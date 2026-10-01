@@ -597,3 +597,208 @@ fn a_cpp_type_whose_name_is_no_macro_is_still_constructed() {
         vec!["instantiates struct Widget (widget.hpp)"]
     );
 }
+
+#[test]
+fn compound_conditions_decide_macro_visibility() {
+    for language in ["c", "cpp"] {
+        let graph = resolve_project(
+            "compound",
+            &[
+                (
+                    format!("unit.{language}"),
+                    [
+                        "#if 1 || FLAG",
+                        "#define HOOK_A(x) ((void)(x))",
+                        "#endif",
+                        "#if 0 && FLAG",
+                        "#define HOOK_B(x) ((void)(x))",
+                        "#endif",
+                        "#define A",
+                        "#if defined(A) || defined(B)",
+                        "#define HOOK_C(x) ((void)(x))",
+                        "#endif",
+                        "#if FLAG == 0",
+                        "#define HOOK_D(x) ((void)(x))",
+                        "#endif",
+                        "#if 1 || \\",
+                        "    FLAG /* continued */",
+                        "#define HOOK_E(x) ((void)(x))",
+                        "#endif",
+                        "#if 0",
+                        "#elif 1 || \\",
+                        "      FLAG",
+                        "#define HOOK_F(x) ((void)(x))",
+                        "#endif",
+                        "void use_a(void) { HOOK_A(1); }",
+                        "void use_b(void) { HOOK_B(1); }",
+                        "void use_c(void) { HOOK_C(1); }",
+                        "void use_d(void) { HOOK_D(1); }",
+                        "void use_e(void) { HOOK_E(1); }",
+                        "void use_f(void) { HOOK_F(1); }",
+                        "",
+                    ]
+                    .join("\n"),
+                ),
+                (
+                    format!("decoy.{language}"),
+                    ["A", "B", "C", "D", "E", "F"]
+                        .map(|hook| format!("void HOOK_{hook}(int x) {{}}\n"))
+                        .concat(),
+                ),
+            ],
+        );
+        let calls = ["a", "b", "c", "d", "e", "f"]
+            .map(|user| (user, graph.calls(&format!("use_{user}"))))
+            .to_vec();
+        let real = |hook: &str| vec![format!("function HOOK_{hook} (decoy.{language})")];
+        // Definitely true, through `||`, `defined` or a continued line: the
+        // macro expands. Definitely false: the function is called. Unknown: the
+        // call keeps its function.
+        assert_eq!(
+            calls,
+            vec![
+                ("a", Vec::<String>::new()),
+                ("b", real("B")),
+                ("c", Vec::new()),
+                ("d", real("D")),
+                ("e", Vec::new()),
+                ("f", Vec::new()),
+            ],
+            "{language}"
+        );
+    }
+}
+
+#[test]
+fn only_a_whole_file_ifndef_is_an_include_guard() {
+    for language in ["c", "cpp"] {
+        let graph = resolve_project(
+            "whole-file-guard",
+            &[
+                (
+                    "licensed.h".to_string(),
+                    "/* License\n * text */\n// more\n#ifndef LICENSED_H\n#define LICENSED_H\n#define LIC(x) ((void)(x))\n#endif // LICENSED_H\n\n"
+                        .to_string(),
+                ),
+                (
+                    "code_before.h".to_string(),
+                    "int before;\n#ifndef BEFORE_H\n#define BEFORE_H\n#define BEFORE(x) ((void)(x))\n#endif\n"
+                        .to_string(),
+                ),
+                (
+                    "code_after.h".to_string(),
+                    "#ifndef AFTER_H\n#define AFTER_H\n#define AFTER(x) ((void)(x))\n#endif\nint after;\n"
+                        .to_string(),
+                ),
+                (
+                    "has_else.h".to_string(),
+                    "#ifndef ELSE_H\n#define ELSE_H\n#define ELSE(x) ((void)(x))\n#else\n#endif\n"
+                        .to_string(),
+                ),
+                (
+                    format!("unit.{language}"),
+                    [
+                        "#include \"licensed.h\"",
+                        "#include \"code_before.h\"",
+                        "#include \"code_after.h\"",
+                        "#include \"has_else.h\"",
+                        // A feature-flag default, not a guard: a build with
+                        // -DFEATURE never defines HOOK.
+                        "#ifndef FEATURE",
+                        "#define FEATURE",
+                        "#define HOOK(x) ((void)(x))",
+                        "#endif",
+                        // A fallback macro: a prior MIN from an unseen header or
+                        // -D may call the function, so nothing is definite.
+                        "#ifndef MIN",
+                        "#define MIN(a, b) ((a) < (b) ? (a) : (b))",
+                        "#endif",
+                        "void use_lic(void) { LIC(1); }",
+                        "void use_before(void) { BEFORE(1); }",
+                        "void use_after(void) { AFTER(1); }",
+                        "void use_else(void) { ELSE(1); }",
+                        "void use_hook(void) { HOOK(1); }",
+                        "int use_min(void) { return MIN(1, 2); }",
+                        "",
+                    ]
+                    .join("\n"),
+                ),
+                (
+                    format!("decoy.{language}"),
+                    "void LIC(int x) {}\nvoid BEFORE(int x) {}\nvoid AFTER(int x) {}\nvoid ELSE(int x) {}\nvoid HOOK(int x) {}\nint MIN(int a, int b) { return a; }\n"
+                        .to_string(),
+                ),
+            ],
+        );
+        let calls = ["lic", "before", "after", "else", "hook", "min"]
+            .map(|user| (user, graph.calls(&format!("use_{user}"))))
+            .to_vec();
+        let real = |name: &str| vec![format!("function {name} (decoy.{language})")];
+        assert_eq!(
+            calls,
+            vec![
+                ("lic", Vec::<String>::new()),
+                ("before", real("BEFORE")),
+                ("after", real("AFTER")),
+                ("else", real("ELSE")),
+                ("hook", real("HOOK")),
+                ("min", real("MIN")),
+            ],
+            "{language}"
+        );
+    }
+}
+
+#[test]
+fn continuations_splice_before_comments_and_macro_values_keep_their_number() {
+    for language in ["c", "cpp"] {
+        let graph = resolve_project(
+            "splice-first",
+            &[
+                (
+                    format!("unit.{language}"),
+                    [
+                        // `N` is 2: whether it equals 1 is not its truth.
+                        "#define N 2",
+                        "#if N == 1",
+                        "#define HOOK_G(x) ((void)(x))",
+                        "#endif",
+                        // Lines splice before comments go: the backslash inside
+                        // the comment still continues the directive.
+                        "#if 1 || /* comment \\",
+                        "*/ FLAG",
+                        "#define HOOK_H(x) ((void)(x))",
+                        "#endif",
+                        "#define LEVEL /* level \\",
+                        "*/ 1",
+                        "#if LEVEL",
+                        "#define HOOK_I(x) ((void)(x))",
+                        "#endif",
+                        "void use_g(void) { HOOK_G(1); }",
+                        "void use_h(void) { HOOK_H(1); }",
+                        "void use_i(void) { HOOK_I(1); }",
+                        "",
+                    ]
+                    .join("\n"),
+                ),
+                (
+                    format!("decoy.{language}"),
+                    "void HOOK_G(int x) {}\nvoid HOOK_H(int x) {}\nvoid HOOK_I(int x) {}\n"
+                        .to_string(),
+                ),
+            ],
+        );
+        let calls = ["g", "h", "i"]
+            .map(|user| (user, graph.calls(&format!("use_{user}"))))
+            .to_vec();
+        assert_eq!(
+            calls,
+            vec![
+                ("g", vec![format!("function HOOK_G (decoy.{language})")]),
+                ("h", Vec::<String>::new()),
+                ("i", Vec::new()),
+            ],
+            "{language}"
+        );
+    }
+}

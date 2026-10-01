@@ -199,6 +199,7 @@ impl MacroVisibility {
         }
         let source = context.read_file(file).unwrap_or_default();
         let lines = directive_lines(&source);
+        let code = code_line_flags(&source);
         let mut events = Vec::new();
         for (index, text) in lines.iter().enumerate() {
             if let Some(branch) = BRANCH.captures(text) {
@@ -211,7 +212,7 @@ impl MacroVisibility {
                     _ => BranchOp::Endif,
                 };
                 let expression = branch[2].to_string();
-                let guard = guards_itself(&lines, index, op, &expression);
+                let guard = guards_itself(&lines, &code, index, op, &expression);
                 events.push(FileEvent::Branch {
                     op,
                     expression,
@@ -469,31 +470,17 @@ impl Walk {
         })
     }
 
-    /// What an `#if` expression says, as far as the source decides it:
-    /// integer literals, `defined(NAME)` / `!defined NAME`, and a bare name's
-    /// known value. Anything else depends on the build.
+    /// What an `#if` expression says, as far as the source decides it: the
+    /// whole expression, three-valued (see [`evaluate`]). Upstream reads a
+    /// literal, one `defined` test or a bare name only (KEEP-RUST).
     fn condition(&self, expression: &str) -> Truth {
-        let text = expression.trim();
-        if let Some(literal) = INTEGER_LITERAL.captures(text) {
-            let digits = literal.get(1).map_or(&literal[2], |hex| hex.as_str());
-            return Some(digits.bytes().any(|digit| digit != b'0'));
-        }
-        if let Some(defined) = DEFINED_TEST.captures(text) {
-            let name = defined
-                .get(2)
-                .or_else(|| defined.get(3))
-                .map_or("", |m| m.as_str());
-            let known = self.definitions.get(name).and_then(|d| d.defined);
-            return if defined.get(1).is_some() {
-                not(known)
-            } else {
-                known
-            };
-        }
-        if is_word(text) {
-            return self.definitions.get(text).and_then(|d| d.value);
-        }
-        None
+        evaluate(expression, &|name| {
+            let known = self.definitions.get(name);
+            NameState {
+                defined: known.and_then(|d| d.defined),
+                value: known.and_then(|d| d.value),
+            }
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -557,25 +544,377 @@ static INCLUDE: LazyLock<Regex> = LazyLock::new(|| {
 });
 static PRAGMA_ONCE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\s*#\s*pragma\s+once\b").expect("pragma once regex is valid"));
-static INTEGER_LITERAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)^(?:0x([0-9a-f]+)|([0-9]+))[ul]*$").expect("integer literal regex is valid")
-});
-static DEFINED_TEST: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(!)?\s*defined\s*(?:\(\s*([A-Za-z0-9_]+)\s*\)|([A-Za-z0-9_]+))$")
-        .expect("defined test regex is valid")
-});
 static NOT_DEFINED_GUARD: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*!\s*defined\s*(?:\(\s*([A-Za-z0-9_]+)\s*\)|([A-Za-z0-9_]+))\s*$")
         .expect("guard test regex is valid")
 });
 
-/// The include-guard idiom: `#ifndef X_H` (or `#if !defined(X_H)`) whose next
-/// directive is `#define X_H`. Nothing defines the guard before the test, so
-/// this is the first inclusion and the guarded body is active. A fallback
-/// function-like macro (`#ifndef MIN` / `#define MIN(a, b) …`) reads the same
-/// way. A default VALUE (`#ifndef ENABLE_X` / `#define ENABLE_X 0`) does not:
-/// that is the flag a build overrides on the command line.
-fn guards_itself(lines: &[String], index: usize, op: BranchOp, expression: &str) -> bool {
+/// Translation phase 2: every backslash-newline joins its line to the next,
+/// before comments are removed, so a backslash inside a `/* … */` still
+/// continues a directive. A joined line's text moves to the line that
+/// started it and leaves an empty line behind, so line numbers stay put.
+fn splice_continuations(source: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut joined: Option<usize> = None;
+    for raw in source.split('\n') {
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        let (text, continues) = match line.strip_suffix('\\') {
+            Some(head) => (head, true),
+            None => (line, false),
+        };
+        match joined {
+            Some(at) => {
+                lines[at].push_str(text);
+                lines.push(String::new());
+            }
+            None => lines.push(text.to_string()),
+        }
+        joined = if continues {
+            joined.or(Some(lines.len() - 1))
+        } else {
+            None
+        };
+    }
+    lines.join("\n")
+}
+
+/// What the walk knows about a name an `#if` mentions.
+struct NameState {
+    defined: Truth,
+    /// The truth of its value, when a definitely active definition gave one.
+    value: Truth,
+}
+
+/// An `#if` operand: a known integer — a literal, or a logical result's 0 or
+/// 1 — or a truth with no known number: a macro's value, recorded only as a
+/// truth (`#define N 2` is true, not 1), or anything the build decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Value {
+    Int(i64),
+    Truth(Truth),
+}
+
+/// A decided truth as C's 0 or 1, an undecided one as unknown.
+fn logical(truth: Truth) -> Value {
+    truth.map_or(Value::Truth(None), |known| Value::Int(i64::from(known)))
+}
+
+impl Value {
+    fn truth(self) -> Truth {
+        match self {
+            Value::Int(number) => Some(number != 0),
+            Value::Truth(truth) => truth,
+        }
+    }
+
+    fn int(self) -> Option<i64> {
+        match self {
+            Value::Int(number) => Some(number),
+            Value::Truth(_) => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Token<'a> {
+    /// `None` for a number the evaluator cannot read (a float, an overflow).
+    Number(Option<i64>),
+    Word(&'a str),
+    Punct(&'static str),
+    /// A character or string literal, or a byte no operator uses.
+    Opaque,
+}
+
+const PUNCTUATORS: [&str; 25] = [
+    "<<", ">>", "<=", ">=", "==", "!=", "&&", "||", "+", "-", "*", "/", "%", "<", ">", "&", "^",
+    "|", "!", "~", "?", ":", "(", ")", ",",
+];
+
+fn tokens(expression: &str) -> Vec<Token<'_>> {
+    let bytes = expression.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if byte.is_ascii_whitespace() {
+            i += 1;
+        } else if byte.is_ascii_digit() {
+            let start = i;
+            while i < bytes.len() && (is_word_byte(bytes[i]) || matches!(bytes[i], b'\'' | b'.')) {
+                i += 1;
+            }
+            out.push(Token::Number(integer_literal(&expression[start..i])));
+        } else if is_word_byte(byte) {
+            let start = i;
+            while i < bytes.len() && is_word_byte(bytes[i]) {
+                i += 1;
+            }
+            out.push(Token::Word(&expression[start..i]));
+        } else if byte == b'"' || byte == b'\'' {
+            i += 1;
+            while i < bytes.len() && bytes[i] != byte {
+                i += if bytes[i] == b'\\' { 2 } else { 1 };
+            }
+            i += 1;
+            out.push(Token::Opaque);
+        } else if let Some(punct) = PUNCTUATORS
+            .iter()
+            .find(|punct| expression[i..].starts_with(**punct))
+        {
+            i += punct.len();
+            out.push(Token::Punct(punct));
+        } else {
+            i += expression[i..].chars().next().map_or(1, char::len_utf8);
+            out.push(Token::Opaque);
+        }
+    }
+    out
+}
+
+/// A C integer literal — decimal, `0x`, `0b` or octal, with digit separators
+/// and `u`/`l`/`z` suffixes — or `None`.
+fn integer_literal(text: &str) -> Option<i64> {
+    let digits: String = text
+        .trim_end_matches(['u', 'U', 'l', 'L', 'z', 'Z'])
+        .chars()
+        .filter(|c| *c != '\'')
+        .collect();
+    let (radix, body) = if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        (16, hex)
+    } else if let Some(binary) = digits
+        .strip_prefix("0b")
+        .or_else(|| digits.strip_prefix("0B"))
+    {
+        (2, binary)
+    } else if digits.len() > 1 && digits.starts_with('0') {
+        (8, &digits[1..])
+    } else {
+        (10, digits.as_str())
+    };
+    i64::from_str_radix(body, radix).ok()
+}
+
+/// Evaluate an `#if` expression three-valued. `&&` and `||` decide whenever
+/// one side does (`1 || FLAG` is true, `0 && FLAG` false); `?:` with an
+/// unknown condition is known only when both branches agree; every other
+/// operator needs known operands, and a macro's value is known only as a truth
+/// (`#if N == 1` with `#define N 2` stays unknown). An unseen name, a
+/// definitely undefined name's `0` aside, is unknown; so are a call-like `__has_include(…)`, a
+/// character literal, overflow, division by zero, and anything malformed.
+fn evaluate(expression: &str, name: &dyn Fn(&str) -> NameState) -> Truth {
+    let tokens = tokens(expression);
+    let mut parser = ConditionParser {
+        tokens: &tokens,
+        at: 0,
+        name,
+    };
+    let value = parser.ternary()?;
+    (parser.at == tokens.len()).then_some(())?;
+    value.truth()
+}
+
+struct ConditionParser<'t, 'n> {
+    tokens: &'t [Token<'t>],
+    at: usize,
+    name: &'n dyn Fn(&str) -> NameState,
+}
+
+impl<'t> ConditionParser<'t, '_> {
+    fn peek(&self) -> Option<Token<'t>> {
+        self.tokens.get(self.at).copied()
+    }
+
+    fn next(&mut self) -> Option<Token<'t>> {
+        let token = self.tokens.get(self.at).copied();
+        self.at += 1;
+        token
+    }
+
+    fn eat(&mut self, punct: &str) -> bool {
+        let found = matches!(self.peek(), Some(Token::Punct(p)) if p == punct);
+        if found {
+            self.at += 1;
+        }
+        found
+    }
+
+    fn ternary(&mut self) -> Option<Value> {
+        let condition = self.binary(1)?;
+        if !self.eat("?") {
+            return Some(condition);
+        }
+        let yes = self.ternary()?;
+        if !self.eat(":") {
+            return None;
+        }
+        let no = self.ternary()?;
+        Some(match condition.truth() {
+            Some(true) => yes,
+            Some(false) => no,
+            None => match (yes.int(), no.int()) {
+                (Some(a), Some(b)) if a == b => Value::Int(a),
+                _ => Value::Truth(None),
+            },
+        })
+    }
+
+    fn binary(&mut self, minimum: u8) -> Option<Value> {
+        let mut left = self.unary()?;
+        while let Some(Token::Punct(op)) = self.peek() {
+            let Some(precedence) = binary_precedence(op).filter(|p| *p >= minimum) else {
+                break;
+            };
+            self.at += 1;
+            let right = self.binary(precedence + 1)?;
+            left = combine(op, left, right);
+        }
+        Some(left)
+    }
+
+    fn unary(&mut self) -> Option<Value> {
+        let Some(Token::Punct(op @ ("!" | "~" | "-" | "+"))) = self.peek() else {
+            return self.primary();
+        };
+        self.at += 1;
+        let value = self.unary()?;
+        Some(match op {
+            "!" => logical(not(value.truth())),
+            "~" => value.int().map_or(Value::Truth(None), |n| Value::Int(!n)),
+            "-" => value
+                .int()
+                .and_then(i64::checked_neg)
+                .map_or(Value::Truth(None), Value::Int),
+            _ => value.int().map_or(Value::Truth(None), Value::Int),
+        })
+    }
+
+    fn primary(&mut self) -> Option<Value> {
+        match self.next()? {
+            Token::Number(number) => Some(number.map_or(Value::Truth(None), Value::Int)),
+            Token::Punct("(") => {
+                let value = self.ternary()?;
+                self.eat(")").then_some(value)
+            }
+            Token::Word("defined") => {
+                let parenthesized = self.eat("(");
+                let Some(Token::Word(word)) = self.next() else {
+                    return None;
+                };
+                if parenthesized && !self.eat(")") {
+                    return None;
+                }
+                Some(logical((self.name)(word).defined))
+            }
+            Token::Word(word) => {
+                if matches!(self.peek(), Some(Token::Punct("("))) {
+                    // `__has_include(<x>)`, a function-like macro: the build decides.
+                    self.skip_group()?;
+                    return Some(Value::Truth(None));
+                }
+                let state = (self.name)(word);
+                Some(if state.defined == Some(false) {
+                    Value::Int(0)
+                } else {
+                    Value::Truth(state.value)
+                })
+            }
+            Token::Opaque => Some(Value::Truth(None)),
+            Token::Punct(_) => None,
+        }
+    }
+
+    /// Skip one balanced `( … )` group, whatever it holds.
+    fn skip_group(&mut self) -> Option<()> {
+        let mut depth = 0usize;
+        loop {
+            match self.next()? {
+                Token::Punct("(") => depth += 1,
+                Token::Punct(")") => {
+                    depth = depth.checked_sub(1)?;
+                    if depth == 0 {
+                        return Some(());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn binary_precedence(op: &str) -> Option<u8> {
+    Some(match op {
+        "||" => 1,
+        "&&" => 2,
+        "|" => 3,
+        "^" => 4,
+        "&" => 5,
+        "==" | "!=" => 6,
+        "<" | "<=" | ">" | ">=" => 7,
+        "<<" | ">>" => 8,
+        "+" | "-" => 9,
+        "*" | "/" | "%" => 10,
+        _ => return None,
+    })
+}
+
+fn combine(op: &str, left: Value, right: Value) -> Value {
+    match op {
+        "||" => logical(or(left.truth(), right.truth())),
+        "&&" => logical(and(left.truth(), right.truth())),
+        _ => left
+            .int()
+            .zip(right.int())
+            .and_then(|(a, b)| arithmetic(op, a, b))
+            .map_or(Value::Truth(None), Value::Int),
+    }
+}
+
+fn arithmetic(op: &str, a: i64, b: i64) -> Option<i64> {
+    Some(match op {
+        "*" => a.checked_mul(b)?,
+        "/" => a.checked_div(b)?,
+        "%" => a.checked_rem(b)?,
+        "+" => a.checked_add(b)?,
+        "-" => a.checked_sub(b)?,
+        "<<" => a.checked_shl(u32::try_from(b).ok()?)?,
+        ">>" => a.checked_shr(u32::try_from(b).ok()?)?,
+        "<" => i64::from(a < b),
+        "<=" => i64::from(a <= b),
+        ">" => i64::from(a > b),
+        ">=" => i64::from(a >= b),
+        "==" => i64::from(a == b),
+        "!=" => i64::from(a != b),
+        "&" => a & b,
+        "^" => a ^ b,
+        "|" => a | b,
+        _ => return None,
+    })
+}
+
+/// A whole-file include guard: `#ifndef X_H` (or `#if !defined(X_H)`) is
+/// the file's first code line, its next directive is an empty `#define X_H`,
+/// and its matching `#endif` — with no `#else`/`#elif` at its depth — is the
+/// file's last code line. Nothing defines the guard before the test, so this
+/// is the first inclusion and the guarded body is active.
+///
+/// Upstream reads any `#ifndef X` / `#define X` pair, and a fallback
+/// function-like macro (`#ifndef MIN` / `#define MIN(a, b) …`), the same way.
+/// The port does not (KEEP-RUST): a feature-flag default
+/// (`#ifndef FEATURE` / `#define FEATURE` among other code) is skipped by a
+/// build with `-DFEATURE`, and a prior `MIN` from an unseen header or `-D` may
+/// be a wrapper that calls the function. A valued default
+/// (`#ifndef ENABLE_X` / `#define ENABLE_X 0`) is the flag a build overrides,
+/// never a guard.
+fn guards_itself(
+    lines: &[String],
+    code: &[bool],
+    index: usize,
+    op: BranchOp,
+    expression: &str,
+) -> bool {
     let name = match op {
         BranchOp::Ifndef => expression.trim().to_string(),
         BranchOp::If => NOT_DEFINED_GUARD
@@ -584,7 +923,7 @@ fn guards_itself(lines: &[String], index: usize, op: BranchOp, expression: &str)
             .map_or(String::new(), |m| m.as_str().to_string()),
         _ => return false,
     };
-    if !is_word(&name) {
+    if !is_word(&name) || code.iter().take(index).any(|has_code| *has_code) {
         return false;
     }
     let Some(next) = lines[index + 1..]
@@ -599,8 +938,79 @@ fn guards_itself(lines: &[String], index: usize, op: BranchOp, expression: &str)
     if &captures[1] != "define" || captures[2] != *name {
         return false;
     }
-    let rest = &next[captures.get(2).map_or(0, |m| m.end())..];
-    rest.starts_with('(') || rest.trim().is_empty()
+    if !next[captures.get(2).map_or(0, |m| m.end())..]
+        .trim()
+        .is_empty()
+    {
+        return false;
+    }
+    let mut depth = 0usize;
+    for (at, text) in lines.iter().enumerate().skip(index + 1) {
+        let Some(branch) = BRANCH.captures(text) else {
+            continue;
+        };
+        match (&branch[1], depth) {
+            ("if" | "ifdef" | "ifndef", _) => depth += 1,
+            ("else" | "elif", 0) => return false,
+            ("endif", 0) => return !code.iter().skip(at + 1).any(|has_code| *has_code),
+            ("endif", _) => depth -= 1,
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Per line: whether anything but comments and whitespace is on it, with raw
+/// string bodies masked first, as [`directive_lines`] does.
+fn code_line_flags(source: &str) -> Vec<bool> {
+    let masked = splice_continuations(&mask_cpp_raw_strings(source));
+    let mut in_block = false;
+    masked
+        .split('\n')
+        .map(|raw| {
+            let line = raw.strip_suffix('\r').unwrap_or(raw);
+            let bytes = line.as_bytes();
+            let mut has_code = false;
+            let mut quote: Option<u8> = None;
+            let mut i = 0;
+            while i < bytes.len() {
+                if in_block {
+                    let Some(end) = line[i..].find("*/") else {
+                        break;
+                    };
+                    i += end + 2;
+                    in_block = false;
+                    continue;
+                }
+                let byte = bytes[i];
+                if let Some(q) = quote {
+                    if byte == b'\\' {
+                        i += 1;
+                    } else if byte == q {
+                        quote = None;
+                    }
+                    i += 1;
+                    continue;
+                }
+                match byte {
+                    b'/' if bytes.get(i + 1) == Some(&b'/') => break,
+                    b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                        in_block = true;
+                        i += 2;
+                        continue;
+                    }
+                    b'"' | b'\'' => {
+                        quote = Some(byte);
+                        has_code = true;
+                    }
+                    _ if !byte.is_ascii_whitespace() => has_code = true,
+                    _ => {}
+                }
+                i += 1;
+            }
+            has_code
+        })
+        .collect()
 }
 
 /// Does the body of the `#define NAME(` at `index` (continuation lines
@@ -652,7 +1062,7 @@ fn calls_itself(lines: &[String], index: usize, name: &str) -> bool {
 /// string bodies are masked first, so a `#define` inside one is not a
 /// directive.
 fn directive_lines(source: &str) -> Vec<String> {
-    let masked = mask_cpp_raw_strings(source);
+    let masked = splice_continuations(&mask_cpp_raw_strings(source));
     let mut out = Vec::new();
     let mut in_block = false;
     for raw in masked.split('\n') {
@@ -847,17 +1257,181 @@ mod tests {
         assert!(calls_itself(&parenthesized, 0, "wrap"));
     }
 
+    /// Evaluate with `A` definitely defined as 1, `Z` definitely undefined,
+    /// and every other name unseen.
+    fn eval(expression: &str) -> Truth {
+        evaluate(expression, &|name| match name {
+            "A" => NameState {
+                defined: Some(true),
+                value: Some(true),
+            },
+            "Z" => NameState {
+                defined: Some(false),
+                value: None,
+            },
+            _ => NameState {
+                defined: None,
+                value: None,
+            },
+        })
+    }
+
     #[test]
-    fn guards_are_the_ifndef_define_idiom_and_not_a_default_value() {
-        let guard = ["#ifndef X_H", "#define X_H"].map(str::to_string).to_vec();
-        assert!(guards_itself(&guard, 0, BranchOp::Ifndef, " X_H"));
-        let fallback = ["#if !defined(MIN)", "#define MIN(a, b) a"]
-            .map(str::to_string)
-            .to_vec();
-        assert!(guards_itself(&fallback, 0, BranchOp::If, " !defined(MIN)"));
-        let default = ["#ifndef ENABLE_X", "#define ENABLE_X 0"]
-            .map(str::to_string)
-            .to_vec();
-        assert!(!guards_itself(&default, 0, BranchOp::Ifndef, " ENABLE_X"));
+    fn conditions_are_whole_expressions_decided_three_valued() {
+        for (expression, expected) in [
+            // The forms upstream reads.
+            ("1", Some(true)),
+            ("0x0", Some(false)),
+            ("10UL", Some(true)),
+            ("defined(A)", Some(true)),
+            ("!defined A", Some(false)),
+            ("defined FLAG", None),
+            ("A", Some(true)),
+            ("FLAG", None),
+            // `||` and `&&` decide whenever one side does.
+            ("1 || FLAG", Some(true)),
+            ("FLAG || 1", Some(true)),
+            ("0 && FLAG", Some(false)),
+            ("FLAG && 1", None),
+            ("defined(A) || defined(B)", Some(true)),
+            ("defined A && !defined(Z)", Some(true)),
+            // C precedence and arithmetic on known operands.
+            ("1 + 2 * 3 == 7", Some(true)),
+            ("(1 + 2) * 3 == 9", Some(true)),
+            ("1 << 4 == 0x10 && 07 == 7 && 0b101 == 5", Some(true)),
+            ("1'000 > 999", Some(true)),
+            ("-1 < 0 && ~0 == -1", Some(true)),
+            ("!0 == 1", Some(true)),
+            // A definitely undefined name is 0; an unseen one is unknown.
+            ("Z == 0", Some(true)),
+            ("FLAG == 0", None),
+            // A name's value is known only as a truth, never as a number: `A`
+            // may be defined as 2. A logical result is a real 0 or 1.
+            ("A == 1", None),
+            ("A + 0", None),
+            ("defined(A) + defined(A) == 2", Some(true)),
+            ("(1 || FLAG) == 1", Some(true)),
+            // `?:` with an unknown condition needs agreeing branches.
+            ("1 ? FLAG : 0", None),
+            ("FLAG ? 1 : 1", Some(true)),
+            ("0 ? FLAG : A", Some(true)),
+            // The build decides: calls, characters, overflow, division by zero.
+            ("__has_include(<stdio.h>)", None),
+            ("__has_include(<stdio.h>) || 1", Some(true)),
+            ("'a' == 97", None),
+            ("9223372036854775807 + 1", None),
+            ("1 / 0", None),
+            ("1.5", None),
+            // Malformed text decides nothing.
+            ("", None),
+            ("1 +", None),
+            ("1 2", None),
+            ("(1", None),
+            ("1 ? 2", None),
+            ("defined", None),
+        ] {
+            assert_eq!(eval(expression), expected, "{expression:?}");
+        }
+    }
+
+    #[test]
+    fn continued_directives_are_one_logical_line() {
+        // Phase 2 joins lines before comments go: a backslash inside a block
+        // comment still continues the directive. Joined lines stay as empty
+        // lines, so every line keeps its number.
+        let source = "#if 1 || \\\n    FLAG // trailing\n#if A || /* c \\\n*/ B\n#define V /* v \\\n*/ 1\n#if DONE\n";
+        assert_eq!(
+            splice_continuations(source),
+            "#if 1 ||     FLAG // trailing\n\n#if A || /* c */ B\n\n#define V /* v */ 1\n\n#if DONE\n"
+        );
+        let lines = directive_lines(source);
+        assert_eq!(lines.len(), 8);
+        assert_eq!(lines[0], "#if 1 ||     FLAG ");
+        assert_eq!(lines[2], "#if A ||   B");
+        assert_eq!(lines[4], "#define V   1");
+        assert_eq!(lines[6], "#if DONE");
+        assert!([1, 3, 5, 7].iter().all(|at| lines[*at].is_empty()));
+        // A trailing backslash on the last line joins nothing.
+        assert_eq!(splice_continuations("#if 1 \\"), "#if 1 ");
+    }
+
+    #[test]
+    fn guards_are_whole_file_ifndef_define_idioms_only() {
+        // `(file, line of the test, op, expression, guard?)`.
+        let cases = [
+            (
+                "/* License */\n#ifndef X_H\n#define X_H\nint x;\n#endif // X_H\n",
+                1,
+                BranchOp::Ifndef,
+                " X_H",
+                true,
+            ),
+            (
+                "#if !defined(X_H)\n#define X_H\n#if A\n#else\n#endif\n#endif\n",
+                0,
+                BranchOp::If,
+                " !defined(X_H)",
+                true,
+            ),
+            // A fallback function-like macro is no guard (KEEP-RUST).
+            (
+                "#if !defined(MIN)\n#define MIN(a, b) a\n#endif\n",
+                0,
+                BranchOp::If,
+                " !defined(MIN)",
+                false,
+            ),
+            // A default VALUE is the flag a build overrides.
+            (
+                "#ifndef ENABLE_X\n#define ENABLE_X 0\n#endif\n",
+                0,
+                BranchOp::Ifndef,
+                " ENABLE_X",
+                false,
+            ),
+            // Code before the test or after the `#endif`, or an `#else` at
+            // the guard's depth: not the whole file.
+            (
+                "int before;\n#ifndef X_H\n#define X_H\n#endif\n",
+                1,
+                BranchOp::Ifndef,
+                " X_H",
+                false,
+            ),
+            (
+                "#ifndef X_H\n#define X_H\n#endif\nint after;\n",
+                0,
+                BranchOp::Ifndef,
+                " X_H",
+                false,
+            ),
+            (
+                "#ifndef X_H\n#define X_H\n#else\n#endif\n",
+                0,
+                BranchOp::Ifndef,
+                " X_H",
+                false,
+            ),
+        ];
+        for (source, index, op, expression, expected) in cases {
+            let lines = directive_lines(source);
+            let code = code_line_flags(source);
+            assert_eq!(
+                guards_itself(&lines, &code, index, op, expression),
+                expected,
+                "{source:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn code_lines_ignore_comments_and_whitespace() {
+        let flags = code_line_flags(
+            "/* a\n * b */\n// c\n  \nint x; // d\n/* e */ y\nchar *s = \"/* f\";\n",
+        );
+        assert_eq!(
+            flags,
+            vec![false, false, false, false, true, true, true, false]
+        );
     }
 }
