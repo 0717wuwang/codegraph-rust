@@ -10,7 +10,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock, OnceLock};
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use codegraph_core::config::Config;
@@ -28,7 +28,9 @@ use serde_json::Value;
 use crate::dynamic_boundaries::scan_dynamic_dispatch;
 use crate::explore_budget::{ExploreOutputBudget, get_explore_output_budget};
 use crate::protocol::ToolResult;
-use crate::query_paths::{extract_query_paths_with_file_probe, query_might_contain_paths};
+use crate::query_paths::{
+    QueryLineAnchor, extract_query_paths_with_probes, query_might_contain_paths,
+};
 
 /// Default caller/callee recursion depth for callers/callees tools. The upstream
 /// `getCallers`/`getCallees` default to `maxDepth: 1` (`traversal.ts` callers
@@ -57,6 +59,22 @@ const POINTER_MAX_FILES: usize = 10;
 /// highest-importance member, even when that exceeds the room it was given; the
 /// caller then drops the file whole rather than emitting a stub.
 const MIN_WINDOW_LINES: usize = 12;
+
+/// Importance of an EXACT target (upstream #2063): a callable the query
+/// singled out with no ambiguity left — a qualified name resolving to at most
+/// three callables, or the callable enclosing a single-line anchor — or a line
+/// span the query anchored. Above a protected focus (11) and a root (10).
+const EXACT_IMPORTANCE: u32 = 12;
+
+/// Lines either side of a single-line anchor that no callable encloses.
+const ANCHOR_LINE_CONTEXT: usize = 15;
+
+/// Most lines an oversize exact body is windowed on beyond its head: the
+/// anchored line inside it and its calls into the question's other symbols.
+const MAX_BODY_FOCUS_LINES: usize = 6;
+
+/// Query tokens consulted for qualified exact targets — upstream's seeder cap.
+const MAX_EXACT_SYMBOL_TOKENS: usize = 16;
 
 /// Minimum source budget protected for every path explicitly named in an
 /// explore query. Pinned files are ordered first and reserve this much for one
@@ -1226,20 +1244,29 @@ impl CodeGraphEngine {
                 .into_iter()
                 .map(|file| file.path)
                 .collect::<Vec<_>>();
-            extract_query_paths_with_file_probe(
+            extract_query_paths_with_probes(
                 &query,
                 &indexed_paths,
                 max_files.min(8),
-                &|relative| project_regular_file_exists(&self.project_root, relative),
+                Some(&|relative| project_regular_file_exists(&self.project_root, relative)),
+                Some(&|symbol| self.files_defining_symbol(symbol)),
             )
         } else {
-            extract_query_paths_with_file_probe(&query, &[], max_files.min(8), &|relative| {
-                project_regular_file_exists(&self.project_root, relative)
-            })
+            extract_query_paths_with_probes(
+                &query,
+                &[],
+                max_files.min(8),
+                Some(&|relative| project_regular_file_exists(&self.project_root, relative)),
+                None,
+            )
         };
         let match_query = path_extraction.stripped_query.trim().to_string();
-        let subgraph =
-            self.find_relevant_context_with_pins(&match_query, &path_extraction.pinned_files)?;
+        let exact = self.exact_targets(&match_query, &path_extraction.line_anchors);
+        let subgraph = self.find_relevant_context_with_pins(
+            &match_query,
+            &path_extraction.pinned_files,
+            &exact,
+        )?;
         let unresolved_note = (!path_extraction.unresolved_path_spans.is_empty()).then(|| {
             path_extraction
                 .unresolved_path_spans
@@ -1253,8 +1280,9 @@ impl CodeGraphEngine {
                 .as_ref()
                 .map(|spans| format!(" (no indexed file uniquely matches {spans})"))
                 .unwrap_or_default();
+            let explanation = self.explore_miss_explanation(&match_query);
             return Ok(ToolResult::text(format!(
-                "No relevant code found for \"{query}\"{miss_note}"
+                "No relevant code found for \"{query}\"{miss_note}{explanation}"
             )));
         }
 
@@ -1281,6 +1309,34 @@ impl CodeGraphEngine {
         }
         if let Some(spans) = &unresolved_note {
             lines.push(format!("No indexed file uniquely matches {spans}."));
+        }
+        // A same-named file a span did not pin is named, so an agent that did
+        // mean it sees where it went instead of a silent drop (#2071).
+        let set_aside_note = path_extraction
+            .set_aside_matches
+            .iter()
+            .map(|entry| {
+                let which = if entry.files.len() <= 2 {
+                    entry
+                        .files
+                        .iter()
+                        .map(|file| format!("`{file}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                } else {
+                    format!("{} other `{}` files", entry.files.len(), entry.span)
+                };
+                let verb = if entry.files.len() == 1 {
+                    "defines"
+                } else {
+                    "define"
+                };
+                format!("Not pinned: {which}, which {verb} none of the named symbols.")
+            })
+            .collect::<Vec<_>>()
+            .join(" ");
+        if !set_aside_note.is_empty() {
+            lines.push(set_aside_note);
         }
         lines.push(String::new());
 
@@ -1330,10 +1386,16 @@ impl CodeGraphEngine {
         // list (`tools.ts:2483-2905`).
         let mut total_chars: usize = lines.join("\n").len();
         let mut files_included = 0usize;
-        let mut any_file_trimmed = false;
+        let mut budget_dropped = false;
         let mut excluded_files: Vec<&String> = Vec::new();
         let mut rendered_sources: Vec<(String, usize)> = Vec::new();
+        // Every admitted section: `(line index, path, what it elided)`.
+        let mut sections: Vec<(usize, &String, Vec<WantedSpan>)> = Vec::new();
+        // Named files whose per-file ceiling clipped them, with what a second
+        // render needs: `(line index, path, focuses, exact focus)`.
+        let mut named_clipped: Vec<(usize, &String, Vec<usize>, Vec<BodyFocus>)> = Vec::new();
         let precise_tokens = precise_query_tokens(&match_query);
+        let question_ids = subgraph.question_ids(&precise_tokens);
         let indexed_file_count = self.store.counts().ok().map(|c| c.file_count);
         let effective_budget = budget
             .max_output_chars
@@ -1359,6 +1421,12 @@ impl CodeGraphEngine {
             let lang = subgraph.file_language(file_path);
 
             let focuses = subgraph.file_focus_lines(file_path, &precise_tokens);
+            let exact_focus = self.exact_body_focus(
+                &subgraph,
+                file_path,
+                &path_extraction.line_anchors,
+                &question_ids,
+            );
             let available = effective_budget
                 .saturating_sub(total_chars)
                 .saturating_sub(1);
@@ -1375,6 +1443,8 @@ impl CodeGraphEngine {
                 budget: &budget,
                 funded_headroom,
                 focuses: &focuses,
+                exact_focus: &exact_focus,
+                lift_file_cap: false,
                 drifted: possibly_drifted,
             };
             let rendered = self.render_explore_file(&subgraph, file_path, &file_lines, &lang, &ctx);
@@ -1387,23 +1457,100 @@ impl CodeGraphEngine {
             // expression appears at the accumulator below, so the admission test
             // and the running total cannot disagree.
             if total_chars + rendered.section.len() + 1 > effective_budget {
-                any_file_trimmed = true;
+                budget_dropped = true;
                 excluded_files.push(file_path);
                 continue;
-            }
-            if rendered.section.contains("... (gap) ...")
-                || rendered.section.contains("more (signatures elided)")
-            {
-                any_file_trimmed = true;
             }
             let section_len = rendered.section.len();
             if rendered.source_emitted {
                 rendered_sources.push(((*file_path).clone(), lines.len()));
             }
+            let named = subgraph.is_pinned(file_path)
+                || subgraph.holds_exact(file_path)
+                || !focuses.is_empty();
+            if rendered.clipped && named {
+                named_clipped.push((lines.len(), file_path, focuses, exact_focus));
+            }
+            sections.push((lines.len(), file_path, rendered.elided));
             lines.push(rendered.section);
             total_chars += section_len + 1;
             files_included += 1;
         }
+
+        // A file the query NAMED — by path, or by a symbol it defines — that its
+        // per-file ceiling clipped is rendered again into what the response left
+        // unspent (upstream #2068), in file order. Only that: every other file
+        // keeps exactly the section it was given, and the pointer list below
+        // keeps the room it would have had. Where nothing is spare a named file
+        // renders exactly as before.
+        let pointer_candidates: Vec<String> =
+            if budget.include_additional_files && !excluded_files.is_empty() {
+                excluded_files
+                    .iter()
+                    .map(|file_path| {
+                        format!("- {file_path}: {}", subgraph.file_node_locations(file_path))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+        let pointer_reserve: usize = fit_pointer_lines(
+            &pointer_candidates,
+            effective_budget.saturating_sub(total_chars),
+        )
+        .0
+        .iter()
+        .map(|line| line.len() + 1)
+        .sum();
+        let mut spare = effective_budget
+            .saturating_sub(total_chars)
+            .saturating_sub(pointer_reserve);
+        for (line_index, file_path, focuses, exact_focus) in &named_clipped {
+            if spare == 0 {
+                break;
+            }
+            let source = self.project_source(file_path);
+            let Some(content) = source.content.clone() else {
+                continue;
+            };
+            let file_lines: Vec<&str> = content.split('\n').collect();
+            let lang = subgraph.file_language(file_path);
+            let given = lines[*line_index].len();
+            let ctx = RenderCtx {
+                budget: &budget,
+                funded_headroom: given + spare,
+                focuses,
+                exact_focus,
+                lift_file_cap: true,
+                drifted: source.is_possibly_drifted(),
+            };
+            let grown = self.render_explore_file(&subgraph, file_path, &file_lines, &lang, &ctx);
+            let len = grown.section.len();
+            if !grown.source_emitted || len <= given || len > given + spare {
+                continue;
+            }
+            spare -= len - given;
+            total_chars += len - given;
+            lines[*line_index] = grown.section;
+            if let Some(entry) = sections.iter_mut().find(|entry| entry.0 == *line_index) {
+                entry.2 = grown.elided;
+            }
+        }
+        // Sections missing some of what they set out to deliver, in render
+        // order, measured from the ranges actually sent (#2077): "complete" is
+        // claimed only for sections that are.
+        let trimmed_shown: Vec<(String, Vec<WantedSpan>)> = sections
+            .iter()
+            .filter(|(_, _, elided)| !elided.is_empty())
+            .map(|(_, path, elided)| ((*path).clone(), elided.clone()))
+            .collect();
+        let any_file_trimmed = budget_dropped
+            || !trimmed_shown.is_empty()
+            || sections.iter().any(|(index, _, _)| {
+                lines[*index].contains("... (gap) ...")
+                    || lines[*index].contains("more (signatures elided)")
+            });
+        let mut epilogue_room = effective_budget.saturating_sub(total_chars);
 
         // "Additional relevant files (not shown)" — the excluded set, so the
         // agent can request specifics. Gated by the budget (`tools.ts:2910-2927`).
@@ -1414,14 +1561,8 @@ impl CodeGraphEngine {
             // not use, so however long the pointer list is it cannot push the
             // response past its budget. The frame and the tail are already paid
             // for by the reserve and so are not charged here.
-            let candidates: Vec<String> = excluded_files
-                .iter()
-                .map(|file_path| {
-                    format!("- {file_path}: {}", subgraph.file_node_locations(file_path))
-                })
-                .collect();
-            let (pointer_lines, unlisted) =
-                fit_pointer_lines(&candidates, effective_budget.saturating_sub(total_chars));
+            let (pointer_lines, unlisted) = fit_pointer_lines(&pointer_candidates, epilogue_room);
+            epilogue_room = epilogue_room.saturating_sub(joined_line_cost(&pointer_lines));
             lines.extend(pointer_lines);
             // The TRUE unlisted count — those dropped by elasticity plus those
             // dropped by the file cap — so a file the response did not render is
@@ -1442,9 +1583,27 @@ impl CodeGraphEngine {
         // question was still uncovered (#1504). The useful half — one more explore
         // beats falling back to Read — is kept, the phantom cap is dropped, and
         // the absence of a limit is stated outright rather than left to inference.
+        //
+        // The completeness note is the most specific candidate that fits: the
+        // reserve holds the least specific one, so a note naming the trimmed
+        // files and symbols is paid only from what the sections and the pointer
+        // list left, and never costs a pointer line (upstream #2077).
+        let completeness_note = if budget.include_completeness_signal {
+            let candidates =
+                completeness_notes(files_included, &trimmed_shown, &subgraph.file_order);
+            let room = completeness_note_floor(max_files) + epilogue_room;
+            candidates
+                .iter()
+                .find(|note| note.len() <= room)
+                .or(candidates.last())
+                .cloned()
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
         lines.extend(epilogue_note_lines(
             &budget,
-            files_included,
+            &completeness_note,
             any_file_trimmed,
             indexed_file_count,
         ));
@@ -1454,9 +1613,137 @@ impl CodeGraphEngine {
         // (`tools.ts:2954-2975`).
         let output = lines.join("\n");
         let hard_ceiling = ((budget.max_output_chars as f64 * 1.5).round() as usize).min(25000);
-        let (output, kept_prefix_len) = cut_at_section_boundary(&output, hard_ceiling);
+        let trimmed_paths: Vec<&str> = trimmed_shown
+            .iter()
+            .map(|(path, _)| path.as_str())
+            .collect();
+        let (output, kept_prefix_len) =
+            cut_at_section_boundary(&output, hard_ceiling, &trimmed_paths);
         self.mark_surviving_explore_citations(&lines, &rendered_sources, kept_prefix_len);
         Ok(ToolResult::text(output))
+    }
+
+    /// Why an explore came back empty (upstream #1904). Explore matches names
+    /// and indexed code words lexically, not by meaning, so the answer names
+    /// the checked words that matched nothing, those that matched but scored
+    /// out, and indexed names sharing a word to retry with — from two bounded
+    /// FTS queries and the query-time name segments (the golden-neutral
+    /// substitute for upstream's `name_segment_vocab`).
+    fn explore_miss_explanation(&self, match_query: &str) -> String {
+        let mut explanation = "\n\nExplore matches symbol/file names and indexed code words lexically, not by meaning.".to_string();
+        if self
+            .store
+            .counts()
+            .is_ok_and(|counts| counts.node_count == 0)
+        {
+            explanation.push_str("\nThis project has nothing indexed.");
+            return explanation;
+        }
+        let miss = self.explore_miss_diagnostics(match_query);
+        explanation.push_str("\nChecked indexed names, signatures, docstrings (FTS prefixes) and live name segments; not all source text.");
+        if miss.limited {
+            explanation.push_str("\nWord check limited to 16 words of at most 64 characters.");
+        }
+        let unmatched = capped_word_list(&miss.unmatched, 250);
+        explanation.push_str(&format!(
+            "\nNo lexical matches for checked words: {}.",
+            if unmatched.is_empty() {
+                "(none)"
+            } else {
+                &unmatched
+            }
+        ));
+        if !miss.matched.is_empty() {
+            explanation.push_str(&format!(
+                "\nMatched indexed words: {}; these did not yield a relevant result after filtering/scoring.",
+                capped_word_list(&miss.matched, 200)
+            ));
+        }
+        if miss.candidates.is_empty() {
+            explanation.push_str("\nNo shared-word symbol candidates found; retry codegraph_explore with literal symbol/file names or code terms.");
+        } else {
+            explanation.push_str(&format!(
+                "\nCandidates to retry with codegraph_explore (shared words, not confirmed answers): {}",
+                capped_word_list(&miss.candidates, 350)
+            ));
+        }
+        explanation
+    }
+
+    /// The lexical evidence behind [`Self::explore_miss_explanation`]: at most
+    /// 16 query words of at most 64 characters are checked against FTS
+    /// prefixes and live name segments; up to 12 retry candidates.
+    fn explore_miss_diagnostics(&self, query: &str) -> ExploreMissDiagnostics {
+        static WORD: OnceLock<regex::Regex> = OnceLock::new();
+        let word_re =
+            WORD.get_or_init(|| regex::Regex::new(r"[\p{L}\p{N}]+").expect("explore miss word"));
+        let mut words: Vec<String> = Vec::new();
+        for word in word_re.find_iter(query) {
+            let word = word.as_str().to_lowercase();
+            if !words.contains(&word) {
+                words.push(word);
+            }
+        }
+        let checked = words
+            .iter()
+            .filter(|word| word.chars().count() <= 64)
+            .take(16)
+            .cloned()
+            .collect::<Vec<_>>();
+        let limited = checked.len() != words.len();
+        let mut diagnostics = ExploreMissDiagnostics {
+            limited,
+            ..ExploreMissDiagnostics::default()
+        };
+        if checked.is_empty() {
+            return diagnostics;
+        }
+        let names = self
+            .store
+            .distinct_non_file_node_names()
+            .unwrap_or_default();
+        let mut segment_hits: BTreeSet<String> = BTreeSet::new();
+        let mut candidates: Vec<String> = Vec::new();
+        for (name, _) in &names {
+            let segments = codegraph_graph::segments::split_identifier_segments(name);
+            let mut shares = false;
+            for segment in segments {
+                if checked.contains(&segment) {
+                    segment_hits.insert(segment);
+                    shares = true;
+                }
+            }
+            if shares && candidates.len() < 12 {
+                candidates.push(name.clone());
+            }
+        }
+        for word in checked {
+            let matched = segment_hits.contains(&word)
+                || self.store.fts_any_column_has_prefix(&word).unwrap_or(false);
+            if matched {
+                diagnostics.matched.push(word);
+            } else {
+                diagnostics.unmatched.push(word);
+            }
+        }
+        let checked_words = diagnostics
+            .matched
+            .iter()
+            .chain(&diagnostics.unmatched)
+            .cloned()
+            .collect::<Vec<_>>();
+        for name in self
+            .store
+            .fts_name_prefix_names(&checked_words, 12)
+            .unwrap_or_default()
+        {
+            if !candidates.contains(&name) {
+                candidates.push(name);
+            }
+        }
+        candidates.truncate(12);
+        diagnostics.candidates = candidates;
+        diagnostics
     }
 
     /// Render one file's source section under the per-file budget. Small files
@@ -1490,6 +1777,8 @@ impl CodeGraphEngine {
                         "#### {file_path} — {names} · ⚠ changed since last index sync; source below is the full current file\n\n```{lang}\n{numbered}\n```\n"
                     ),
                     source_emitted: true,
+                    clipped: false,
+                    elided: Vec::new(),
                 };
             }
             return ExploreFileRender {
@@ -1497,6 +1786,9 @@ impl CodeGraphEngine {
                     "#### {file_path} — ⚠ changed on disk after the last index sync — source omitted because indexed line ranges are unsafe and the current file exceeds the {FILE_MODE_MAX_LINES}-line whole-file cap. Read this file directly.\n"
                 ),
                 source_emitted: false,
+                clipped: false,
+                // Nothing it set out to deliver was sent (#2077).
+                elided: elided_wanted_spans(&subgraph.wanted_spans_in(file_path), &[]),
             };
         }
 
@@ -1521,20 +1813,26 @@ impl CodeGraphEngine {
                 return ExploreFileRender {
                     section,
                     source_emitted: true,
+                    clipped: false,
+                    elided: Vec::new(),
                 };
             }
-            // (2) Unaffordable but owning NO focus ⇒ also today's behaviour:
-            //     return whole and let the caller drop it whole, so "an incidental
-            //     file that doesn't fit is DROPPED whole" stays literally true.
-            if ctx.focuses.is_empty() {
+            // (2) Unaffordable but owning NO focus and no exact target ⇒ also
+            //     today's behaviour: return whole and let the caller drop it
+            //     whole, so "an incidental file that doesn't fit is DROPPED
+            //     whole" stays literally true.
+            if ctx.focuses.is_empty() && !subgraph.holds_exact(file_path) {
                 return ExploreFileRender {
                     section,
                     source_emitted: true,
+                    clipped: false,
+                    elided: Vec::new(),
                 };
             }
-            // (3) Unaffordable AND owning a focus ⇒ fall through to the clustering
-            //     path, which windows against `funded_headroom` and guarantees a
-            //     window per focus. The ONLY new behaviour.
+            // (3) Unaffordable AND owning a focus or an exact target ⇒ fall
+            //     through to the clustering path, which windows against
+            //     `funded_headroom` and pays the named members first. The ONLY
+            //     new behaviour.
         }
 
         // Cluster nearby symbol ranges; merge ranges within `gapThreshold`
@@ -1563,7 +1861,9 @@ impl CodeGraphEngine {
                 // matched on the STORED definition line: a focus whose line the
                 // clamp below moves is one the range filters would drop anyway,
                 // and §3.1.1 conditions the guarantee on surviving them.
-                let importance = if ctx.focuses.contains(&(n.start_line as usize)) {
+                let importance = if subgraph.is_exact(&n.id) {
+                    EXACT_IMPORTANCE
+                } else if ctx.focuses.contains(&(n.start_line as usize)) {
                     11
                 } else if subgraph.roots.iter().any(|r| r == &n.id) {
                     10
@@ -1581,18 +1881,48 @@ impl CodeGraphEngine {
                     start,
                     end,
                     label: format!("{}({})", n.name, n.kind.as_str()),
+                    member: ElidedSymbol {
+                        name: n.name.clone(),
+                        kind: n.kind.as_str(),
+                        start_line: start,
+                    },
                     importance,
+                    qualified_name: Some(n.qualified_name.clone()),
                 }
             })
             // Drop ranges whose start is past EOF (a fully-stale node).
             .filter(|r| r.start <= total_lines)
             .collect();
+        // Line spans the query anchored in this file (`lines 900-1003`) are
+        // exact targets too, rendered as exactly the span asked for rather than
+        // as the symbols around it (#2063).
+        for (start, end) in subgraph.anchor_spans_in(file_path) {
+            if start > total_lines {
+                continue;
+            }
+            let end = end.min(total_lines);
+            let name = format!("lines {start}-{end}");
+            ranges.push(ClusterRange {
+                start,
+                end,
+                label: format!("{name}(range)"),
+                member: ElidedSymbol {
+                    name,
+                    kind: "range",
+                    start_line: start,
+                },
+                importance: EXACT_IMPORTANCE,
+                qualified_name: None,
+            });
+        }
         ranges.sort_by_key(|r| r.start);
 
         if ranges.is_empty() {
             return ExploreFileRender {
                 section: String::new(),
                 source_emitted: false,
+                clipped: false,
+                elided: Vec::new(),
             };
         }
 
@@ -1602,6 +1932,8 @@ impl CodeGraphEngine {
             if r.start <= current.end + budget.gap_threshold {
                 current.end = current.end.max(r.end);
                 current.symbols.push(r.label.clone());
+                current.members.push(r.member.clone());
+                current.spans.push((r.start, r.end, r.importance));
                 current.score += r.importance;
                 current.max_importance = current.max_importance.max(r.importance);
             } else {
@@ -1699,47 +2031,60 @@ impl CodeGraphEngine {
         // instead of being taken whole (which then costs the entire file) or
         // skipped whole. Returns the rendered body and whether it was windowed,
         // so the caller can add the `... (gap) ...` honesty marker.
-        let window_cluster = |c: &Cluster, room: usize, focuses: &[usize]| -> (String, bool) {
-            let (start_idx, end_idx) = span_of(c);
-            if range_cost(start_idx, end_idx) <= room {
-                return (render_range(start_idx, end_idx), false);
-            }
-            let head_room = if focuses.is_empty() {
-                room
-            } else {
-                room * 60 / 100
-            };
-            let mut windows: Vec<(usize, usize)> = vec![grow_head(start_idx, end_idx, head_room)];
-            if !focuses.is_empty() {
+        let window_cluster =
+            |c: &Cluster, room: usize, focuses: &[usize]| -> (Vec<(usize, usize)>, bool) {
+                let (start_idx, end_idx) = span_of(c);
+                if range_cost(start_idx, end_idx) <= room {
+                    return (vec![(start_idx, end_idx)], false);
+                }
+                // Upstream `windowToCeiling` (CG-38): the whole room goes to the
+                // head first, and 40% of it is held back for focus windows only
+                // when that head leaves a focus uncovered — then only the focuses
+                // the smaller head misses take a share of it.
+                let full = grow_head(start_idx, end_idx, room);
+                let covers = |w: (usize, usize), line: usize| line > w.0 && line <= w.1;
+                if focuses.iter().all(|&line| covers(full, line)) {
+                    return (vec![full], full != (start_idx, end_idx));
+                }
+                let head_room = room * 60 / 100;
+                let head = grow_head(start_idx, end_idx, head_room);
+                let pending: Vec<usize> = focuses
+                    .iter()
+                    .copied()
+                    .filter(|&line| !covers(head, line))
+                    .collect();
+                let mut windows: Vec<(usize, usize)> = vec![head];
                 // Even shares with carry-forward, never greedy: upstream measured
                 // that a greedy split let an early focus eat the whole reserve and
                 // re-lose the target. One integer division, so the same input
                 // cannot drift by a char across platforms.
                 let reserve = room - head_room;
-                let base = reserve / focuses.len();
-                let mut carry = reserve - base * focuses.len();
-                for &line in focuses {
+                let base = reserve / pending.len();
+                let mut carry = reserve - base * pending.len();
+                for &line in &pending {
                     let allot = base + carry;
                     let w = grow_around(line.saturating_sub(1), start_idx, end_idx, allot);
                     carry = allot.saturating_sub(range_cost(w.0, w.1));
                     windows.push(w);
                 }
-            }
-            windows.sort_unstable();
-            let mut merged: Vec<(usize, usize)> = Vec::new();
-            for w in windows {
-                match merged.last_mut() {
-                    Some(last) if w.0 <= last.1 => last.1 = last.1.max(w.1),
-                    _ => merged.push(w),
+                windows.sort_unstable();
+                let mut merged: Vec<(usize, usize)> = Vec::new();
+                for w in windows {
+                    match merged.last_mut() {
+                        Some(last) if w.0 <= last.1 => last.1 = last.1.max(w.1),
+                        _ => merged.push(w),
+                    }
                 }
-            }
-            let covers_all = merged.len() == 1 && merged[0] == (start_idx, end_idx);
-            let body = merged
+                let covers_all = merged.len() == 1 && merged[0] == (start_idx, end_idx);
+                (merged, !covers_all)
+            };
+        // What windows cost with bare gap markers, the price selection uses.
+        let bare_len = |windows: &[(usize, usize)]| -> usize {
+            windows
                 .iter()
-                .map(|&(lo, hi)| render_range(lo, hi))
-                .collect::<Vec<_>>()
-                .join(GAP_MARKER);
-            (body, !covers_all)
+                .map(|&(lo, hi)| range_cost(lo, hi))
+                .sum::<usize>()
+                + GAP_MARKER.len() * windows.len().saturating_sub(1)
         };
 
         // Rank clusters: entry-point importance first, then density, then span
@@ -1769,23 +2114,293 @@ impl CodeGraphEngine {
             + lang.len()
             + SECTION_FENCE_CHARS
             + SECTION_GAP_TAIL_CHARS;
-        let ceiling = ((budget.max_chars_per_file as f64 * 1.5).round() as usize)
-            .min(ctx.funded_headroom)
-            .saturating_sub(section_frame);
+        let file_cap = if ctx.lift_file_cap {
+            ctx.funded_headroom
+        } else {
+            ((budget.max_chars_per_file as f64 * 1.5).round() as usize).min(ctx.funded_headroom)
+        };
+        let ceiling = file_cap.saturating_sub(section_frame);
+        // A member the query asked for — a root or a protected focus — rather
+        // than incidental context that merely sits within `gap_threshold` of one
+        // (#2062).
+        let is_protected = |importance: u32| importance >= 10;
+        // Member ranges re-merged in source order and padded into windows, so
+        // adjacent survivors read as one block.
+        let member_windows = |spans: &[(usize, usize)]| -> Vec<(usize, usize)> {
+            let mut sorted = spans.to_vec();
+            sorted.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::new();
+            for (start, end) in sorted {
+                match merged.last_mut() {
+                    Some(last) if start <= last.1 + budget.gap_threshold => {
+                        last.1 = last.1.max(end);
+                    }
+                    _ => merged.push((start, end)),
+                }
+            }
+            let mut windows: Vec<(usize, usize)> = Vec::new();
+            for (start, end) in merged {
+                let hi = (end + CONTEXT_PADDING).min(total_lines);
+                let lo = start
+                    .saturating_sub(1)
+                    .saturating_sub(CONTEXT_PADDING)
+                    .min(hi);
+                match windows.last_mut() {
+                    Some(last) if lo <= last.1 => last.1 = last.1.max(hi),
+                    _ => windows.push((lo, hi)),
+                }
+            }
+            windows
+        };
+        // What a cluster's protected members cost on their own — the room a
+        // cluster ranked ABOVE it must leave for them. 0 without any.
+        let protected_core_cost = |c: &Cluster| -> usize {
+            let core = c
+                .spans
+                .iter()
+                .filter(|s| is_protected(s.2))
+                .map(|s| (s.0, s.1))
+                .collect::<Vec<_>>();
+            if core.is_empty() {
+                0
+            } else {
+                bare_len(&member_windows(&core)) + GAP_MARKER.len()
+            }
+        };
+        // The cluster's protected members always, then its incidental members
+        // (most important, smallest, earliest first) while the windows still fit
+        // `cap`. `None` when every member fits, or when the protected core alone
+        // overruns `room` and the ordinary windowing has to cut it.
+        let shrink_to_members =
+            |c: &Cluster, room: usize, cap: usize| -> Option<Vec<(usize, usize)>> {
+                if c.spans.len() < 2 {
+                    return None;
+                }
+                let mut order = c.spans.clone();
+                order.sort_by(|a, b| {
+                    is_protected(b.2)
+                        .cmp(&is_protected(a.2))
+                        .then(b.2.cmp(&a.2))
+                        .then((a.1 - a.0).cmp(&(b.1 - b.0)))
+                        .then(a.0.cmp(&b.0))
+                });
+                let mut kept: Vec<(usize, usize)> = Vec::new();
+                for span in &order {
+                    let mut candidate = kept.clone();
+                    candidate.push((span.0, span.1));
+                    let cost = bare_len(&member_windows(&candidate));
+                    if kept.is_empty() || is_protected(span.2) {
+                        if cost > room {
+                            return None;
+                        }
+                        kept = candidate;
+                    } else if cost <= cap.min(room) {
+                        kept = candidate;
+                    }
+                }
+                (kept.len() < c.spans.len()).then(|| member_windows(&kept))
+            };
+        // What the protected members of every cluster ranked below position `p`
+        // cost. Rank orders clusters, not members, and density counts every
+        // member, so a named function packed with helpers can outrank a named
+        // function alone and spend the file's room on the helpers (#2062).
+        let mut owed_from = vec![0usize; ranked.len() + 1];
+        for p in (0..ranked.len()).rev() {
+            owed_from[p] = owed_from[p + 1] + protected_core_cost(&clusters[ranked[p]]);
+        }
         // Per-cluster render state lives in a Vec indexed parallel to `clusters`,
         // never in a HashSet that is then iterated: emission order must come from
         // the index, not from hash order, or the output stops being byte-stable.
-        let mut rendered_clusters: Vec<Option<String>> = vec![None; clusters.len()];
+        let mut rendered_clusters: Vec<Option<Vec<(usize, usize)>>> = vec![None; clusters.len()];
         let mut projected = 0usize;
         let mut chosen_count = 0usize;
         let mut any_cluster_windowed = false;
-        for &idx in &ranked {
+        // A cluster's exact members (#2063), re-merged and padded like any other.
+        let exact_spans = |c: &Cluster| -> Vec<(usize, usize)> {
+            c.spans
+                .iter()
+                .filter(|s| s.2 >= EXACT_IMPORTANCE)
+                .map(|s| (s.0, s.1))
+                .collect()
+        };
+        let exact_core_cost = |c: &Cluster| -> usize {
+            let exact = exact_spans(c);
+            if exact.is_empty() {
+                0
+            } else {
+                bare_len(&member_windows(&exact))
+            }
+        };
+        // Whether 1-based `line` falls inside one of the 0-based exclusive-end
+        // `windows`.
+        let covers = |windows: &[(usize, usize)], line: usize| -> bool {
+            windows.iter().any(|&(lo, hi)| line > lo && line <= hi)
+        };
+        // What a window of an exact cluster's exact bodies must still reach when
+        // they do not fit whole: each exact member's first line, its body focus
+        // lines, and any named focus inside an exact body. Only lines INSIDE the
+        // exact bodies, as upstream windows only the parts it kept: a named
+        // member beside an oversize exact body is dropped and named in the
+        // header rather than splitting the room the body's own calls need.
+        let exact_focuses_in = |c: &Cluster| -> Vec<usize> {
+            let exact = exact_spans(c);
+            let inside = |line: usize| exact.iter().any(|&(lo, hi)| line >= lo && line <= hi);
+            let mut lines: Vec<usize> = exact.iter().map(|&(lo, _)| lo).collect();
+            for (start, end, body) in ctx.exact_focus {
+                if *start >= c.start && (*end).min(total_lines) <= c.end {
+                    lines.extend(body.iter().copied());
+                }
+            }
+            lines.extend(focuses_in(c).into_iter().filter(|&line| inside(line)));
+            lines.retain(|&line| line >= 1 && line <= total_lines);
+            lines.sort_unstable();
+            lines.dedup();
+            lines
+        };
+        // Upstream's exact branch (#2063). The exact body is kept whole when it
+        // fits `room`, and every other member joins while the rendered windows
+        // still fit: a protected one within `room`, an incidental one within
+        // `cap`. Priced on the rendered windows, so nothing above the exact body
+        // in source order can be paid first and cut its tail. When the exact
+        // body alone overruns `room` it is windowed from its own first line:
+        // the whole room goes to that head unless it would leave a focus line
+        // uncovered, and then 60% of it. Focus lines still uncovered get a
+        // window each from an even share of what is left, carried forward, and
+        // only when one of `MIN_WINDOW_LINES` fits its share.
+        let exact_render = |c: &Cluster, room: usize, cap: usize| -> (Vec<(usize, usize)>, bool) {
+            let (start_idx, end_idx) = span_of(c);
+            if range_cost(start_idx, end_idx) <= cap.min(room) {
+                return (vec![(start_idx, end_idx)], false);
+            }
+            let exact = exact_spans(c);
+            let core = member_windows(&exact);
+            let focuses = exact_focuses_in(c);
+            let mut windows = if bare_len(&core) <= room {
+                let mut order: Vec<(usize, usize, u32)> = c
+                    .spans
+                    .iter()
+                    .filter(|s| s.2 < EXACT_IMPORTANCE)
+                    .copied()
+                    .collect();
+                order.sort_by(|a, b| {
+                    is_protected(b.2)
+                        .cmp(&is_protected(a.2))
+                        .then(b.2.cmp(&a.2))
+                        .then((a.1 - a.0).cmp(&(b.1 - b.0)))
+                        .then(a.0.cmp(&b.0))
+                });
+                let mut kept = exact;
+                for span in order {
+                    let mut candidate = kept.clone();
+                    candidate.push((span.0, span.1));
+                    let limit = if is_protected(span.2) {
+                        room
+                    } else {
+                        cap.min(room)
+                    };
+                    if bare_len(&member_windows(&candidate)) <= limit {
+                        kept = candidate;
+                    }
+                }
+                member_windows(&kept)
+            } else {
+                let head_start = core[0].0;
+                let full = grow_head(head_start, end_idx, room);
+                let head_room = if focuses.iter().all(|&line| covers(&[full], line)) {
+                    room
+                } else {
+                    room * 60 / 100
+                };
+                vec![grow_head(head_start, end_idx, head_room)]
+            };
+            let pending: Vec<usize> = focuses
+                .iter()
+                .copied()
+                .filter(|&line| !covers(&windows, line))
+                .collect();
+            let mut left = room.saturating_sub(bare_len(&windows));
+            for (i, &line) in pending.iter().enumerate() {
+                if covers(&windows, line) {
+                    continue;
+                }
+                let share = (left / (pending.len() - i)).saturating_sub(GAP_MARKER.len());
+                if share == 0 {
+                    continue;
+                }
+                let w = grow_around(line - 1, start_idx, end_idx, share);
+                if w.1 - w.0 < MIN_WINDOW_LINES.min(end_idx - start_idx)
+                    || range_cost(w.0, w.1) > share
+                {
+                    continue;
+                }
+                left = left.saturating_sub(range_cost(w.0, w.1) + GAP_MARKER.len());
+                windows.push(w);
+            }
+            windows.sort_unstable();
+            let mut merged: Vec<(usize, usize)> = Vec::new();
+            for w in windows {
+                match merged.last_mut() {
+                    Some(last) if w.0 <= last.1 => last.1 = last.1.max(w.1),
+                    _ => merged.push(w),
+                }
+            }
+            let whole = merged.len() == 1 && merged[0] == (start_idx, end_idx);
+            (merged, !whole)
+        };
+        // A cluster's incidental members may only use what is left once every
+        // lower-ranked cluster's protected members are paid for, and in a
+        // cluster holding a protected member they never take it past its room,
+        // so a window from the head no longer cuts a named body's tail. Its own
+        // protected members are never held back (#2062).
+        // An exact cluster renders by `exact_render`, with the same hold-back.
+        let guarded_render =
+            |c: &Cluster, room: usize, owed_below: usize| -> (Vec<(usize, usize)>, bool) {
+                if c.max_importance >= EXACT_IMPORTANCE {
+                    let cap = room.saturating_sub(owed_below);
+                    return exact_render(c, room, cap);
+                }
+                let has_protected = c.spans.iter().any(|s| is_protected(s.2));
+                let cap = match (owed_below > 0, has_protected) {
+                    (true, _) => Some(room.saturating_sub(owed_below)),
+                    (false, true) => Some(room),
+                    (false, false) => None,
+                };
+                if let Some(cap) = cap {
+                    let (start_idx, end_idx) = span_of(c);
+                    if range_cost(start_idx, end_idx) > cap.min(room)
+                        && let Some(windows) = shrink_to_members(c, room, cap)
+                    {
+                        return (windows, true);
+                    }
+                }
+                window_cluster(c, room, &focuses_in(c))
+            };
+        // What the exact members of every exact cluster ranked below position
+        // `p` cost. Several exact targets can land in different clusters of one
+        // big file, and the one ranked first would spend the whole room on its
+        // neighbours; so an exact cluster holds that back, never cutting into its
+        // own exact members (#2063).
+        let mut owed_exact_from = vec![0usize; ranked.len() + 1];
+        for p in (0..ranked.len()).rev() {
+            let cost = exact_core_cost(&clusters[ranked[p]]);
+            owed_exact_from[p] =
+                owed_exact_from[p + 1] + if cost > 0 { cost + GAP_MARKER.len() } else { 0 };
+        }
+        let hold_back = |c: &Cluster, rank: usize, room: usize| -> usize {
+            let owed = owed_exact_from[rank + 1];
+            if c.max_importance < EXACT_IMPORTANCE || owed == 0 {
+                return room;
+            }
+            room.min(exact_core_cost(c).max(room.saturating_sub(owed)))
+        };
+        for (rank, &idx) in ranked.iter().enumerate() {
+            let owed_below = owed_from[rank + 1];
             if chosen_count == 0 {
-                let (body, windowed) =
-                    window_cluster(&clusters[idx], ceiling, &focuses_in(&clusters[idx]));
-                projected += body.len();
+                let room = hold_back(&clusters[idx], rank, ceiling);
+                let (windows, windowed) = guarded_render(&clusters[idx], room, owed_below);
+                projected += bare_len(&windows);
                 any_cluster_windowed |= windowed;
-                rendered_clusters[idx] = Some(body);
+                rendered_clusters[idx] = Some(windows);
                 chosen_count += 1;
                 continue;
             }
@@ -1796,7 +2411,11 @@ impl CodeGraphEngine {
             // first cluster's body legitimately exceed `file_budget`, so a plain
             // subtraction wraps to a huge `room` and hands this cluster unlimited
             // budget, the exact opposite of the intent.
-            let room = ceiling.saturating_sub(projected + GAP_MARKER.len());
+            let room = hold_back(
+                &clusters[idx],
+                rank,
+                ceiling.saturating_sub(projected + GAP_MARKER.len()),
+            );
             // The floor's own cost IS `MIN_CHARS` — the smallest useful window —
             // rather than a new magic number. When even that cannot be paid for
             // the cluster is still skipped, so shrinking can never overspend into
@@ -1806,34 +2425,81 @@ impl CodeGraphEngine {
             if room < range_cost(start_idx, floor_end) {
                 continue;
             }
-            let (body, windowed) =
-                window_cluster(&clusters[idx], room, &focuses_in(&clusters[idx]));
+            let (windows, windowed) = guarded_render(&clusters[idx], room, owed_below);
             any_cluster_windowed |= windowed;
-            projected += body.len() + GAP_MARKER.len();
-            rendered_clusters[idx] = Some(body);
+            projected += bare_len(&windows) + GAP_MARKER.len();
+            rendered_clusters[idx] = Some(windows);
             chosen_count += 1;
         }
 
-        let mut file_section = String::new();
+        // Emit chosen clusters in source order, each window a part named by its
+        // 1-based line span.
+        let mut parts: Vec<(usize, usize, String)> = Vec::new();
         let mut symbols: Vec<String> = Vec::new();
         for (i, cluster) in clusters.iter().enumerate() {
-            let Some(body) = rendered_clusters[i].as_ref() else {
+            let Some(windows) = rendered_clusters[i].as_ref() else {
                 continue;
             };
-            if !file_section.is_empty() {
-                file_section.push_str(GAP_MARKER);
-            }
-            file_section.push_str(body);
+            parts.extend(
+                windows
+                    .iter()
+                    .map(|&(lo, hi)| (lo + 1, hi, render_range(lo, hi))),
+            );
             symbols.extend(cluster.symbols.iter().cloned());
         }
-        if chosen_count < clusters.len() || any_cluster_windowed {
+        // Gap names (#1711) are paid from what selection left of this file's
+        // budget, never from source: selection measured every gap as bare.
+        let bare_text = parts.iter().map(|(_, _, text)| text.len()).sum::<usize>()
+            + GAP_MARKER.len() * parts.len().saturating_sub(1);
+        let spare = ceiling.max(projected).saturating_sub(bare_text);
+        let file_index_nodes = self.store.nodes_by_file_path(file_path).unwrap_or_default();
+        let mut file_section =
+            join_parts_with_named_gaps(file_path, &parts, &file_index_nodes, spare);
+        let clipped = chosen_count < clusters.len() || any_cluster_windowed;
+        if clipped {
             file_section.push_str("\n\n... (gap) ...");
         }
 
-        let header = explore_file_header(file_path, &symbols, budget.max_symbols_in_file_header);
+        // Every member across ALL clusters is a candidate for the header bias,
+        // so a dropped cluster's symbols no longer vanish from it (#1711).
+        let mut elided: Vec<ElidedSymbol> = Vec::new();
+        for member in clusters.iter().flat_map(|c| &c.members) {
+            let covered = parts
+                .iter()
+                .any(|(first, last, _)| member.start_line >= *first && member.start_line <= *last);
+            if !covered && !elided.iter().any(|e| e.name == member.name) {
+                elided.push(member.clone());
+            }
+        }
+        elided.sort_by_key(|s| s.start_line);
+        let header = explore_file_header(
+            file_path,
+            &symbols,
+            &elided,
+            budget.max_symbols_in_file_header,
+        );
+        // Every member of every cluster, chosen or not: a dropped cluster, a
+        // shrunk one and a windowed body all leave a member short (#2077).
+        let wanted: Vec<WantedSpan> = ranges
+            .iter()
+            .map(|r| WantedSpan {
+                name: r.member.name.clone(),
+                kind: r.member.kind,
+                start: r.start,
+                end: r.end,
+                importance: r.importance,
+                qualified_name: r.qualified_name.clone(),
+            })
+            .collect();
+        let delivered: Vec<(usize, usize)> = parts
+            .iter()
+            .map(|(first, last, _)| (*first, *last))
+            .collect();
         ExploreFileRender {
             section: format!("{header}\n\n```{lang}\n{file_section}\n```\n"),
             source_emitted: true,
+            clipped,
+            elided: elided_wanted_spans(&wanted, &delivered),
         }
     }
 
@@ -1842,9 +2508,17 @@ impl CodeGraphEngine {
         const ROOT_CAP: usize = 5;
         const DIRECT_CALLER_FILE_CAP: usize = 4;
         let traverser = GraphTraverser::new(&self.store);
-        let roots: Vec<&Node> = subgraph
-            .roots
-            .iter()
+        // Exact targets lead (upstream #2063): the roots are whatever search
+        // ranked first for the bare name, so without this a query for
+        // `SQLCompiler.as_sql` headlined a same-named override.
+        let mut ids: Vec<&String> = Vec::new();
+        for id in subgraph.exact_ids.iter().chain(&subgraph.roots) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        let roots: Vec<&Node> = ids
+            .into_iter()
             .filter_map(|id| subgraph.node(id))
             .filter(|n| is_meaningful_kind(n.kind))
             .take(ROOT_CAP)
@@ -2306,6 +2980,152 @@ impl CodeGraphEngine {
         Ok(results.into_iter().map(|r| r.node).collect())
     }
 
+    /// Which indexed files define a symbol spelled like this query token
+    /// (upstream `filesDefiningSymbol`, #2071): exact names only, and the shared
+    /// matcher for a qualified token, so it agrees with how explore resolves
+    /// named symbols. A node that names a thing without defining it in its file
+    /// (a file, import, export or parameter) does not count. A lookup error
+    /// answers "none", which leaves the span's pins as they were.
+    fn files_defining_symbol(&self, symbol: &str) -> Vec<String> {
+        let qualified = symbol.contains(['.', '/']) || symbol.contains("::");
+        let name = if qualified {
+            last_qualifier_part(symbol).unwrap_or(symbol)
+        } else {
+            symbol
+        };
+        let Ok(nodes) = self.store.nodes_by_name(name) else {
+            return Vec::new();
+        };
+        nodes
+            .into_iter()
+            .filter(|n| !qualified || matches_symbol(n, symbol))
+            .filter(|n| {
+                !matches!(
+                    n.kind,
+                    NodeKind::File | NodeKind::Import | NodeKind::Export | NodeKind::Parameter
+                )
+            })
+            .map(|n| n.file_path)
+            .collect()
+    }
+
+    /// The query's EXACT targets (upstream #2063). A multi-line anchor names a
+    /// span, not a symbol — often the tail of a body a previous response
+    /// windowed — so it is kept as that span; a single-line anchor resolves to
+    /// the innermost callable containing it. A qualified token is exact when
+    /// its non-test definitions number at most three, and then only its
+    /// callables are. Lookups that fail are skipped: exact targets must never
+    /// fail an explore call.
+    ///
+    /// Test paths are judged by the shared `is_test_file`, which differs from
+    /// upstream's seeder regex only at its margins (it also counts `e2e/` and
+    /// `_test.`, but not `fixtures/` or `mocks/`).
+    fn exact_targets(&self, match_query: &str, anchors: &[QueryLineAnchor]) -> ExactTargets {
+        let mut exact = ExactTargets::default();
+        for anchor in anchors {
+            let Ok(file_nodes) = self.store.nodes_by_file_path(&anchor.file) else {
+                continue;
+            };
+            if anchor.start == anchor.end {
+                let line = anchor.start as i64;
+                let enclosing = file_nodes
+                    .into_iter()
+                    .filter(|n| {
+                        is_exact_target_kind(n.kind) && n.start_line <= line && n.end_line >= line
+                    })
+                    .min_by_key(|n| {
+                        (
+                            n.end_line - n.start_line,
+                            n.start_line,
+                            n.start_column,
+                            n.id.clone(),
+                        )
+                    });
+                if let Some(node) = enclosing {
+                    exact.push_node(node);
+                    continue;
+                }
+            }
+            let (start, end) = if anchor.start == anchor.end {
+                (
+                    anchor.start.saturating_sub(ANCHOR_LINE_CONTEXT).max(1),
+                    anchor.start + ANCHOR_LINE_CONTEXT,
+                )
+            } else {
+                (anchor.start, anchor.end)
+            };
+            exact.spans.push((anchor.file.clone(), start, end));
+        }
+        for token in exact_symbol_tokens(match_query) {
+            if !(token.contains('.') || token.contains("::")) {
+                continue;
+            }
+            let Ok(all) = self.find_all_symbols(&token) else {
+                continue;
+            };
+            let candidates: Vec<Node> = all
+                .nodes
+                .into_iter()
+                .filter(|n| is_seedable_kind(n.kind) && !is_test_file(&n.file_path))
+                .collect();
+            if candidates.len() > 3 {
+                continue;
+            }
+            for node in candidates {
+                if is_exact_target_kind(node.kind) {
+                    exact.push_node(node);
+                }
+            }
+        }
+        exact
+    }
+
+    /// Per exact target in `file_path`, `(start, end, focus lines)`: the lines a
+    /// window of its body must reach when it does not fit whole — an anchored
+    /// line inside it, then every line where it uses another symbol the
+    /// question is about (upstream `bodyFocusLines`), capped.
+    fn exact_body_focus(
+        &self,
+        subgraph: &ExploreSubgraph,
+        file_path: &str,
+        anchors: &[QueryLineAnchor],
+        question_ids: &HashSet<String>,
+    ) -> Vec<BodyFocus> {
+        let mut out = Vec::new();
+        for id in &subgraph.exact_ids {
+            let Some(n) = subgraph.node(id) else {
+                continue;
+            };
+            if n.file_path != file_path || n.start_line < 1 || n.end_line < n.start_line {
+                continue;
+            }
+            let (start, end) = (n.start_line as usize, n.end_line as usize);
+            let mut lines: Vec<usize> = anchors
+                .iter()
+                .filter(|a| a.file == n.file_path && a.start > start && a.start <= end)
+                .map(|a| a.start)
+                .collect();
+            let mut uses: Vec<usize> = self
+                .store
+                .edges_by_source_kind(&n.id, None)
+                .unwrap_or_default()
+                .into_iter()
+                .filter(|e| e.target != n.id && question_ids.contains(&e.target))
+                .filter_map(|e| e.line)
+                .filter(|&line| line > start as i64 && line <= end as i64)
+                .map(|line| line as usize)
+                .collect();
+            uses.sort_unstable();
+            lines.extend(uses);
+            let mut seen = HashSet::new();
+            lines.retain(|line| seen.insert(*line));
+            lines.truncate(MAX_BODY_FOCUS_LINES);
+            out.push((start, end, lines));
+        }
+        out.sort_unstable();
+        out
+    }
+
     /// Build the explore subgraph. Ports the deterministic spine of
     /// `findRelevantContext` (`context/index.ts:900-940`): the entry points
     /// (`roots`) are the FTS search results for the query (`searchLimit: 8`,
@@ -2315,13 +3135,14 @@ impl CodeGraphEngine {
     /// relevance re-ranking / file gating is NOT ported (see KNOWN_DIFFS.md).
     #[cfg(test)]
     fn find_relevant_context(&self, query: &str) -> anyhow::Result<ExploreSubgraph> {
-        self.find_relevant_context_with_pins(query, &[])
+        self.find_relevant_context_with_pins(query, &[], &ExactTargets::default())
     }
 
     fn find_relevant_context_with_pins(
         &self,
         query: &str,
         pinned_files: &[String],
+        exact: &ExactTargets,
     ) -> anyhow::Result<ExploreSubgraph> {
         let mut sub = ExploreSubgraph::default();
         let traverser = GraphTraverser::new(&self.store);
@@ -2371,6 +3192,12 @@ impl CodeGraphEngine {
                 sub.insert(node);
             }
         }
+        for node in &exact.nodes {
+            sub.exact_ids.push(node.id.clone());
+            sub.exact_files.insert(node.file_path.clone());
+            sub.insert(node.clone());
+        }
+        sub.anchor_spans = exact.spans.clone();
 
         for root_id in seed_ids.clone() {
             for c in traverser.get_callers(&root_id, CALL_DEPTH)? {
@@ -2919,6 +3746,13 @@ struct SourceProbe {
 struct ExploreFileRender {
     section: String,
     source_emitted: bool,
+    /// The per-file ceiling cut something cluster selection wanted: a cluster
+    /// was dropped or windowed. Only such a render can grow when a named file
+    /// is given the response's unspent budget (#2068).
+    clipped: bool,
+    /// The symbols this section set out to deliver and did not, measured from
+    /// the ranges it sent (#2077). Empty for a complete section.
+    elided: Vec<WantedSpan>,
 }
 
 impl SourceProbe {
@@ -3034,6 +3868,15 @@ struct ExploreSubgraph {
     /// Project-configured ranking-only paths. They stay in the subgraph and
     /// source output, but lose same-tier ordering ties to first-party files.
     deprioritized_files: HashSet<String>,
+    /// EXACT targets (upstream #2063), in discovery order: they lead the blast
+    /// radius and outrank every other member of their file's clusters.
+    exact_ids: Vec<String>,
+    /// Files holding an exact target. Ranked with the rescued files, the
+    /// port's named-file tier, so the answer the agent singled out is funded
+    /// before incidental files.
+    exact_files: HashSet<String>,
+    /// Anchored line spans to render as written, `(file, start, end)`.
+    anchor_spans: Vec<(String, usize, usize)>,
 }
 
 impl ExploreSubgraph {
@@ -3048,6 +3891,66 @@ impl ExploreSubgraph {
 
     fn is_pinned(&self, file_path: &str) -> bool {
         self.pinned_files.iter().any(|path| path == file_path)
+    }
+
+    fn is_exact(&self, id: &str) -> bool {
+        self.exact_ids.iter().any(|exact| exact == id)
+    }
+
+    /// Whether `file_path` holds an exact target or an anchored span.
+    fn holds_exact(&self, file_path: &str) -> bool {
+        self.exact_files.contains(file_path)
+            || self
+                .anchor_spans
+                .iter()
+                .any(|(file, _, _)| file == file_path)
+    }
+
+    /// The nodes of `file_path` as the spans a section of it sets out to
+    /// deliver (#2077): no file node — no section delivers "the file" as a
+    /// symbol — and no import or export.
+    fn wanted_spans_in(&self, file_path: &str) -> Vec<WantedSpan> {
+        self.nodes
+            .iter()
+            .filter(|n| {
+                n.file_path == file_path
+                    && !matches!(n.kind, NodeKind::File | NodeKind::Import | NodeKind::Export)
+                    && n.start_line > 0
+            })
+            .map(|n| WantedSpan {
+                name: n.name.clone(),
+                kind: n.kind.as_str(),
+                start: n.start_line as usize,
+                end: n.end_line.max(n.start_line) as usize,
+                importance: if self.is_exact(&n.id) {
+                    EXACT_IMPORTANCE
+                } else if self.roots.iter().any(|r| r == &n.id) {
+                    10
+                } else {
+                    1
+                },
+                qualified_name: Some(n.qualified_name.clone()),
+            })
+            .collect()
+    }
+
+    fn anchor_spans_in(&self, file_path: &str) -> Vec<(usize, usize)> {
+        self.anchor_spans
+            .iter()
+            .filter(|(file, _, _)| file == file_path)
+            .map(|&(_, start, end)| (start, end))
+            .collect()
+    }
+
+    /// The symbols the question is about: its exact targets and the roots a
+    /// shape-precise query token names — the port's analog of upstream's
+    /// `questionIds` (exact ∪ named ∪ spine), since it has no flow spine.
+    fn question_ids(&self, precise: &[String]) -> HashSet<String> {
+        let named = self.roots.iter().filter(|id| {
+            self.node(id)
+                .is_some_and(|n| precise.iter().any(|t| t.eq_ignore_ascii_case(&n.name)))
+        });
+        self.exact_ids.iter().chain(named).cloned().collect()
     }
 
     fn insert(&mut self, node: Node) -> bool {
@@ -3113,8 +4016,12 @@ impl ExploreSubgraph {
                 // A rescued change-surface file (#1064) is the lexically-
                 // dissimilar answer — give it the TOP tier so it outranks
                 // incidental roots that merely share query words and survives
-                // the output file budget.
-                let tier = if self.rescued_files.contains(fp.as_str()) {
+                // the output file budget. A file holding an exact target
+                // (#2063) is the answer by the same argument, and upstream sorts
+                // the two into one named-file tier.
+                let tier = if self.rescued_files.contains(fp.as_str())
+                    || self.exact_files.contains(fp.as_str())
+                {
                     3
                 } else if root_files.contains(fp.as_str()) {
                     2
@@ -3278,6 +4185,10 @@ impl ExploreSubgraph {
     }
 }
 
+/// An exact target's `(start, end, focus lines)`: where its body sits and the
+/// lines a window of it must still reach (#2063).
+type BodyFocus = (usize, usize, Vec<usize>);
+
 /// Per-file render state for one iteration of `handle_explore`'s file loop.
 ///
 /// These cannot live in [`ExploreOutputBudget`]: that struct is `Copy` and built
@@ -3292,8 +4203,18 @@ struct RenderCtx<'a> {
     funded_headroom: usize,
     /// Definition lines of this file's protected focuses (§3.1): roots whose name
     /// a shape-precise query token names. Every focus line is guaranteed to land
-    /// inside some emitted window.
+    /// inside some emitted window — except in a cluster holding an exact target
+    /// (#2063), which pays the exact body first: a focus outside it that no
+    /// longer fits whole is dropped and named in the file header instead, as
+    /// upstream ranks exact above named.
     focuses: &'a [usize],
+    /// This file's exact targets as `(start, end, body focus lines)`, from
+    /// [`CodeGraphEngine::exact_body_focus`].
+    exact_focus: &'a [BodyFocus],
+    /// Bound the section by `funded_headroom` alone, not also by the per-file
+    /// ceiling: set only when a named file is re-rendered into the budget the
+    /// rest of the response left unspent (#2068).
+    lift_file_cap: bool,
     drifted: bool,
 }
 
@@ -3308,12 +4229,37 @@ fn decimal_width(n: usize) -> usize {
     width
 }
 
+/// What an explore query singled out with no ambiguity left (upstream #2063):
+/// a qualified name that resolves to at most three callables
+/// (`SQLCompiler.as_sql`, not the other `as_sql`s), the callable enclosing a
+/// single-line anchor (`compiler.py:776`), or a line span the query anchored
+/// that no callable answers (`compiler.py lines 900-1003`).
+#[derive(Debug, Default)]
+struct ExactTargets {
+    /// Exact callables in discovery order: anchors first, then qualified names.
+    nodes: Vec<Node>,
+    /// Anchored spans, `(file, start, end)`, 1-based and inclusive. A
+    /// single-line anchor no callable encloses becomes the lines around it.
+    spans: Vec<(String, usize, usize)>,
+}
+
+impl ExactTargets {
+    fn push_node(&mut self, node: Node) {
+        if !self.nodes.iter().any(|known| known.id == node.id) {
+            self.nodes.push(node);
+        }
+    }
+}
+
 /// Cluster source range used when sizing a god-file (`tools.ts:2708-2718`).
 struct ClusterRange {
     start: usize,
     end: usize,
     label: String,
+    member: ElidedSymbol,
     importance: u32,
+    /// The node's qualified name; `None` for an anchored line span.
+    qualified_name: Option<String>,
 }
 
 /// A merged run of adjacent ranges (`tools.ts:2744-2771`).
@@ -3321,6 +4267,13 @@ struct Cluster {
     start: usize,
     end: usize,
     symbols: Vec<String>,
+    /// Every member's name, kind and definition line, so the header can name
+    /// the ones a trim cut (#1711).
+    members: Vec<ElidedSymbol>,
+    /// Every member's `(start, end, importance)` source range, 1-based, so a
+    /// cluster can render its protected members without its incidental ones
+    /// (#2062).
+    spans: Vec<(usize, usize, u32)>,
     score: u32,
     max_importance: u32,
 }
@@ -3331,10 +4284,136 @@ impl Cluster {
             start: r.start,
             end: r.end,
             symbols: vec![r.label.clone()],
+            members: vec![r.member.clone()],
+            spans: vec![(r.start, r.end, r.importance)],
             score: r.importance,
             max_importance: r.importance,
         }
     }
+}
+
+/// What an empty explore's diagnostics found (upstream #1904).
+#[derive(Debug, Default)]
+struct ExploreMissDiagnostics {
+    matched: Vec<String>,
+    unmatched: Vec<String>,
+    candidates: Vec<String>,
+    limited: bool,
+}
+
+/// Backticked words joined by `, `, keeping whole words up to `cap` (UTF-16
+/// units, as upstream measures) and marking a cut with ` …`.
+fn capped_word_list(words: &[String], cap: usize) -> String {
+    let list = |words: &[String]| {
+        words
+            .iter()
+            .map(|word| format!("`{word}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut kept = 0;
+    while kept < words.len() && list(&words[..=kept]).encode_utf16().count() <= cap {
+        kept += 1;
+    }
+    let mut out = list(&words[..kept]);
+    if kept < words.len() {
+        out.push_str(" …");
+    }
+    out
+}
+
+/// An indexed symbol a trim left out of a rendered file (#1711).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ElidedSymbol {
+    name: String,
+    kind: &'static str,
+    start_line: usize,
+}
+
+/// How many elided symbols a gap marker names (#1711): enough for a follow-up
+/// explore to have a target, few enough that the marker never rivals the
+/// source it points at.
+const ELIDED_SYMBOL_CAP: usize = 6;
+
+const BARE_GAP_MARKER: &str = "\n\n... (gap) ...\n\n";
+
+/// Indexed symbols whose definition starts strictly between two rendered spans
+/// (1-based lines): the hole a trim dropped (#1711).
+fn symbols_between_ranges(nodes: &[Node], from_end: usize, to_start: usize) -> Vec<ElidedSymbol> {
+    if to_start <= from_end + 1 {
+        return Vec::new();
+    }
+    let mut out: Vec<ElidedSymbol> = Vec::new();
+    for node in nodes {
+        if matches!(node.kind, NodeKind::Import | NodeKind::Export) {
+            continue;
+        }
+        let start = usize::try_from(node.start_line).unwrap_or(0);
+        if start <= from_end || start >= to_start || out.iter().any(|s| s.name == node.name) {
+            continue;
+        }
+        out.push(ElidedSymbol {
+            name: node.name.clone(),
+            kind: node.kind.as_str(),
+            start_line: start,
+        });
+    }
+    out.sort_by_key(|s| s.start_line);
+    out
+}
+
+/// The gap marker between two non-contiguous slices of one file. A bare
+/// `... (gap) ...` said something was missing but not WHAT, while the trim
+/// note asked for exact names it never gave (#1711); a hole holding indexed
+/// symbols names them as `name (file:line)`.
+fn format_gap_marker(file_path: &str, elided: &[ElidedSymbol]) -> String {
+    if elided.is_empty() {
+        return BARE_GAP_MARKER.to_string();
+    }
+    let shown = elided
+        .iter()
+        .take(ELIDED_SYMBOL_CAP)
+        .map(|s| format!("{} ({file_path}:{})", s.name, s.start_line))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let more = elided.len().saturating_sub(ELIDED_SYMBOL_CAP);
+    let more = if more > 0 {
+        format!(", +{more} more")
+    } else {
+        String::new()
+    };
+    format!("\n\n... (gap: {shown}{more}) ...\n\n")
+}
+
+/// Join rendered parts — `(first_line, last_line, text)`, 1-based — with gap
+/// markers that name what the trim skipped. `spare` is what naming may cost
+/// beyond bare markers: selection priced every join as bare, so a gap the
+/// spare cannot cover stays bare rather than pushing source out (#2057).
+fn join_parts_with_named_gaps(
+    file_path: &str,
+    parts: &[(usize, usize, String)],
+    nodes: &[Node],
+    mut spare: usize,
+) -> String {
+    let Some((_, _, first)) = parts.first() else {
+        return String::new();
+    };
+    let mut out = first.clone();
+    for pair in parts.windows(2) {
+        let named = format_gap_marker(
+            file_path,
+            &symbols_between_ranges(nodes, pair[0].1, pair[1].0),
+        );
+        let extra = named.len() - BARE_GAP_MARKER.len();
+        if extra <= spare {
+            out.push_str(&named);
+            spare -= extra;
+        } else {
+            out.push_str(BARE_GAP_MARKER);
+        }
+        out.push_str(&pair[1].2);
+    }
+    out
 }
 
 // === Free-function renderers (1:1 with upstream helpers) ====================
@@ -3969,6 +5048,61 @@ fn is_handler_method_name(name: &str) -> bool {
     )
 }
 
+/// Kinds an exact target can be (upstream `ANCHOR_CALLABLE_KINDS` / the
+/// seeder's `CALLABLE`): the innermost one containing an anchored line is the
+/// symbol the agent points at. A class is deliberately not one — it spans most
+/// of its file, and "the whole class" is not what a line number asks for.
+/// `constructor` has no Rust NodeKind (ctors are `method`).
+fn is_exact_target_kind(kind: NodeKind) -> bool {
+    matches!(
+        kind,
+        NodeKind::Method | NodeKind::Function | NodeKind::Component
+    )
+}
+
+/// Upstream's seeder `SEEDABLE`: what a named token resolves to, counted when
+/// deciding whether a qualified name is specific enough to be exact.
+fn is_seedable_kind(kind: NodeKind) -> bool {
+    is_exact_target_kind(kind) || matches!(kind, NodeKind::Variable | NodeKind::Constant)
+}
+
+/// File extensions the seeder strips from a token (upstream `FILE_EXT`), so
+/// `compiler.py` reads as `compiler`.
+static SEEDER_FILE_EXT: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(
+        r"(?i)\.(?:java|kt|kts|ts|tsx|js|jsx|mjs|cjs|cs|py|go|rb|php|swift|rs|cpp|cc|cxx|c|h|hpp|scala|lua|dart|vue|svelte|astro|erl|hrl)$",
+    )
+    .expect("seeder file-extension regex is valid")
+});
+
+/// A token shaped like a symbol name (upstream's seeder test), ASCII only as in
+/// JavaScript's `\w`: `get_select`, `SQLCompiler.as_sql`, `Engine::ServeHTTP`.
+static SEEDER_SYMBOL_TOKEN: LazyLock<regex::Regex> = LazyLock::new(|| {
+    regex::Regex::new(r"^[A-Za-z_$][A-Za-z0-9_$]*(?:(?:::|\.)[A-Za-z0-9_$]+)*$")
+        .expect("seeder symbol-token regex is valid")
+});
+
+/// The query's symbol-shaped tokens, split as upstream's named-symbol seeder
+/// splits them, in order, deduped and capped.
+fn exact_symbol_tokens(query: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for raw in query.split(|c: char| c.is_whitespace() || matches!(c, ',' | '(' | ')' | '[' | ']'))
+    {
+        let token = SEEDER_FILE_EXT.replace(raw, "");
+        let token = token.trim();
+        if token.len() < 3 || !SEEDER_SYMBOL_TOKEN.is_match(token) {
+            continue;
+        }
+        if !out.iter().any(|seen| seen == token) {
+            out.push(token.to_string());
+        }
+        if out.len() >= MAX_EXACT_SYMBOL_TOKENS {
+            break;
+        }
+    }
+    out
+}
+
 fn is_container(kind: NodeKind) -> bool {
     matches!(
         kind,
@@ -4119,9 +5253,15 @@ fn cap_header_names(names: &[String], cap: usize) -> String {
     format!("{shown}, +{} more", names.len() - cap)
 }
 
-/// Build a clustered file's `#### path — symbols` header, ranking symbols by
-/// frequency and capping at `cap` (`tools.ts:2859-2876`).
-fn explore_file_header(file_path: &str, symbols: &[String], cap: usize) -> String {
+/// A clustered file's header, preferring the symbols the trim elided so
+/// `+N more` is less likely to hide the answer (#1711): elided first (in
+/// source order), then frequency, then name.
+fn explore_file_header(
+    file_path: &str,
+    symbols: &[String],
+    elided: &[ElidedSymbol],
+    cap: usize,
+) -> String {
     let mut counts: Vec<(String, usize)> = Vec::new();
     for s in symbols {
         if let Some(slot) = counts.iter_mut().find(|(name, _)| name == s) {
@@ -4130,7 +5270,35 @@ fn explore_file_header(file_path: &str, symbols: &[String], cap: usize) -> Strin
             counts.push((s.clone(), 1));
         }
     }
-    counts.sort_by_key(|b| std::cmp::Reverse(b.1));
+    let elided_labels = elided
+        .iter()
+        .map(|s| format!("{}({})", s.name, s.kind))
+        .collect::<Vec<_>>();
+    for label in &elided_labels {
+        if !counts.iter().any(|(name, _)| name == label) {
+            counts.push((label.clone(), 1));
+        }
+    }
+    let rank_of = |label: &str| -> Option<usize> {
+        let name = label.split_once('(').map_or(label, |(name, _)| name);
+        elided_labels
+            .iter()
+            .position(|l| l == label)
+            .or_else(|| elided.iter().position(|s| s.name == name))
+    };
+    counts.sort_by(|(a, count_a), (b, count_b)| {
+        let (rank_a, rank_b) = (rank_of(a), rank_of(b));
+        rank_b
+            .is_some()
+            .cmp(&rank_a.is_some())
+            .then(count_b.cmp(count_a))
+            .then(
+                rank_a
+                    .unwrap_or(usize::MAX)
+                    .cmp(&rank_b.unwrap_or(usize::MAX)),
+            )
+            .then(a.cmp(b))
+    });
     let ranked: Vec<String> = counts.into_iter().map(|(name, _)| name).collect();
     format!("#### {file_path} — {}", cap_header_names(&ranked, cap))
 }
@@ -4243,12 +5411,243 @@ const COMPLETENESS_RULE: &str = "---";
 /// The trim note emitted at tiers that gate the completeness signal OFF. It is
 /// only reached when a file was actually trimmed, but `any_file_trimmed` is
 /// loop-determined, so the pre-loop reserve has to assume it.
-const TRIMMED_NOTE: &str = "> Some file sections were trimmed for size. For a specific symbol you still need, run another `codegraph_explore` (or `codegraph_node`) with its exact name — line-numbered source, cheaper and more complete than Read.";
+const TRIMMED_NOTE: &str = "> Some file sections were trimmed for size. Elided symbols are named inside gap markers as `name (file:line)` and preferred in the file header — run another `codegraph_explore` (or `codegraph_node`) with those exact names for their source.";
 
-fn completeness_signal(files_included: usize) -> String {
+/// One symbol a file section set out to deliver: a cluster member, or a node
+/// of a section that renders no source (#2077). Completeness is judged against
+/// these, not against the file — explore never promises whole files, only the
+/// symbols it selected for each one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WantedSpan {
+    name: String,
+    kind: &'static str,
+    start: usize,
+    end: usize,
+    importance: u32,
+    /// The indexed qualified name (`SQLCompiler::as_sql`), when the span is a node.
+    qualified_name: Option<String>,
+}
+
+/// The wanted spans a section did NOT deliver in full: some line of the span
+/// is outside every range it sent (upstream `elidedWantedSpans`, #2077).
+/// Derived from the emitted ranges rather than from a flag each trim site has
+/// to remember to set, so a member shrink, a ceiling window and a dropped
+/// cluster all show up. Most relevant first, then source order.
+fn elided_wanted_spans(wanted: &[WantedSpan], delivered: &[(usize, usize)]) -> Vec<WantedSpan> {
+    let mut sorted = delivered.to_vec();
+    sorted.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::new();
+    for (start, end) in sorted {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 + 1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    let mut out: Vec<WantedSpan> = wanted
+        .iter()
+        .filter(|w| {
+            w.start > 0
+                && w.end >= w.start
+                && !merged
+                    .iter()
+                    .any(|&(start, end)| start <= w.start && w.end <= end)
+        })
+        .cloned()
+        .collect();
+    out.sort_by(|a, b| b.importance.cmp(&a.importance).then(a.start.cmp(&b.start)));
+    out
+}
+
+/// The shortest trailing slice of each path that no other path ends with:
+/// `extHostExtensionService.ts` alone when it is the only one,
+/// `node/extHostExtensionService.ts` beside `common/extHostExtensionService.ts`.
+fn shortest_unique_suffixes(paths: &[String]) -> HashMap<String, String> {
+    let mut all: Vec<&String> = paths.iter().collect();
+    all.sort_unstable();
+    all.dedup();
+    let mut out = HashMap::new();
+    for path in &all {
+        let segments: Vec<&str> = path.split('/').collect();
+        let mut n = 1;
+        while n < segments.len() {
+            let suffix = segments[segments.len() - n..].join("/");
+            let taken = all.iter().any(|other| {
+                other != path && (**other == suffix || other.ends_with(&format!("/{suffix}")))
+            });
+            if !taken {
+                break;
+            }
+            n += 1;
+        }
+        out.insert((*path).clone(), segments[segments.len() - n..].join("/"));
+    }
+    out
+}
+
+/// Trimmed files the completeness note names one by one; the rest are a count.
+const TRIMMED_FILES_NAMED: usize = 3;
+/// Elided symbols the completeness note names: the ones the query named.
+const TRIMMED_SYMBOLS_NAMED: usize = 4;
+
+/// The name the completeness note offers for an elided symbol: `Owner.member`
+/// for a method, so an overloaded name resolves to the definition that was cut
+/// (django has 110 `as_sql`s). The bare name otherwise.
+fn follow_up_name(span: &WantedSpan) -> String {
+    let owner = span
+        .qualified_name
+        .as_deref()
+        .filter(|_| span.kind == NodeKind::Method.as_str())
+        .and_then(|qualified| {
+            let segments: Vec<&str> = qualified.split("::").collect();
+            (segments.len() >= 2).then(|| segments[segments.len() - 2])
+        })
+        .filter(|owner| {
+            owner.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_' || c == '$')
+                && owner
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+        });
+    match owner {
+        Some(owner) => format!("{owner}.{}", span.name),
+        None => span.name.clone(),
+    }
+}
+
+/// How the completeness note counts the files it vouches for: never "0 files"
+/// beside a note about what was shown.
+fn files_wording(files_included: usize) -> String {
+    match files_included {
+        0 => "these files".to_string(),
+        1 => "1 file".to_string(),
+        n => format!("{n} files"),
+    }
+}
+
+fn complete_source_note(files: &str) -> String {
     format!(
-        "> **Complete source for {files_included} files is included above — do NOT re-read them.** If your question also needs files/symbols listed under \"Not shown above\" (or any area this call didn't cover), make ANOTHER codegraph_explore targeting those names — it returns the same source with line numbers and is cheaper and more complete than reading. Reserve Read for a single specific line range explore can't surface."
+        "> **Complete source for {files} is included above — do NOT re-read them.** If your question also needs files/symbols listed under \"Not shown above\" (or any area this call didn't cover), make ANOTHER codegraph_explore targeting those names — it returns the same source with line numbers and is cheaper and more complete than reading."
     )
+}
+
+const TRIMMED_NOTE_WHAT: &str = "gap markers and file headers name what was elided";
+const TRIMMED_NOTE_TAIL: &str = "For those, or anything under \"Not shown above\", make ANOTHER codegraph_explore with those exact names instead of reading the files — it returns their source with line numbers.";
+
+fn trimmed_note_head(files: &str) -> String {
+    format!("> **Verbatim source for {files} is included above — treat it as already Read.**")
+}
+
+/// The least specific trimmed note: it names nothing, so it is the floor the
+/// epilogue reserve holds.
+fn generic_trimmed_note(files: &str) -> String {
+    format!(
+        "{} Some sections were trimmed for size; {TRIMMED_NOTE_WHAT}. {TRIMMED_NOTE_TAIL}",
+        trimmed_note_head(files)
+    )
+}
+
+/// The large tiers' completeness note, as candidates from most to least
+/// specific (upstream `exploreCompletenessNotes`, #2077). "Complete" is claimed
+/// only when no section elided anything it set out to deliver. Otherwise the
+/// note keeps the guarantee that is still true (every block shown is
+/// verbatim), names the trimmed files and the most relevant elided symbols as
+/// room allows, and sends the agent to another codegraph_explore for them. It
+/// never offers Read.
+fn completeness_notes(
+    files_included: usize,
+    trimmed: &[(String, Vec<WantedSpan>)],
+    known_paths: &[String],
+) -> Vec<String> {
+    let files = files_wording(files_included);
+    if trimmed.is_empty() {
+        return vec![complete_source_note(&files)];
+    }
+    let mut labeled: Vec<String> = known_paths.to_vec();
+    labeled.extend(trimmed.iter().map(|(path, _)| path.clone()));
+    let labels = shortest_unique_suffixes(&labeled);
+    let shown: Vec<String> = trimmed
+        .iter()
+        .take(TRIMMED_FILES_NAMED)
+        .map(|(path, _)| format!("`{}`", labels[path]))
+        .collect();
+    let more = trimmed.len() - shown.len();
+    let mut trimmed_list = shown.join(", ");
+    if more > 0 {
+        trimmed_list.push_str(&format!(" +{more} more"));
+    }
+    let mut names: Vec<String> = Vec::new();
+    for (_, elided) in trimmed {
+        for span in elided {
+            if names.len() >= TRIMMED_SYMBOLS_NAMED {
+                break;
+            }
+            // A container elided by a trim is too big for one section by
+            // construction; its members are the useful names.
+            let container = matches!(
+                span.kind,
+                "file"
+                    | "module"
+                    | "namespace"
+                    | "class"
+                    | "struct"
+                    | "union"
+                    | "interface"
+                    | "protocol"
+                    | "trait"
+            );
+            if span.importance < 10 || container {
+                continue;
+            }
+            let name = follow_up_name(span);
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    let head = trimmed_note_head(&files);
+    let with_files = format!("{head} Trimmed for size: {trimmed_list}; {TRIMMED_NOTE_WHAT}");
+    let mut candidates = Vec::new();
+    if !names.is_empty() {
+        let named = names
+            .iter()
+            .map(|name| format!("`{name}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        candidates.push(format!("{with_files} (e.g. {named}). {TRIMMED_NOTE_TAIL}"));
+    }
+    candidates.push(format!("{with_files}. {TRIMMED_NOTE_TAIL}"));
+    candidates.push(generic_trimmed_note(&files));
+    candidates
+}
+
+/// The longest note the epilogue can fall back to with at most `max_files`
+/// sections: the reserve holds it, so the note always fits, and a more
+/// specific one is used only when what the sections and the pointer list left
+/// pays for its detail.
+fn completeness_note_floor(max_files: usize) -> usize {
+    [
+        files_wording(0),
+        files_wording(1),
+        files_wording(max_files.max(2)),
+    ]
+    .iter()
+    .map(|files| {
+        complete_source_note(files)
+            .len()
+            .max(generic_trimmed_note(files).len())
+    })
+    .max()
+    .unwrap_or(0)
+}
+
+/// The note closing a response the hard ceiling cut, in two wordings: the
+/// trimmed one drops "complete" when a section that survives the cut was
+/// trimmed, and is no longer, so the cut's room holds either.
+fn truncation_note(trimmed: bool) -> &'static str {
+    if trimmed {
+        "\n\n... (output truncated to budget; the source above is verbatim — treat it as already Read. For names its gap markers list, or any area not covered, run another codegraph_explore — do NOT Read these files.)"
+    } else {
+        "\n\n... (output truncated to budget; the source above is complete and verbatim — treat it as already Read. For any area not covered, run another codegraph_explore with the specific names — do NOT Read these files.)"
+    }
 }
 
 fn explore_budget_note(file_count: i64) -> String {
@@ -4266,17 +5665,19 @@ fn pointer_unlisted_tail(unlisted: usize) -> String {
 /// The pre-loop reserve and the post-loop emitter both call THIS function, so the
 /// reserve is derived from the very strings that get emitted and cannot drift from
 /// them. The reserve passes the arguments that maximise the result, which is why
-/// it is an upper bound rather than an estimate.
+/// it is an upper bound rather than an estimate: the completeness note at its
+/// floor length (`completeness_note_floor`), which every note the emitter picks
+/// either meets or pays the difference for from the room the sections left.
 fn epilogue_note_lines(
     budget: &ExploreOutputBudget,
-    files_included: usize,
+    completeness_note: &str,
     any_file_trimmed: bool,
     file_count: Option<i64>,
 ) -> Vec<String> {
     let mut lines = Vec::new();
     if budget.include_completeness_signal {
         lines.push(COMPLETENESS_RULE.to_string());
-        lines.push(completeness_signal(files_included));
+        lines.push(completeness_note.to_string());
         lines.push(String::new());
     } else if any_file_trimmed {
         lines.push(TRIMMED_NOTE.to_string());
@@ -4301,8 +5702,8 @@ fn joined_line_cost(lines: &[String]) -> usize {
 /// file is admitted so the sections cannot spend what the epilogue will need.
 ///
 /// Every term is the length of a string the epilogue actually emits, evaluated at
-/// its worst case: `max_files` maximises the completeness signal's digit width,
-/// `any_file_trimmed = true` selects the larger of the two mutually exclusive
+/// its worst case: the completeness note at the longest length it can fall back
+/// to, `any_file_trimmed = true` selects the larger of the two mutually exclusive
 /// notes, and the unlisted tail is reserved at `file_order` length, which is
 /// >= any achievable count because every unlisted file came from `file_order`.
 fn fixed_epilogue_reserve(
@@ -4320,7 +5721,8 @@ fn fixed_epilogue_reserve(
             String::new(),
         ]);
     }
-    reserve += joined_line_cost(&epilogue_note_lines(budget, max_files, true, file_count));
+    let floor_note = "x".repeat(completeness_note_floor(max_files));
+    reserve += joined_line_cost(&epilogue_note_lines(budget, &floor_note, true, file_count));
     reserve
 }
 
@@ -4350,7 +5752,11 @@ fn fit_pointer_lines(candidates: &[String], pointer_budget: usize) -> (Vec<Strin
 /// trailing whole sections drop rather than slicing a method body; fall back to
 /// a line boundary in the degenerate single-giant-section case
 /// (`tools.ts:2964-2975`).
-fn cut_at_section_boundary(output: &str, ceiling: usize) -> (String, usize) {
+fn cut_at_section_boundary(
+    output: &str,
+    ceiling: usize,
+    trimmed_files: &[&str],
+) -> (String, usize) {
     if output.len() <= ceiling {
         return (output.to_string(), output.len());
     }
@@ -4362,10 +5768,12 @@ fn cut_at_section_boundary(output: &str, ceiling: usize) -> (String, usize) {
     };
     let kept_prefix_len = if boundary > 0 { boundary } else { cut.len() };
     let safe = &output[..kept_prefix_len];
+    // "Complete" only while no trimmed section survives the cut (#2077).
+    let trimmed = trimmed_files
+        .iter()
+        .any(|file| safe.contains(&format!("#### {file} ")));
     (
-        format!(
-            "{safe}\n\n... (output truncated to budget; the source above is complete and verbatim — treat it as already Read. For any area not covered, run another codegraph_explore with the specific names — do NOT Read these files.)"
-        ),
+        format!("{safe}{}", truncation_note(trimmed)),
         kept_prefix_len,
     )
 }
@@ -4435,6 +5843,8 @@ mod tests {
             budget,
             funded_headroom: budget.max_output_chars.saturating_sub(1),
             focuses,
+            exact_focus: &[],
+            lift_file_cap: false,
             drifted: false,
         }
     }
@@ -4513,6 +5923,674 @@ mod tests {
             .section;
         assert!(out.contains("line 10"), "cluster source missing: {out:?}");
         assert!(out.contains("line 30"), "cluster source missing: {out:?}");
+    }
+
+    /// A gap between two rendered spans names the indexed symbols that start
+    /// inside it, from the full file index (#1711), and only while the spare
+    /// budget pays for the names; otherwise it stays bare (#2057).
+    #[test]
+    fn gap_markers_name_the_symbols_a_trim_skipped_within_the_spare_budget() {
+        let nodes = vec![
+            node("alpha", "a.ts", 10, 30, NodeKind::Function),
+            node("helperMid", "a.ts", 100, 120, NodeKind::Function),
+            node("helperMid", "a.ts", 130, 140, NodeKind::Function),
+            node("loader", "a.ts", 150, 150, NodeKind::Import),
+            node("beta", "a.ts", 200, 220, NodeKind::Function),
+        ];
+        assert_eq!(
+            symbols_between_ranges(&nodes, 33, 197)
+                .iter()
+                .map(|s| (s.name.as_str(), s.start_line))
+                .collect::<Vec<_>>(),
+            vec![("helperMid", 100)]
+        );
+        let parts = vec![(7, 33, "head".to_string()), (197, 223, "tail".to_string())];
+        assert_eq!(
+            join_parts_with_named_gaps("a.ts", &parts, &nodes, usize::MAX),
+            "head\n\n... (gap: helperMid (a.ts:100)) ...\n\ntail"
+        );
+        assert_eq!(
+            join_parts_with_named_gaps("a.ts", &parts, &nodes, 3),
+            "head\n\n... (gap) ...\n\ntail",
+            "names the spare cannot pay for stay out"
+        );
+
+        let many: Vec<ElidedSymbol> = (0..8)
+            .map(|i| ElidedSymbol {
+                name: format!("s{i}"),
+                kind: "function",
+                start_line: 40 + i,
+            })
+            .collect();
+        assert!(format_gap_marker("a.ts", &many).contains("s5 (a.ts:45), +2 more"));
+    }
+
+    /// An empty explore explains itself lexically (upstream #1904): which
+    /// checked words matched nothing, which matched but scored out, and the
+    /// indexed names sharing a word to retry with.
+    #[test]
+    fn empty_explore_explains_lexical_misses_and_offers_shared_word_candidates() {
+        let mut engine = test_engine();
+        put_indexed_source(
+            &engine,
+            "src/a.ts",
+            "function explainHowThingsWork() {\n  return 1;\n}\n",
+            Language::TypeScript,
+            1,
+        );
+        put_nodes(
+            &mut engine,
+            &[node_lang(
+                "explainHowThingsWork",
+                "explainHowThingsWork",
+                "src/a.ts",
+                1,
+                3,
+                NodeKind::Function,
+                Language::TypeScript,
+            )],
+        );
+        let explore = |query: &str| {
+            text_of(&engine.execute("codegraph_explore", &serde_json::json!({ "query": query })))
+        };
+
+        let text = explore("how do we stop users signing up too fast");
+        assert!(text.contains("No relevant code found"), "{text}");
+        assert!(text.contains("lexically, not by meaning"), "{text}");
+        let line = |prefix: &str| {
+            text.lines()
+                .find(|line| line.starts_with(prefix))
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(line("No lexical matches").contains("`signing`"), "{text}");
+        assert!(line("Matched indexed words").contains("`how`"), "{text}");
+        assert!(
+            line("Candidates to retry with codegraph_explore").contains("`explainHowThingsWork`"),
+            "{text}"
+        );
+
+        let text = explore("zebra quantum");
+        assert!(
+            text.contains("No lexical matches for checked words: `zebra`, `quantum`."),
+            "{text}"
+        );
+        assert!(
+            text.contains("No shared-word symbol candidates found"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn empty_explore_on_an_empty_index_says_so() {
+        let engine = test_engine();
+        let text = text_of(&engine.execute(
+            "codegraph_explore",
+            &serde_json::json!({ "query": "signup throttle" }),
+        ));
+        assert!(text.contains("This project has nothing indexed"), "{text}");
+    }
+
+    #[test]
+    fn capped_word_lists_keep_whole_words_and_mark_the_cut() {
+        let words = ["alpha", "beta", "gamma"].map(String::from);
+        assert_eq!(capped_word_list(&words, 100), "`alpha`, `beta`, `gamma`");
+        assert_eq!(capped_word_list(&words, 15), "`alpha`, `beta` …");
+        assert_eq!(capped_word_list(&words, 3), " …");
+    }
+
+    /// The header prefers the symbols the trim cut, in source order, so
+    /// `+N more` stops hiding the answer (#1711).
+    #[test]
+    fn clustered_file_header_prefers_elided_symbols() {
+        let symbols = vec![
+            "alpha(function)".to_string(),
+            "alpha(function)".to_string(),
+            "zed(function)".to_string(),
+        ];
+        let elided = vec![
+            ElidedSymbol {
+                name: "syncStateNow".to_string(),
+                kind: "method",
+                start_line: 300,
+            },
+            ElidedSymbol {
+                name: "beta".to_string(),
+                kind: "function",
+                start_line: 120,
+            },
+        ];
+        let mut elided_sorted = elided.clone();
+        elided_sorted.sort_by_key(|s| s.start_line);
+        assert_eq!(
+            explore_file_header("f.ts", &symbols, &elided_sorted, 3),
+            "#### f.ts — beta(function), syncStateNow(method), alpha(function), +1 more"
+        );
+    }
+
+    /// A named function packed with incidental helpers can outrank, by density,
+    /// a cluster holding a named function alone. Its helpers may then only use
+    /// what is left once the lower cluster's named body is paid for, so both
+    /// named bodies come back whole (upstream #2062).
+    #[test]
+    fn incidental_members_leave_room_for_a_lower_ranked_named_body() {
+        let engine = test_engine();
+        let file = "lib/response.ts";
+        let owned: Vec<String> = (1..=600)
+            .map(|i| format!("    const v{i} = step{i}(input); // line {i}"))
+            .collect();
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let send_file = node("sendFile", file, 10, 30, NodeKind::Function);
+        let send_body = node("sendBody", file, 300, 336, NodeKind::Function);
+        let mut nodes = vec![send_file.clone(), send_body.clone()];
+        for k in 0..40 {
+            let start = 32 + 3 * k;
+            nodes.push(node(
+                &format!("helper{k}"),
+                file,
+                start,
+                start + 1,
+                NodeKind::Function,
+            ));
+        }
+        let sg = subgraph_with(nodes, vec![send_file.id.clone(), send_body.id.clone()]);
+        let budget = crate::explore_budget::get_explore_output_budget(200);
+        let out = engine
+            .render_explore_file(
+                &sg,
+                file,
+                &file_lines,
+                "typescript",
+                &render_ctx(&budget, &[]),
+            )
+            .section;
+        let emitted = out
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .filter_map(|(n, _)| n.parse::<usize>().ok())
+            .collect::<std::collections::BTreeSet<_>>();
+        for line in (10..=30).chain(300..=336) {
+            assert!(
+                emitted.contains(&line),
+                "named body line {line} missing: {emitted:?}"
+            );
+        }
+    }
+
+    /// CG-38, as upstream's `windowToCeiling` has it: the whole room goes to a
+    /// windowed cluster's head first, so a focus the head already covers costs
+    /// the head nothing — it used to hold 40% of the room back for a window on
+    /// a line the head showed anyway.
+    #[test]
+    fn a_focus_the_head_already_covers_costs_the_head_nothing() {
+        let engine = test_engine();
+        let file = "god.ts";
+        let owned: Vec<String> = (1..=600)
+            .map(|i| format!("  // padding line {i} inside hugeHandler keeping the body enormous"))
+            .collect();
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let huge = node("hugeHandler", file, 1, 600, NodeKind::Function);
+        let sg = subgraph_with(vec![huge.clone()], vec![huge.id.clone()]);
+        let budget = crate::explore_budget::get_explore_output_budget(200);
+        let render = |focuses: &[usize]| {
+            engine
+                .render_explore_file(
+                    &sg,
+                    file,
+                    &file_lines,
+                    "typescript",
+                    &render_ctx(&budget, focuses),
+                )
+                .section
+        };
+        assert_eq!(render(&[1]), render(&[]));
+    }
+
+    /// #2063: two exact targets in different clusters of one file. The one
+    /// ranked first sits among named roots that would otherwise fill the whole
+    /// room, so it holds back what the lower-ranked exact target still owes, and
+    /// both render whole.
+    #[test]
+    fn an_exact_cluster_holds_back_what_a_lower_ranked_exact_target_owes() {
+        let engine = test_engine();
+        let file = "app/App.py";
+        let owned: Vec<String> = (1..=600)
+            .map(|i| format!("    v{i} = step{i}(state)  # line {i}"))
+            .collect();
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let trigger = node("triggerRender", file, 10, 40, NodeKind::Method);
+        let pointer = node("handlePointer", file, 500, 530, NodeKind::Method);
+        let mut nodes = vec![trigger.clone(), pointer.clone()];
+        let mut roots = Vec::new();
+        for k in 0..30 {
+            let start = 42 + 4 * k;
+            let root = node(
+                &format!("hook{k}"),
+                file,
+                start,
+                start + 1,
+                NodeKind::Method,
+            );
+            roots.push(root.id.clone());
+            nodes.push(root);
+        }
+        let mut sg = subgraph_with(nodes, roots);
+        sg.exact_ids = vec![trigger.id.clone(), pointer.id.clone()];
+        sg.exact_files.insert(file.to_string());
+        let budget = crate::explore_budget::get_explore_output_budget(200);
+        let out = engine
+            .render_explore_file(&sg, file, &file_lines, "python", &render_ctx(&budget, &[]))
+            .section;
+        let emitted = out
+            .lines()
+            .filter_map(|line| line.split_once('\t'))
+            .filter_map(|(n, _)| n.parse::<usize>().ok())
+            .collect::<std::collections::BTreeSet<_>>();
+        for line in (10..=40).chain(500..=530) {
+            assert!(
+                emitted.contains(&line),
+                "exact body line {line} missing: {emitted:?}"
+            );
+        }
+    }
+
+    /// #2063: an anchor resolves to the innermost callable enclosing its line;
+    /// a range, or a line no callable encloses, stays a span.
+    #[test]
+    fn line_anchors_resolve_to_the_innermost_callable_or_stay_spans() {
+        let mut engine = test_engine();
+        let file = "pkg/compiler.py";
+        let class = node("SQLCompiler", file, 1, 100, NodeKind::Class);
+        let method = node("as_sql", file, 10, 60, NodeKind::Method);
+        let inner = node("render_part", file, 20, 30, NodeKind::Function);
+        put_nodes(&mut engine, &[class, method.clone(), inner.clone()]);
+        let anchor = |start: usize, end: usize| QueryLineAnchor {
+            file: file.to_string(),
+            start,
+            end,
+        };
+        let exact = engine.exact_targets(
+            "",
+            &[
+                anchor(25, 25),
+                anchor(50, 50),
+                anchor(150, 150),
+                anchor(5, 5),
+                anchor(40, 60),
+            ],
+        );
+        let ids: Vec<&str> = exact.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids, vec![inner.id.as_str(), method.id.as_str()]);
+        assert_eq!(
+            exact.spans,
+            vec![
+                (file.to_string(), 135, 165),
+                (file.to_string(), 1, 20),
+                (file.to_string(), 40, 60),
+            ]
+        );
+    }
+
+    /// #2063: a qualified name is exact only when its non-test definitions
+    /// number at most three, and then only its callables are.
+    #[test]
+    fn a_qualified_name_is_exact_only_when_it_names_at_most_three_definitions() {
+        let mut engine = test_engine();
+        let lang = Language::Python;
+        let plan = node_lang(
+            "plan",
+            "Planner::plan",
+            "planner.py",
+            2,
+            9,
+            NodeKind::Method,
+            lang,
+        );
+        let plan_test = node_lang(
+            "plan",
+            "Planner::plan",
+            "tests/test_planner.py",
+            2,
+            4,
+            NodeKind::Method,
+            lang,
+        );
+        let limit = node_lang(
+            "limit",
+            "Planner::limit",
+            "planner.py",
+            11,
+            11,
+            NodeKind::Variable,
+            lang,
+        );
+        let as_sql: Vec<Node> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|dir| {
+                node_lang(
+                    "as_sql",
+                    "Compiler::as_sql",
+                    &format!("{dir}/compiler.py"),
+                    3,
+                    8,
+                    NodeKind::Method,
+                    lang,
+                )
+            })
+            .collect();
+        let render: Vec<Node> = ["a", "b", "c"]
+            .iter()
+            .map(|dir| {
+                node_lang(
+                    "render",
+                    "Widget::render",
+                    &format!("{dir}/widget.py"),
+                    3,
+                    8,
+                    NodeKind::Method,
+                    lang,
+                )
+            })
+            .collect();
+        let mut all = vec![plan.clone(), plan_test, limit];
+        all.extend(as_sql);
+        all.extend(render.clone());
+        put_nodes(&mut engine, &all);
+        let exact = engine.exact_targets(
+            "Planner.plan Planner.limit Compiler.as_sql Widget.render plan",
+            &[],
+        );
+        let ids: Vec<&str> = exact.nodes.iter().map(|n| n.id.as_str()).collect();
+        assert_eq!(ids.first(), Some(&plan.id.as_str()), "{ids:?}");
+        let mut rest = ids[1..].to_vec();
+        rest.sort_unstable();
+        let mut want: Vec<&str> = render.iter().map(|n| n.id.as_str()).collect();
+        want.sort_unstable();
+        assert_eq!(
+            rest, want,
+            "three definitions are still exact; four are not"
+        );
+        assert!(exact.spans.is_empty());
+    }
+
+    #[test]
+    fn exact_symbol_tokens_split_like_the_seeder() {
+        assert_eq!(
+            exact_symbol_tokens(
+                "SQLCompiler.as_sql, get_select() compiler.py Engine::ServeHTTP of x é.a get_select"
+            ),
+            vec![
+                "SQLCompiler.as_sql",
+                "get_select",
+                "compiler",
+                "Engine::ServeHTTP",
+            ]
+        );
+    }
+
+    fn wanted(
+        name: &str,
+        start: usize,
+        end: usize,
+        importance: u32,
+        kind: &'static str,
+    ) -> WantedSpan {
+        WantedSpan {
+            name: name.to_string(),
+            kind,
+            start,
+            end,
+            importance,
+            qualified_name: None,
+        }
+    }
+
+    fn names_of(spans: &[WantedSpan]) -> Vec<&str> {
+        spans.iter().map(|s| s.name.as_str()).collect()
+    }
+
+    /// Anything that offers Read as a way forward (#2077). "treat it as already
+    /// Read" is the guarantee and "do NOT Read" a prohibition; neither offers it.
+    fn offers_read(text: &str) -> bool {
+        ["Reserve Read", "use Read", "Read for ", "fall back to Read"]
+            .iter()
+            .any(|offer| text.contains(offer))
+    }
+
+    /// The note #2077 replaced, for the size bound.
+    const OLD_COMPLETENESS_NOTE: &str = "> **Complete source for 8 files is included above — do NOT re-read them.** If your question also needs files/symbols listed under \"Not shown above\" (or any area this call didn't cover), make ANOTHER codegraph_explore targeting those names — it returns the same source with line numbers and is cheaper and more complete than reading. Reserve Read for a single specific line range explore can't surface.";
+
+    #[test]
+    fn elided_wanted_spans_are_judged_on_what_was_sent() {
+        let elided = elided_wanted_spans(
+            &[
+                wanted("inside", 10, 20, 1, "method"),
+                wanted("straddles", 25, 60, 1, "method"),
+                wanted("absent", 90, 95, 1, "method"),
+            ],
+            &[(1, 40)],
+        );
+        assert_eq!(names_of(&elided), vec!["straddles", "absent"]);
+        // Adjacent ranges are one continuous copy.
+        assert!(
+            elided_wanted_spans(&[wanted("whole", 5, 45, 1, "method")], &[(1, 30), (31, 50)])
+                .is_empty()
+        );
+        // Most relevant first, then source order; no usable range, no entry.
+        let ordered = elided_wanted_spans(
+            &[
+                wanted("late", 80, 81, 10, "method"),
+                wanted("peripheral", 5, 6, 1, "method"),
+                wanted("early", 40, 41, 10, "method"),
+                wanted("zero", 0, 0, 10, "method"),
+                wanted("inverted", 9, 3, 10, "method"),
+            ],
+            &[],
+        );
+        assert_eq!(names_of(&ordered), vec!["early", "late", "peripheral"]);
+    }
+
+    #[test]
+    fn shortest_unique_suffixes_name_a_file_apart_from_its_namesakes() {
+        let paths: Vec<String> = [
+            "src/vs/workbench/api/common/extHostExtensionService.ts",
+            "src/vs/workbench/api/node/extHostExtensionService.ts",
+            "src/vs/workbench/services/extensions/common/rpcProtocol.ts",
+        ]
+        .map(str::to_string)
+        .to_vec();
+        let labels = shortest_unique_suffixes(&paths);
+        assert_eq!(labels[&paths[0]], "common/extHostExtensionService.ts");
+        assert_eq!(labels[&paths[1]], "node/extHostExtensionService.ts");
+        assert_eq!(labels[&paths[2]], "rpcProtocol.ts");
+        // One path a suffix of another: the whole path.
+        let nested: Vec<String> = ["a/b.ts", "x/a/b.ts"].map(str::to_string).to_vec();
+        let labels = shortest_unique_suffixes(&nested);
+        assert_eq!(labels["a/b.ts"], "a/b.ts");
+        assert_eq!(labels["x/a/b.ts"], "x/a/b.ts");
+    }
+
+    #[test]
+    fn completeness_is_claimed_only_when_nothing_was_trimmed() {
+        let notes = completeness_notes(4, &[], &["a.ts".to_string(), "b.ts".to_string()]);
+        assert_eq!(notes.len(), 1);
+        assert!(
+            notes[0].contains("Complete source for 4 files"),
+            "{}",
+            notes[0]
+        );
+        assert!(!offers_read(&notes[0]), "{}", notes[0]);
+
+        let file = "src/vs/workbench/services/extensions/common/rpcProtocol.ts".to_string();
+        let trimmed = vec![(
+            file.clone(),
+            vec![
+                wanted("_receiveOneMessage", 280, 357, 11, "method"),
+                // A container is no follow-up target.
+                wanted("RPCProtocol", 200, 900, 10, "class"),
+                wanted("serializeRequest", 700, 720, 10, "method"),
+                wanted("helperNobodyAskedFor", 10, 12, 1, "method"),
+            ],
+        )];
+        let notes = completeness_notes(3, &trimmed, &[file, "src/a.ts".to_string()]);
+        for note in &notes {
+            assert!(!note.contains("Complete source"), "{note}");
+            assert!(note.contains("Verbatim source for 3 files"), "{note}");
+            assert!(note.contains("treat it as already Read"), "{note}");
+            assert!(note.contains("codegraph_explore"), "{note}");
+            assert!(!offers_read(note), "{note}");
+        }
+        assert!(notes[0].contains("`rpcProtocol.ts`"), "{}", notes[0]);
+        assert!(
+            notes[0].contains("`_receiveOneMessage`, `serializeRequest`"),
+            "{}",
+            notes[0]
+        );
+        assert!(!notes[0].contains("`RPCProtocol`"), "{}", notes[0]);
+        assert!(!notes[0].contains("helperNobodyAskedFor"), "{}", notes[0]);
+    }
+
+    #[test]
+    fn completeness_notes_count_files_in_words_and_label_namesakes_apart() {
+        let one = vec![("a.ts".to_string(), vec![wanted("f", 1, 9, 10, "function")])];
+        let known = ["a.ts".to_string()];
+        assert!(
+            completeness_notes(1, &[], &known)[0]
+                .contains("Complete source for 1 file is included")
+        );
+        assert!(
+            completeness_notes(1, &one, &known)[0]
+                .contains("Verbatim source for 1 file is included")
+        );
+        for note in completeness_notes(0, &one, &known) {
+            assert!(!note.contains(" 0 file"), "{note}");
+            assert!(note.contains("Verbatim source for these files"), "{note}");
+        }
+        let trimmed = vec![(
+            "src/common/rpcProtocol.ts".to_string(),
+            vec![wanted("f", 1, 9, 10, "function")],
+        )];
+        let notes = completeness_notes(
+            1,
+            &trimmed,
+            &[
+                "src/common/rpcProtocol.ts".to_string(),
+                "src/node/rpcProtocol.ts".to_string(),
+            ],
+        );
+        assert!(notes[0].contains("`common/rpcProtocol.ts`"), "{}", notes[0]);
+    }
+
+    #[test]
+    fn completeness_notes_offer_an_elided_method_as_owner_dot_member() {
+        let q = |mut span: WantedSpan, qualified: &str| {
+            span.qualified_name = Some(qualified.to_string());
+            span
+        };
+        let trimmed = vec![(
+            "django/db/models/sql/compiler.py".to_string(),
+            vec![
+                q(
+                    wanted("as_sql", 776, 1003, 12, "method"),
+                    "SQLCompiler::as_sql",
+                ),
+                q(
+                    wanted("PLUGIN_ID", 5, 5, 10, "method"),
+                    "org.lamport.tla::HelpActivator::PLUGIN_ID",
+                ),
+                // A local function keeps its bare name.
+                q(wanted("inner", 40, 44, 10, "function"), "Outer::run::inner"),
+                // A path is no owner.
+                q(wanted("odd", 50, 52, 10, "method"), "src/a.py::odd"),
+            ],
+        )];
+        let notes = completeness_notes(
+            1,
+            &trimmed,
+            &["django/db/models/sql/compiler.py".to_string()],
+        );
+        assert!(
+            notes[0]
+                .contains("(e.g. `SQLCompiler.as_sql`, `HelpActivator.PLUGIN_ID`, `inner`, `odd`)"),
+            "{}",
+            notes[0]
+        );
+    }
+
+    #[test]
+    fn completeness_notes_run_from_most_to_least_specific_within_the_old_bound() {
+        let trimmed: Vec<(String, Vec<WantedSpan>)> = ["a", "b", "c", "d", "e"]
+            .iter()
+            .map(|n| {
+                (
+                    format!("packages/{n}/src/deeply/nested/{n}Service.ts"),
+                    vec![wanted(&format!("{n}Handler"), 10, 90, 10, "function")],
+                )
+            })
+            .collect();
+        let known: Vec<String> = trimmed.iter().map(|(path, _)| path.clone()).collect();
+        let notes = completeness_notes(8, &trimmed, &known);
+        assert_eq!(notes.len(), 3);
+        for pair in notes.windows(2) {
+            assert!(pair[1].len() < pair[0].len(), "{pair:?}");
+        }
+        assert!(
+            notes[1].contains("`aService.ts`, `bService.ts`, `cService.ts` +2 more"),
+            "{}",
+            notes[1]
+        );
+        assert!(!notes[2].contains("Service.ts"), "{}", notes[2]);
+        assert!(notes[2].len() < OLD_COMPLETENESS_NOTE.len());
+        // The reserve covers the longest note the epilogue can fall back to.
+        assert!(completeness_note_floor(8) >= notes[2].len());
+        assert!(completeness_note_floor(8) >= completeness_notes(8, &[], &known)[0].len());
+        assert!(completeness_note_floor(8) >= completeness_notes(0, &trimmed, &known)[2].len());
+    }
+
+    #[test]
+    fn the_truncation_note_drops_complete_for_a_trimmed_response() {
+        let (complete, trimmed) = (truncation_note(false), truncation_note(true));
+        assert!(trimmed.len() <= complete.len());
+        assert!(complete.contains("complete and verbatim"));
+        assert!(!trimmed.contains("complete"), "{trimmed}");
+        assert!(trimmed.contains("treat it as already Read"));
+        for note in [complete, trimmed] {
+            assert!(note.contains("codegraph_explore"));
+            assert!(!offers_read(note), "{note}");
+        }
+    }
+
+    /// End to end: two rendered clusters with an index-only symbol between
+    /// them get a named gap.
+    #[test]
+    fn render_explore_file_names_an_index_only_symbol_in_a_gap() {
+        let mut engine = test_engine();
+        let file = "big.ts";
+        let owned: Vec<String> = (1..=400).map(|i| format!("line {i}")).collect();
+        let file_lines: Vec<&str> = owned.iter().map(String::as_str).collect();
+        let alpha = node("alpha", file, 10, 30, NodeKind::Function);
+        let beta = node("beta", file, 200, 220, NodeKind::Function);
+        let mid = node("helperMid", file, 100, 110, NodeKind::Function);
+        put_nodes(&mut engine, &[alpha.clone(), mid, beta.clone()]);
+        let sg = subgraph_with(
+            vec![alpha.clone(), beta.clone()],
+            vec![alpha.id.clone(), beta.id.clone()],
+        );
+        let budget = crate::explore_budget::get_explore_output_budget(200);
+        let out = engine
+            .render_explore_file(
+                &sg,
+                file,
+                &file_lines,
+                "typescript",
+                &render_ctx(&budget, &[]),
+            )
+            .section;
+        assert!(out.contains("line 10") && out.contains("line 200"), "{out}");
+        assert!(
+            out.contains("... (gap: helperMid (big.ts:100)) ..."),
+            "{out}"
+        );
     }
 
     /// Regression: a small HEALTHY file returns WHOLE, byte-for-byte, exactly as
@@ -4599,6 +6677,8 @@ mod tests {
             budget: &budget,
             funded_headroom: whole.len() - 1,
             focuses: &[],
+            exact_focus: &[],
+            lift_file_cap: false,
             drifted: false,
         };
         let unaffordable_no_focus = engine
@@ -5738,7 +7818,7 @@ mod tests {
             format!("#### {file} — truncated\n\n```rust\nfn truncated() {{}}\n```\n"),
         ];
         let output = lines.join("\n");
-        let (output, kept_prefix_len) = cut_at_section_boundary(&output, 180);
+        let (output, kept_prefix_len) = cut_at_section_boundary(&output, 180, &[]);
         engine.mark_surviving_explore_citations(&lines, &[(file.to_string(), 1)], kept_prefix_len);
 
         let result = engine.with_staleness_banner(ToolResult::text(output));
@@ -6009,7 +8089,10 @@ mod tests {
             "an admission-dropped file must be named in the pointer block: {text}"
         );
         assert!(
-            text.contains(&format!("Complete source for {} files", headers.len())),
+            text.contains(&format!(
+                "Complete source for {} is included",
+                files_wording(headers.len())
+            )),
             "the epilogue must survive with a count matching the rendered sections: {text}"
         );
         assert!(
@@ -6868,7 +8951,7 @@ mod tests {
         s.push_str(&"a".repeat(100));
         s.push_str("\n#### file.rs — X\n");
         s.push_str(&"b".repeat(400));
-        let (out, _) = cut_at_section_boundary(&s, 200);
+        let (out, _) = cut_at_section_boundary(&s, 200, &[]);
         assert!(out.contains("output truncated to budget"), "got: {out}");
     }
 
@@ -7592,7 +9675,7 @@ mod tests {
             "a(function)".to_string(),
             "b(function)".to_string(),
         ];
-        let h = explore_file_header("f.rs", &syms, 5);
+        let h = explore_file_header("f.rs", &syms, &[], 5);
         assert!(h.starts_with("#### f.rs — "), "got: {h}");
     }
 
