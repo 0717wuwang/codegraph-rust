@@ -174,6 +174,10 @@ struct SnapshotCaches {
     source_facts: BoundedFileMemo<Option<Arc<SourceFacts>>>,
     import_mappings: BoundedFileMemo<Arc<Vec<ImportMapping>>>,
     re_exports: BoundedFileMemo<Arc<Vec<ReExport>>>,
+    /// Filesystem existence probes for paths the snapshot does not know: the
+    /// same candidates are probed from every importing file, and the tree does
+    /// not change within a pass (upstream `fileExistsMemo`).
+    fs_exists: BoundedFileMemo<bool>,
     #[cfg(test)]
     counters: SnapshotCacheCounters,
 }
@@ -188,6 +192,7 @@ impl SnapshotCaches {
             source_facts: BoundedFileMemo::new(content_limit),
             import_mappings: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
             re_exports: BoundedFileMemo::new(DEFAULT_CACHE_LIMIT),
+            fs_exists: BoundedFileMemo::new(crate::context::FILE_EXISTS_MEMO_LIMIT),
             #[cfg(test)]
             counters: SnapshotCacheCounters::default(),
         }
@@ -230,6 +235,8 @@ struct NodeSnapshot {
 pub struct SnapshotResolutionContext {
     snapshot: Arc<NodeSnapshot>,
     caches: Arc<SnapshotCaches>,
+    /// Largest file read for resolution, the project's extraction limit.
+    max_file_size: u64,
     /// Per-chunk `implements`/`extends` adjacency for [`Self::get_supertypes`].
     /// Empty until the resolver installs a chunk's map (T4); an empty map yields
     /// the same result the store context gives before any such edge exists.
@@ -367,6 +374,7 @@ impl SnapshotResolutionContext {
                 go_modules,
             }),
             caches: Arc::new(SnapshotCaches::new()),
+            max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
             edges: Arc::new(HashMap::new()),
         })
     }
@@ -379,7 +387,8 @@ impl SnapshotResolutionContext {
                 .file_loads
                 .fetch_add(1, Ordering::Relaxed);
             let full_path = Path::new(&self.snapshot.project_root).join(file_path);
-            std::fs::read_to_string(full_path).ok().map(Arc::from)
+            crate::context::read_source_file(&full_path, file_path, self.max_file_size)
+                .map(Arc::from)
         })
     }
 
@@ -397,8 +406,18 @@ impl SnapshotResolutionContext {
         Self {
             snapshot: Arc::clone(&self.snapshot),
             caches: Arc::clone(&self.caches),
+            max_file_size: self.max_file_size,
             edges,
         }
+    }
+
+    /// Read files up to the addressed project's extraction limit
+    /// (`indexing.max_file_size`) instead of the default one. Set it before the
+    /// first read: per-chunk clones share one file cache.
+    #[must_use]
+    pub fn with_max_file_size(mut self, max_file_size: u64) -> Self {
+        self.max_file_size = max_file_size;
+        self
     }
 
     #[cfg(test)]
@@ -485,8 +504,10 @@ impl ResolutionContext for SnapshotResolutionContext {
         if normalized != file_path && self.snapshot.known_file_paths.contains(&normalized) {
             return true;
         }
-        pathutil::lexical_path_within_root(&self.snapshot.project_root, file_path)
-            .is_some_and(|full_path| full_path.exists())
+        self.caches.fs_exists.get_or_init(file_path, || {
+            pathutil::lexical_path_within_root(&self.snapshot.project_root, file_path)
+                .is_some_and(|full_path| full_path.exists())
+        })
     }
 
     fn read_file(&self, file_path: &str) -> Option<String> {

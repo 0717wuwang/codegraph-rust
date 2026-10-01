@@ -579,8 +579,10 @@ impl McpServer {
             Err(e) => {
                 return Dispatch::Reply(
                     serde_json::to_value(ToolResult::error(format!(
-                        "Failed to open project at {}: {e}",
-                        project_path.display()
+                        "Failed to open project at {}: {e}{}",
+                        project_path.display(),
+                        codegraph_store::wsl_shared_index_guidance(e.as_ref())
+                            .map_or(String::new(), |guidance| format!("\n{guidance}"))
                     )))
                     .expect("ToolResult serializes"),
                 );
@@ -748,12 +750,7 @@ mod tests {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let path =
             std::env::temp_dir().join(format!("cg-mcp-init-{tag}-{}-{seq}", std::process::id()));
-        // The project dir must exist before `db_path_for` (which resolves the
-        // physical identity) can succeed.
-        std::fs::create_dir_all(&path).unwrap();
-        let db = db_path_for(&path).expect("default project resolves");
-        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-        std::fs::write(&db, b"placeholder").unwrap();
+        crate::roots::write_index_fixture(&path, b"placeholder");
         TempProject { path }
     }
 
@@ -769,10 +766,7 @@ mod tests {
 
     fn indexed_child(workspace: &TempProject, name: &str) -> PathBuf {
         let child = workspace.path().join(name);
-        std::fs::create_dir_all(&child).unwrap();
-        let db = db_path_for(&child).expect("child project resolves");
-        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-        std::fs::write(db, b"placeholder").unwrap();
+        crate::roots::write_index_fixture(&child, b"placeholder");
         child
     }
 

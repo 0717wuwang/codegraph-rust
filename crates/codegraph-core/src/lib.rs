@@ -8,8 +8,10 @@ pub mod generated_header;
 pub mod index_paths;
 pub mod logger;
 pub mod node_id;
+pub mod source_file;
 pub mod traits;
 pub mod types;
+pub mod wsl;
 
 pub use errors::{CodeGraphError, Result};
 pub use index_paths::{IndexPaths, IndexPathsError};

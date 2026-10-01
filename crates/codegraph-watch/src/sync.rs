@@ -13,7 +13,8 @@ use codegraph_core::generated_header::detect_generated_file;
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::FileRecord;
 use codegraph_extract::{
-    ExtensionOverrides, ExtractOptions, detect_language_with, extract_file_with_options,
+    ExtensionOverrides, ExtractOptions, SourceText, detect_language_with,
+    extract_file_with_options, is_source_file, read_source_file,
 };
 use codegraph_resolve::ReferenceResolver;
 use codegraph_resolve::framework::FrameworkExtractionContext;
@@ -101,6 +102,12 @@ pub struct SyncOutcome {
     /// this remains populated when another writer (for example startup catch-up)
     /// indexed the same event first and this sync consequently skips it unchanged.
     pub trigger_paths: Vec<String>,
+    /// References the orphan sweep attempted, resolved and left unresolved
+    /// when it ran (upstream #1360), so a sync that healed an interrupted index
+    /// does not read as a no-op. Zero on a healthy index.
+    pub pending_refs_processed: usize,
+    pub pending_refs_resolved: usize,
+    pub pending_refs_unresolved: usize,
 }
 
 /// Read-only difference between the current project scope and the persisted
@@ -148,22 +155,33 @@ pub fn pending_project_changes(
         .collect::<BTreeMap<_, _>>();
     let on_disk_set = on_disk.iter().cloned().collect::<BTreeSet<_>>();
 
+    let max_file_size = scope.options.max_file_size;
     let mut pending = PendingChanges::default();
     for relative in on_disk {
+        let full = project_root.join(&relative);
         let Some(stored) = tracked.get(&relative) else {
-            pending.added.push(relative);
+            // An untracked video clip named `.ts` is not source sync would add.
+            if is_source_file(&full, &relative, max_file_size)
+                .with_context(|| format!("read pending source {}", full.display()))?
+            {
+                pending.added.push(relative);
+            }
             continue;
         };
-        let full = project_root.join(&relative);
         let metadata = fs::metadata(&full).with_context(|| format!("stat {}", full.display()))?;
         if stored.size == metadata.len() as i64 && stored.modified_at == modified_millis(&metadata)
         {
             continue;
         }
-        let source = fs::read_to_string(&full)
+        let (_, source) = read_source_file(&full, &relative, max_file_size)
             .with_context(|| format!("read pending source {}", full.display()))?;
-        if stored.content_hash != hash_content(&source) {
-            pending.modified.push(relative);
+        match source.hash_input() {
+            // A tracked file that became a video clip leaves the index.
+            None => pending.removed.push(relative),
+            Some(hash_input) if stored.content_hash != hash_content(&hash_input) => {
+                pending.modified.push(relative);
+            }
+            Some(_) => {}
         }
     }
     for relative in tracked.keys() {
@@ -496,12 +514,10 @@ fn sync_paths_with_store(
                 merge_dependent_site(&mut dependent_sites, &mut dependent_fallbacks, affected);
             }
         }
-        let mut resolver = ReferenceResolver::new(project_root.to_string_lossy());
+        let mut resolver = ReferenceResolver::new(project_root.to_string_lossy())
+            .with_max_file_size(scope.options.max_file_size);
         {
-            let context = codegraph_resolve::StoreResolutionContext::new(
-                store,
-                project_root.to_string_lossy(),
-            );
+            let context = resolver.store_context(store);
             resolver.initialize(&context);
         }
         // Re-run framework per-file extract for reindexed files whose framework
@@ -546,7 +562,10 @@ fn sync_paths_with_store(
     // healthy index (marker absent) skips this entirely, so an ordinary sync is
     // byte-for-byte unchanged.
     if store.is_resolution_incomplete()? {
-        sweep_orphaned_refs(project_root, store)?;
+        let stats = sweep_orphaned_refs(project_root, store, scope.options.max_file_size)?;
+        outcome.pending_refs_processed = stats.total;
+        outcome.pending_refs_resolved = stats.resolved;
+        outcome.pending_refs_unresolved = stats.unresolved;
     }
 
     outcome.duration_ms = started.elapsed().as_millis();
@@ -687,11 +706,15 @@ fn merge_dependent_site(
 /// batched pass re-arms and clears the marker itself, so on success the index is
 /// no longer flagged partial. Framework per-file extract is re-run first so any
 /// framework refs an interrupted run never re-injected are present for the sweep.
-fn sweep_orphaned_refs(project_root: &Path, store: &mut Store) -> Result<()> {
-    let mut resolver = ReferenceResolver::new(project_root.to_string_lossy());
+fn sweep_orphaned_refs(
+    project_root: &Path,
+    store: &mut Store,
+    max_file_size: u64,
+) -> Result<codegraph_resolve::ResolutionStats> {
+    let mut resolver =
+        ReferenceResolver::new(project_root.to_string_lossy()).with_max_file_size(max_file_size);
     {
-        let context =
-            codegraph_resolve::StoreResolutionContext::new(store, project_root.to_string_lossy());
+        let context = resolver.store_context(store);
         resolver.initialize(&context);
     }
     // Framework extraction must not run in the sweep. The marker is set only
@@ -701,9 +724,9 @@ fn sweep_orphaned_refs(project_root: &Path, store: &mut Store) -> Result<()> {
     // duplicate rows (`unresolved_refs` has no UNIQUE constraint), which
     // accumulate across interrupt→heal cycles and diverge from `index --force`.
     // Re-resolving the existing rows alone heals the interrupted pass byte-equal.
-    resolver.resolve_and_persist_batched(store, ORPHAN_SWEEP_BATCH_ROWS)?;
+    let result = resolver.resolve_and_persist_batched(store, ORPHAN_SWEEP_BATCH_ROWS)?;
     resolver.run_post_extract(store)?;
-    Ok(())
+    Ok(result.stats)
 }
 
 /// Batch size for the #1187 orphan sweep, matching the CLI full-index batch
@@ -736,21 +759,14 @@ fn sync_one(
     let metadata = match (!force_absent).then(|| fs::metadata(&full)) {
         Some(Ok(metadata)) if metadata.is_file() => metadata,
         _ => {
-            let was_tracked = store.file_by_path(relative)?.is_some();
-            if !was_tracked {
-                outcome.files_ignored += 1;
-                return Ok(false);
-            }
-            for dependent in store.reference_sites_dependent_on_file(relative)? {
-                merge_dependent_site(dependent_sites, dependent_fallbacks, dependent);
-            }
-            for name in node_names_in_file(store, relative)? {
-                changed_names.insert(name);
-            }
-            delete_unresolved_refs_by_file(store, relative)?;
-            store.delete_file_record(relative)?;
-            outcome.files_removed += 1;
-            return Ok(true);
+            return remove_tracked_file(
+                store,
+                relative,
+                outcome,
+                dependent_sites,
+                dependent_fallbacks,
+                changed_names,
+            );
         }
     };
 
@@ -771,8 +787,21 @@ fn sync_one(
         return Ok(false);
     }
 
-    let source = fs::read_to_string(&full).with_context(|| format!("read {}", full.display()))?;
-    let content_hash = hash_content(&source);
+    let (metadata, source) = read_source_file(&full, relative, scope.options.max_file_size)
+        .with_context(|| format!("read {}", full.display()))?;
+    // A file that became a video clip named `.ts` is no longer source: it leaves
+    // the index like a deletion, and an untracked one is ignored (#1910).
+    let Some(hash_input) = source.hash_input() else {
+        return remove_tracked_file(
+            store,
+            relative,
+            outcome,
+            dependent_sites,
+            dependent_fallbacks,
+            changed_names,
+        );
+    };
+    let content_hash = hash_content(&hash_input);
     // Authoritative content gate, port of the upstream hash gate in
     // `upstream extraction/index.ts:1326-1337,1465-1483`.
     if stored.is_some_and(|file| file.content_hash == content_hash) {
@@ -783,22 +812,55 @@ fn sync_one(
     for dependent in store.reference_sites_dependent_on_file(relative)? {
         merge_dependent_site(dependent_sites, dependent_fallbacks, dependent);
     }
-    reextract_into_store(project_root, store, relative, scope, changed_names)?;
+    reextract_into_store(
+        store,
+        relative,
+        scope,
+        changed_names,
+        (&metadata, &source, content_hash),
+    )?;
     outcome.files_reindexed += 1;
     Ok(true)
 }
 
+/// Drop `relative`'s record when it is tracked, collecting what its removal
+/// invalidates; count it as ignored otherwise.
+fn remove_tracked_file(
+    store: &mut Store,
+    relative: &str,
+    outcome: &mut SyncOutcome,
+    dependent_sites: &mut BTreeMap<String, BTreeSet<ReferenceSite>>,
+    dependent_fallbacks: &mut BTreeSet<String>,
+    changed_names: &mut HashSet<String>,
+) -> Result<bool> {
+    let was_tracked = store.file_by_path(relative)?.is_some();
+    if !was_tracked {
+        outcome.files_ignored += 1;
+        return Ok(false);
+    }
+    for dependent in store.reference_sites_dependent_on_file(relative)? {
+        merge_dependent_site(dependent_sites, dependent_fallbacks, dependent);
+    }
+    for name in node_names_in_file(store, relative)? {
+        changed_names.insert(name);
+    }
+    delete_unresolved_refs_by_file(store, relative)?;
+    store.delete_file_record(relative)?;
+    outcome.files_removed += 1;
+    Ok(true)
+}
+
+/// Re-extract `relative` from the bytes `sync_one` already read and hashed, so
+/// the record, its hash and its symbols all describe one read of the file.
 fn reextract_into_store(
-    project_root: &Path,
     store: &mut Store,
     relative: &str,
     scope: &ProjectScope,
     changed_names: &mut HashSet<String>,
+    (metadata, source, content_hash): (&fs::Metadata, &SourceText, String),
 ) -> Result<()> {
-    let full = project_root.join(relative);
-    let source = fs::read_to_string(&full).with_context(|| format!("read {}", full.display()))?;
-    let metadata = fs::metadata(&full).with_context(|| format!("stat {}", full.display()))?;
-    let result = extract_file_with_options(project_root, relative, &scope.options)?;
+    let result = codegraph_extract::engine::extraction_of(relative, source, &scope.options, |_| {});
+    let hash_input = source.hash_input().unwrap_or_default();
     let node_ids = result
         .nodes
         .iter()
@@ -811,10 +873,10 @@ fn reextract_into_store(
         .collect::<Vec<_>>();
     let file = FileRecord {
         path: relative.to_string(),
-        content_hash: hash_content(&source),
+        content_hash,
         language: detect_language_with(relative, &scope.options.extensions),
         size: metadata.len() as i64,
-        modified_at: modified_millis(&metadata),
+        modified_at: modified_millis(metadata),
         indexed_at: now_millis(),
         node_count: result
             .nodes
@@ -822,7 +884,7 @@ fn reextract_into_store(
             .filter(|node| node.file_path == relative)
             .count() as i64,
         errors: result.errors,
-        generated: detect_generated_file(relative, &source),
+        generated: detect_generated_file(relative, &hash_input),
     };
 
     // A name's resolution outcomes (confidence, chosen target) depend on the set
@@ -1515,6 +1577,16 @@ pub(crate) mod tests {
         // When: a bare no-change sync runs (no path is dirty on disk).
         let outcome = sync_changed_paths(dir.path(), &db, Vec::<String>::new()).unwrap();
         assert_eq!(outcome.files_reindexed, 0, "no file changed");
+        // The sweep's work is reported, so a recovering sync is not a no-op
+        // (upstream #1360).
+        assert_eq!(
+            (
+                outcome.pending_refs_processed,
+                outcome.pending_refs_resolved,
+                outcome.pending_refs_unresolved
+            ),
+            (1, 1, 0)
+        );
 
         // Then: the orphaned ref is swept into a Calls edge and the marker clears.
         let store = Store::open(&db).unwrap();
@@ -1558,6 +1630,7 @@ pub(crate) mod tests {
         // Then: no marker was set, nothing was swept, and the retained
         // unresolvable rows are untouched (#1240 retry state preserved).
         assert_eq!(outcome.files_reindexed, 0);
+        assert_eq!(outcome.pending_refs_processed, 0, "no sweep ran");
         assert!(!before.0, "a healthy index must not carry the marker");
         let store = Store::open(&db).unwrap();
         assert!(!store.is_resolution_incomplete().unwrap());

@@ -32,6 +32,7 @@ pub(crate) const DEFAULT_CACHE_LIMIT: usize = 5_000;
 pub struct StoreResolutionContext<'a> {
     store: &'a Store,
     project_root: String,
+    max_file_size: u64,
     caches: RefCell<Caches>,
 }
 
@@ -50,7 +51,14 @@ struct Caches {
     workspace_packages: Option<Option<WorkspacePackages>>,
     all_files: Option<Arc<Vec<String>>>,
     files_by_basename: Option<HashMap<String, Arc<Vec<String>>>>,
+    /// Existence answers for the pass: import resolution probes every extension
+    /// of a specifier from every importing file, and neither the borrowed store
+    /// nor the tree changes within a pass (upstream `fileExistsMemo`).
+    file_exists: HashMap<String, bool>,
 }
+
+/// Bound on memoized existence answers; the memo restarts past it, as upstream.
+pub(crate) const FILE_EXISTS_MEMO_LIMIT: usize = 200_000;
 
 impl Caches {
     fn new() -> Self {
@@ -72,6 +80,7 @@ impl Caches {
             workspace_packages: None,
             all_files: None,
             files_by_basename: None,
+            file_exists: HashMap::new(),
         }
     }
 }
@@ -82,8 +91,17 @@ impl<'a> StoreResolutionContext<'a> {
         Self {
             store,
             project_root: project_root.into(),
+            max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
             caches: RefCell::new(Caches::new()),
         }
+    }
+
+    /// Read files up to the addressed project's extraction limit
+    /// (`indexing.max_file_size`) instead of the default one.
+    #[must_use]
+    pub fn with_max_file_size(mut self, max_file_size: u64) -> Self {
+        self.max_file_size = max_file_size;
+        self
     }
 
     /// Drop all caches (`clearCaches`, `index.ts:313-324`). Called between
@@ -100,6 +118,7 @@ impl<'a> StoreResolutionContext<'a> {
         c.qualified_name_cache.clear();
         c.all_files = None;
         c.files_by_basename = None;
+        c.file_exists.clear();
     }
 
     fn cached_all_files(&self) -> Arc<Vec<String>> {
@@ -230,24 +249,28 @@ impl ResolutionContext for StoreResolutionContext<'_> {
     }
 
     fn file_exists(&self, file_path: &str) -> bool {
+        if let Some(&exists) = self.caches.borrow().file_exists.get(file_path) {
+            return exists;
+        }
         // Known-file fast path then filesystem fallback (index.ts:358-374).
         // The store is the index of known files.
-        if self.store.file_by_path(file_path).ok().flatten().is_some() {
-            return true;
-        }
         let normalized = file_path.replace('\\', "/");
-        if normalized != file_path
-            && self
-                .store
-                .file_by_path(&normalized)
-                .ok()
-                .flatten()
-                .is_some()
-        {
-            return true;
+        let exists = self.store.file_by_path(file_path).ok().flatten().is_some()
+            || (normalized != file_path
+                && self
+                    .store
+                    .file_by_path(&normalized)
+                    .ok()
+                    .flatten()
+                    .is_some())
+            || pathutil::lexical_path_within_root(&self.project_root, file_path)
+                .is_some_and(|full_path| full_path.exists());
+        let mut c = self.caches.borrow_mut();
+        if c.file_exists.len() >= FILE_EXISTS_MEMO_LIMIT {
+            c.file_exists.clear();
         }
-        pathutil::lexical_path_within_root(&self.project_root, file_path)
-            .is_some_and(|full_path| full_path.exists())
+        c.file_exists.insert(file_path.to_string(), exists);
+        exists
     }
 
     fn read_file(&self, file_path: &str) -> Option<String> {
@@ -261,7 +284,8 @@ impl ResolutionContext for StoreResolutionContext<'_> {
             return c.file_cache.get(&file_path.to_string()).flatten();
         }
         let full_path = Path::new(&self.project_root).join(file_path);
-        let content: Option<Arc<str>> = std::fs::read_to_string(&full_path).ok().map(Arc::from);
+        let content: Option<Arc<str>> =
+            read_source_file(&full_path, file_path, self.max_file_size).map(Arc::from);
         c.file_cache.set(file_path.to_string(), content.clone());
         content
     }
@@ -510,6 +534,22 @@ fn is_js_family_path(file_path: &str) -> bool {
 /// (mirrors `loadGoModule`, `upstream resolution/go-module.ts`).
 fn load_go_module(project_root: &str) -> Option<GoModule> {
     load_go_module_in(project_root, "")
+}
+
+/// Read `path` (`relative` in the project) for resolution only if extraction
+/// would index it: a regular file no larger than `max_bytes` that is not a video
+/// clip named `.ts` (upstream #1553, #1910). The shared bounded reader stats it
+/// first, so a dependency archive an import resolves to is never decoded and a
+/// FIFO is never opened, and it decodes the text exactly as extraction does.
+pub(crate) fn read_source_file(path: &Path, relative: &str, max_bytes: u64) -> Option<String> {
+    match codegraph_core::source_file::read_source_file(path, relative, max_bytes)
+        .ok()?
+        .1
+    {
+        codegraph_core::source_file::SourceText::Text(text) => Some(text),
+        codegraph_core::source_file::SourceText::Oversize(_)
+        | codegraph_core::source_file::SourceText::MpegTransportStream => None,
+    }
 }
 
 /// Read the `module` line of `<project_root>/<dir>/go.mod`.

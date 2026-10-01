@@ -414,8 +414,10 @@ fn execute_owned(project_path: &Path, tool_name: &str, args: &Value) -> ToolResu
         Ok(engine) => engine,
         Err(e) => {
             return ToolResult::error(format!(
-                "Failed to open project at {}: {e}",
-                project_path.display()
+                "Failed to open project at {}: {e}{}",
+                project_path.display(),
+                codegraph_store::wsl_shared_index_guidance(e.as_ref())
+                    .map_or(String::new(), |guidance| format!("\n{guidance}"))
             ));
         }
     };
@@ -998,22 +1000,18 @@ mod handler_tests {
         TempDir { path }
     }
 
-    /// Write a placeholder (non-SQLite) db file so `db_exists_for(p)` is true —
-    /// resolution treats the dir as indexed, but a real engine open fails.
+    /// Write a placeholder (non-SQLite) db file under a published namespace so
+    /// `db_exists_for(p)` is true — resolution treats the dir as indexed, but a
+    /// real engine open fails.
     fn placeholder_indexed(tag: &str) -> TempDir {
         let dir = unique_dir(tag);
-        let db = db_path_for(&dir.path).expect("default project resolves");
-        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-        std::fs::write(&db, b"not a real sqlite db").unwrap();
+        crate::roots::write_index_fixture(&dir.path, b"not a real sqlite db");
         dir
     }
 
     fn placeholder_indexed_child(workspace: &TempDir, name: &str) -> PathBuf {
         let child = workspace.path.join(name);
-        std::fs::create_dir_all(&child).unwrap();
-        let db = db_path_for(&child).expect("child project resolves");
-        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-        std::fs::write(&db, b"not a real sqlite db").unwrap();
+        crate::roots::write_index_fixture(&child, b"not a real sqlite db");
         child
     }
 

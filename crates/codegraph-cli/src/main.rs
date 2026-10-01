@@ -22,7 +22,7 @@ use codegraph_core::generated_header::detect_generated_file;
 use codegraph_core::logger::{LoggerConfig, init_logger};
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{Edge, ExtractionResult, FileRecord, Language, Node, NodeKind};
-use codegraph_extract::{ExtractOptions, detect_language_with, extract_source_with_observer};
+use codegraph_extract::{ExtractOptions, detect_language_with};
 use codegraph_graph::graph::{GodotReach, GraphTraverser, group_definitions};
 use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_graph::{segment_match, segments};
@@ -207,6 +207,9 @@ fn cli_main() {
     if let Err(err) = run(cli) {
         eprintln!("Error: {err:#}");
         if let Some(guidance) = index_removal_holder_guidance(&err) {
+            eprint!("{guidance}");
+        }
+        if let Some(guidance) = codegraph_store::wsl_shared_index_guidance(err.as_ref()) {
             eprint!("{guidance}");
         }
         std::process::exit(1);
@@ -1438,6 +1441,22 @@ fn cmd_init(
         "init",
     )?;
     println!("Initialized in {}", project.display());
+    // A fresh index on a Windows drive under WSL gets its own directory (#995);
+    // it is not the documented name, so say where it went and why.
+    if std::env::var_os("CODEGRAPH_DIR").is_none()
+        && let Ok(paths) = index_paths(&project)
+        && paths
+            .current_root()
+            .file_name()
+            .is_some_and(|name| name != codegraph_core::index_paths::DEFAULT_CURRENT_DIR)
+    {
+        println!(
+            "The index is in {}/: this project is on a Windows drive, so WSL keeps its own index \
+             rather than share {}/ with CodeGraph on Windows. Set CODEGRAPH_DIR to choose the name yourself.",
+            codegraph_core::index_paths::WSL_CURRENT_DIR,
+            codegraph_core::index_paths::DEFAULT_CURRENT_DIR
+        );
+    }
     print_index_result(&result);
     installer::run_install_local_targets(project, target)
 }
@@ -1774,6 +1793,22 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool, diagnostics: DiagnosticArgs) -> 
             format_number(outcome.files_removed as i64),
             format_duration(outcome.duration_ms as i64)
         );
+        // A sync that healed an interrupted index reports the sweep's work, so
+        // recovering references on unchanged files is not a no-op (#1360).
+        if outcome.pending_refs_processed > 0 {
+            let unresolved = if outcome.pending_refs_unresolved > 0 {
+                format!(
+                    " ({} unresolved)",
+                    format_number(outcome.pending_refs_unresolved as i64)
+                )
+            } else {
+                String::new()
+            };
+            println!(
+                "Resolved {} pending references{unresolved}",
+                format_number(outcome.pending_refs_resolved as i64)
+            );
+        }
         for warning in &sync_warnings {
             eprintln!("warning: {warning}");
         }
@@ -1784,6 +1819,9 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool, diagnostics: DiagnosticArgs) -> 
         "filesReindexed": outcome.files_reindexed,
         "filesSkipped": outcome.files_skipped_unchanged,
         "filesRemoved": outcome.files_removed,
+        "pendingRefsProcessed": outcome.pending_refs_processed,
+        "pendingRefsResolved": outcome.pending_refs_resolved,
+        "pendingRefsUnresolved": outcome.pending_refs_unresolved,
         "warnings": sync_warnings,
     }));
     Ok(())
@@ -5301,6 +5339,7 @@ fn index_project_inner(
     let mut files_indexed = 0;
     let mut files_skipped = 0;
     let mut files_errored = 0;
+    let mut files_not_source = 0_u64;
     let mut warnings = Vec::new();
 
     // Stream the graph to the store in capped batches instead of holding the whole
@@ -5350,7 +5389,8 @@ fn index_project_inner(
     diagnostic_run.phase_start("parse_write");
     let parse_started = std::time::Instant::now();
 
-    type ParsePayload = (String, FileRecord, ExtractionResult);
+    // `None` for an MPEG transport stream named `.ts`: video, not source (#1910).
+    type ParsePayload = Option<(String, FileRecord, ExtractionResult)>;
     let schedule_tracker = tracker.clone();
     let parse_tracker = tracker.clone();
     let buffer_tracker = tracker.clone();
@@ -5363,55 +5403,34 @@ fn index_project_inner(
             let relative = &files[index];
             let full = project.join(relative);
 
-            parse_tracker.stage(index, "metadata");
-            let metadata = match fs::metadata(&full)
-                .with_context(|| format!("reading metadata for {}", full.display()))
-            {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    parse_tracker.failed(index, &error);
-                    return Err(error);
-                }
-            };
-
             parse_tracker.stage(index, "read");
-            let source = match fs::read_to_string(&full)
-                .with_context(|| format!("reading source file {}", full.display()))
-            {
-                Ok(source) => source,
-                Err(error) => {
-                    parse_tracker.failed(index, &error);
-                    return Err(error);
-                }
+            let (metadata, source) =
+                match codegraph_extract::read_source_file(&full, relative, options.max_file_size)
+                    .with_context(|| format!("reading source file {}", full.display()))
+                {
+                    Ok(read) => read,
+                    Err(error) => {
+                        parse_tracker.failed(index, &error);
+                        return Err(error);
+                    }
+                };
+            // A file over the limit was never read: its size stamp stands in for
+            // its content, in the hash and in the generated-file check. A video
+            // clip named `.ts` is not source at all, so it is not recorded.
+            let Some(hash_input) = source.hash_input() else {
+                return Ok(None);
             };
             parse_tracker.stage(index, "prepare");
             let language = detect_language_with(relative, &options.extensions);
             parse_tracker.file_info(index, metadata.len(), language);
 
-            let result = if metadata.len() > options.max_file_size {
-                ExtractionResult {
-                    nodes: Vec::new(),
-                    edges: Vec::new(),
-                    unresolved_references: Vec::new(),
-                    errors: vec![format!(
-                        "File exceeds max size ({} > {}): {relative}",
-                        metadata.len(),
-                        options.max_file_size
-                    )],
-                    duration_ms: 0,
-                }
-            } else {
-                extract_source_with_observer(
-                    relative,
-                    &source,
-                    None,
-                    &options.extensions,
-                    |stage| parse_tracker.extraction_stage(index, stage),
-                )
-            };
+            let result =
+                codegraph_extract::engine::extraction_of(relative, &source, &options, |stage| {
+                    parse_tracker.extraction_stage(index, stage)
+                });
             let file = FileRecord {
                 path: relative.clone(),
-                content_hash: hash_content(&source),
+                content_hash: hash_content(&hash_input),
                 language,
                 size: metadata.len() as i64,
                 modified_at: modified_millis(&metadata),
@@ -5422,13 +5441,18 @@ fn index_project_inner(
                     .filter(|node| node.file_path == *relative)
                     .count() as i64,
                 errors: result.errors.clone(),
-                generated: detect_generated_file(relative, &source),
+                generated: detect_generated_file(relative, &hash_input),
             };
             parse_tracker.parsed(index, &result);
-            Ok((relative.clone(), file, result))
+            Ok(Some((relative.clone(), file, result)))
         },
         |buffered| buffer_tracker.buffered(buffered),
-        |index, (_relative, file, mut result)| {
+        |index, payload| {
+            let Some((_relative, file, mut result)) = payload else {
+                files_not_source += 1;
+                persist_tracker.persisted(index);
+                return Ok(());
+            };
             let fatal_errors = file
                 .errors
                 .iter()
@@ -5480,7 +5504,7 @@ fn index_project_inner(
         }),
     );
 
-    let scan_files = bar.position();
+    let scan_files = bar.position() - files_not_source;
     finish_phase(
         &bar,
         &format!("Indexed {} files", format_number(scan_files as i64)),
@@ -5536,13 +5560,13 @@ fn index_project_inner(
     diagnostic_run.phase_start("framework_extract");
     let framework_started = std::time::Instant::now();
     let pb = phase_spinner("Detecting frameworks", quiet);
-    let mut resolver = ReferenceResolver::new(project.to_string_lossy());
+    let mut resolver =
+        ReferenceResolver::new(project.to_string_lossy()).with_max_file_size(options.max_file_size);
     // Detect frameworks then run their per-file extract (route/component/handler
     // nodes + refs) BEFORE resolution, mirroring the upstream tree-sitter.ts:4796-4819
     // framework-extraction pass feeding the resolution pipeline.
     {
-        let context =
-            codegraph_resolve::StoreResolutionContext::new(&store, project.to_string_lossy());
+        let context = resolver.store_context(&store);
         resolver.initialize(&context);
     }
     if resolver.has_framework_resolvers() {
