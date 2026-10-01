@@ -293,11 +293,18 @@ The added alias files pin three import-resolution contracts:
 - `from pkg import module as mod_alias; mod_alias.func()` prefers the existing
   module file `pkg/module.py`;
 - `from imported_types import ImportedClass as ImportedAlias; return
-ImportedAlias` preserves member-import semantics and resolves the aliased
-  class-as-value reference by import.
+ImportedAlias` preserves member-import semantics: both the import statement and
+  the aliased class-as-value reference resolve to the class through the import
+  (named Python imports use the absolute-module and top-level-definition
+  fallback of upstream #1820, because Python symbols are never marked
+  exported).
 
 Missing/duplicate/ambiguous module aliases remain unresolved, and a claimed
 module alias never falls through to global bare-name matching.
+
+Since extraction version 14 the `pkg/__init__.py` file node carries its module
+docstring (upstream #1905): a bare string literal first in a module, class or
+function body is that node's docstring, joined after any preceding comment.
 
 Regenerate the committed database and canonical artifacts from a clean corpus:
 
@@ -1231,6 +1238,8 @@ The expanded corpus also pins:
   direct callable members of one exported object literal;
 - source-range containment prevents the unrelated top-level `run` function
   from becoming the target, while nested `api.nested.run()` remains unresolved;
+  since extraction version 14 it is retained as the qualified call site
+  `api.nested.run` (upstream #1862), which only a framework resolver may bind;
 - `tsconfig.json` extends the JSONC/trailing-comma
   `config/tsconfig.base.json`; the declaring config's `baseUrl` resolves
   `@fixture/aliased` to `src/aliased.ts`;

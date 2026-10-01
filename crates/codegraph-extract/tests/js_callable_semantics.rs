@@ -190,3 +190,100 @@ handlers.onSave = () => { findItems(); };
     assert!(calls_from(&result, &delete.id).contains(&"removeItem"));
     assert!(!function_names(&result).contains(&"onSave"));
 }
+
+#[test]
+fn tsx_and_jsx_class_fields_are_modelled_like_their_base_language() {
+    // TSX and JSX run the TypeScript/JavaScript extractors (upstream
+    // `languages/index.ts`); a plain field is a property there, only a
+    // function-valued field is a method.
+    let source = r#"
+class Cart {}
+export class Vault {
+  items = new Cart();
+  #secret = 1;
+  handle = () => { run(); };
+  run() {}
+}
+"#;
+    let shape = |file: &str, language: Language| {
+        let mut members = extract(file, source, language)
+            .nodes
+            .into_iter()
+            .filter(|node| node.qualified_name.starts_with("Vault::"))
+            .map(|node| (node.name, node.kind))
+            .collect::<Vec<_>>();
+        members.sort_by(|a, b| a.0.cmp(&b.0));
+        members
+    };
+    // JS names a field by its `property` child (upstream #808).
+    let expected = vec![
+        ("#secret".to_string(), NodeKind::Property),
+        ("handle".to_string(), NodeKind::Method),
+        ("items".to_string(), NodeKind::Property),
+        ("run".to_string(), NodeKind::Method),
+    ];
+    for (file, language) in [
+        ("vault.ts", Language::TypeScript),
+        ("vault.tsx", Language::Tsx),
+        ("vault.js", Language::JavaScript),
+        ("vault.jsx", Language::Jsx),
+    ] {
+        assert_eq!(shape(file, language), expected, "{file}");
+    }
+}
+
+#[test]
+fn curried_wrapper_object_members_are_named_by_their_key() {
+    // Upstream #1747 follow-up: an Effect service is usually an object a
+    // factory returns, so the wrapper's result lands in a `pair`.
+    let result = extract(
+        "src/m.ts",
+        r#"
+declare const Effect: { fn: (n: string) => (b: unknown) => unknown };
+declare function wrap(n: string): (c: unknown) => unknown;
+declare function useMemo<T>(f: () => T, d: unknown[]): T;
+
+function helper() { return 1; }
+
+function make() {
+  return {
+    getMode: Effect.fn("ACP.Session.getMode")(function* (id: string) { return helper(); }),
+    'quotedKey': wrap("n")(() => { return helper(); }),
+    computed: useMemo(() => 1 + 1, []),
+    mapped: [1, 2].map((x) => x + 1),
+  };
+}
+
+const service = {
+  run: Effect.fn("Service.run")(function* () { return helper(); }),
+  plain: () => helper(),
+};
+
+export const mixed = {
+  direct: () => helper(),
+  wrapped: Effect.fn("Mixed.wrapped")(function* () { return helper(); }),
+};
+"#,
+        Language::TypeScript,
+    );
+    let names = function_names(&result);
+    for expected in ["getMode", "quotedKey", "run", "wrapped"] {
+        assert!(names.contains(&expected), "missing {expected}; {names:?}");
+    }
+    assert!(
+        !names.contains(&"computed") && !names.contains(&"mapped"),
+        "{names:?}"
+    );
+    // Neither path may mint a member twice.
+    for once in ["run", "wrapped", "plain"] {
+        assert_eq!(
+            names.iter().filter(|name| **name == once).count(),
+            1,
+            "{once}: {names:?}"
+        );
+    }
+    let get_mode = node(&result, NodeKind::Function, "getMode");
+    assert!(calls_from(&result, &get_mode.id).contains(&"helper"));
+    let make = node(&result, NodeKind::Function, "make");
+    assert!(!calls_from(&result, &make.id).contains(&"helper"));
+}

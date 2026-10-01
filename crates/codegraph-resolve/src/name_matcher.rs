@@ -5,7 +5,10 @@
 //! cross-language family gate — mirror the upstream exactly. Every strategy cites its
 //! upstream source range.
 
-use crate::source_facts::SourceFacts;
+use crate::object_literal::{
+    LiteralLookup, object_literal_property, property_contains, resolve_object_literal_binding,
+};
+use crate::source_facts::{SourceFacts, TsFieldDeclaration};
 use crate::strip_comments::{CommentLang, strip_comments_for_regex};
 use crate::types::{
     RefView, ResolutionContext, ResolvedBy, ResolvedRef, declares_type_name, is_esm_language,
@@ -162,19 +165,27 @@ fn dir_of(path: &str) -> &str {
 }
 
 /// Language families that share a type system / runtime (`LANGUAGE_FAMILY`,
-/// `name-matcher.ts:113-121`).
+/// upstream v1.6.1): C, C++, Objective-C and Swift interoperate natively; ArkTS
+/// and the single-file-component languages are web.
 fn language_family(lang: Language) -> Option<&'static str> {
     match lang {
         Language::Java | Language::Kotlin | Language::Scala => Some("jvm"),
-        Language::Swift | Language::ObjC => Some("apple"),
-        Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx => Some("web"),
-        Language::C | Language::Cpp => Some("c"),
+        Language::Swift | Language::ObjC | Language::C | Language::Cpp => Some("native"),
+        Language::TypeScript
+        | Language::Tsx
+        | Language::JavaScript
+        | Language::Jsx
+        | Language::ArkTs
+        | Language::Svelte
+        | Language::Vue
+        | Language::Astro => Some("web"),
         Language::CSharp | Language::Razor => Some("dotnet"),
+        Language::Cfml => Some("cfml"),
         _ => None,
     }
 }
 
-/// `sameLanguageFamily` (`name-matcher.ts:122-126`).
+/// `sameLanguageFamily`.
 pub fn same_language_family(a: Language, b: Language) -> bool {
     if a == b {
         return true;
@@ -185,27 +196,148 @@ pub fn same_language_family(a: Language, b: Language) -> bool {
     }
 }
 
-/// `isKnownLanguageFamily` (`name-matcher.ts:134-136`).
-pub fn is_known_language_family(lang: Language) -> bool {
-    language_family(lang).is_some()
+/// The code family of `lang` (`CODE_FAMILY`): a multi-language family, or a
+/// singleton for every other programming language. Config and markup formats
+/// have none, so their transitions stay open.
+fn code_family(lang: Language) -> Option<&'static str> {
+    language_family(lang).or(match lang {
+        Language::Python => Some("python"),
+        Language::Go => Some("go"),
+        Language::Rust => Some("rust"),
+        Language::Php => Some("php"),
+        Language::Ruby => Some("ruby"),
+        Language::Dart => Some("dart"),
+        Language::Lua | Language::Luau => Some("lua"),
+        Language::R => Some("r"),
+        Language::Erlang => Some("erlang"),
+        Language::Pascal => Some("pascal"),
+        Language::Solidity => Some("solidity"),
+        Language::Nix => Some("nix"),
+        _ => None,
+    })
 }
 
-/// `crossesKnownFamily` (`name-matcher.ts:147-149`).
-pub fn crosses_known_family(a: Language, b: Language) -> bool {
-    is_known_language_family(a) && is_known_language_family(b) && !same_language_family(a, b)
+/// Whether a reference from `a` to `b` crosses between two code families
+/// (`crossesCodeBoundary`).
+pub fn crosses_code_boundary(a: Language, b: Language) -> bool {
+    matches!((code_family(a), code_family(b)), (Some(fa), Some(fb)) if fa != fb)
 }
 
-/// Drop cross-language candidates from a name lookup (`applyLanguageGate`,
-/// `name-matcher.ts:160-168`).
+/// Cross-family name matches need an actual ABI boundary (`hasBridgeEvidence`):
+/// a native caller reaching a cgo `//export` or a Rust `pub extern "C" fn`, or
+/// a Go `C.name` / Rust `extern "C" { fn name(…) }` caller reaching a C or C++
+/// function. The evidence is scoped to the named free function.
+fn has_bridge_evidence(
+    candidate: &Node,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    if reference.reference_kind != EdgeKind::Calls || candidate.kind != NodeKind::Function {
+        return false;
+    }
+    let name = regex::escape(&candidate.name);
+    static CGO_IMPORT: OnceLock<Regex> = OnceLock::new();
+    let cgo_import = || {
+        CGO_IMPORT
+            .get_or_init(|| Regex::new(r#"(?-u:\b)import\s+(?:\(\s*)?"C""#).expect("cgo import"))
+    };
+    if code_family(reference.language) == Some("native") {
+        let Some(facts) = context.source_facts(&candidate.file_path) else {
+            return false;
+        };
+        if candidate.language == Language::Go {
+            let start = (candidate.start_line.max(2) - 2) as usize;
+            let end =
+                (candidate.end_line.max(candidate.start_line) as usize).min(facts.line_count());
+            let declaration = if start < end {
+                facts.join_lines(start, end, "\n")
+            } else {
+                String::new()
+            };
+            return cgo_import()
+                .is_match(&strip_comments_for_regex(facts.source(), CommentLang::Go))
+                && Regex::new(&format!(r"(?m)^//export {name}\r?\nfunc {name}\s*\("))
+                    .is_ok_and(|export| export.is_match(&declaration));
+        }
+        if candidate.language == Language::Rust {
+            let start = (candidate.start_line.max(1) - 1) as usize;
+            let end =
+                (candidate.end_line.max(candidate.start_line) as usize).min(facts.line_count());
+            let declaration = if start < end {
+                facts.join_lines(start, end, "\n")
+            } else {
+                String::new()
+            };
+            return Regex::new(&format!(
+                r#"(?-u:\b)pub\s+extern\s+"C"\s+fn\s+{name}(?-u:\b)"#
+            ))
+            .is_ok_and(|export| {
+                export.is_match(&strip_comments_for_regex(&declaration, CommentLang::Rust))
+            });
+        }
+    }
+    if matches!(candidate.language, Language::C | Language::Cpp) {
+        let Some(facts) = context.source_facts(&reference.file_path) else {
+            return false;
+        };
+        if reference.language == Language::Go {
+            return cgo_import()
+                .is_match(&strip_comments_for_regex(facts.source(), CommentLang::Go))
+                && reference.reference_name == format!("C.{}", candidate.name);
+        }
+        if reference.language == Language::Rust {
+            return Regex::new(&format!(
+                r#"extern\s+"C"\s*\{{[^}}]*(?-u:\b)fn\s+{name}\s*\("#
+            ))
+            .is_ok_and(|block| {
+                block.is_match(&strip_comments_for_regex(facts.source(), CommentLang::Rust))
+            });
+        }
+    }
+    false
+}
+
+/// Reject a chosen result that crosses a code-family boundary without bridge
+/// evidence (`gateLanguageMatch`). It never shrinks a candidate pool or tries
+/// a replacement, so no lone survivor is manufactured.
+pub(crate) fn gate_language_match(
+    result: Option<ResolvedRef>,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    let result = result?;
+    let Some(target) = context.get_node_by_id_shared(&result.target_node_id) else {
+        return Some(result);
+    };
+    if crosses_code_boundary(reference.language, target.language)
+        && !has_bridge_evidence(&target, reference, context)
+    {
+        return None;
+    }
+    // Rust-only (upstream has no Godot support): a scene, resource, or
+    // project file's path references into scripts stay unresolved rows, which
+    // impact/affected/audit consume path-keyed (F3). Name matching must not
+    // turn them into edges through the open config→code transition.
+    if reference.reference_kind == EdgeKind::References
+        && matches!(
+            reference.language,
+            Language::GodotScene | Language::GodotResource | Language::GodotProject
+        )
+        && target.language != reference.language
+    {
+        return None;
+    }
+    Some(result)
+}
+
+/// Type/value references keep same-family eligibility in the candidate pool:
+/// a native namesake must not hide the actual web type. Calls, imports and
+/// inheritance are gated on the chosen result instead.
 fn apply_language_gate<T: Borrow<Node>>(candidates: Vec<T>, reference: &RefView) -> Vec<T> {
     match reference.reference_kind {
         EdgeKind::References => candidates
             .into_iter()
             .filter(|c| same_language_family(c.borrow().language, reference.language))
-            .collect(),
-        EdgeKind::Imports => candidates
-            .into_iter()
-            .filter(|c| !crosses_known_family(c.borrow().language, reference.language))
             .collect(),
         _ => candidates,
     }
@@ -264,11 +396,125 @@ pub(crate) fn is_lexically_reachable(
             .any(|p| reference.line >= p.start_line && reference.line <= p.end_line)
 }
 
-fn is_js_family(language: Language) -> bool {
+pub(crate) fn is_js_family(language: Language) -> bool {
     matches!(
         language,
         Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
     )
+}
+
+/// Method names that require receiver evidence before a JS/TS call links to
+/// project code (`JS_BUILTIN_METHODS`, upstream v1.6.1 #1987): Array / typed
+/// array and collection, String, Promise, Function, EventTarget /
+/// EventEmitter and iterator methods. Sorted for binary search.
+const JS_BUILTIN_METHODS: [&str; 103] = [
+    "add",
+    "addEventListener",
+    "addListener",
+    "apply",
+    "at",
+    "bind",
+    "call",
+    "catch",
+    "charAt",
+    "charCodeAt",
+    "clear",
+    "codePointAt",
+    "concat",
+    "copyWithin",
+    "delete",
+    "dispatchEvent",
+    "drop",
+    "emit",
+    "endsWith",
+    "entries",
+    "eventNames",
+    "every",
+    "fill",
+    "filter",
+    "finally",
+    "find",
+    "findIndex",
+    "findLast",
+    "findLastIndex",
+    "flat",
+    "flatMap",
+    "forEach",
+    "get",
+    "getMaxListeners",
+    "has",
+    "includes",
+    "indexOf",
+    "join",
+    "keys",
+    "lastIndexOf",
+    "listenerCount",
+    "listeners",
+    "localeCompare",
+    "map",
+    "match",
+    "matchAll",
+    "next",
+    "normalize",
+    "off",
+    "on",
+    "once",
+    "padEnd",
+    "padStart",
+    "pop",
+    "prependListener",
+    "prependOnceListener",
+    "push",
+    "rawListeners",
+    "reduce",
+    "reduceRight",
+    "removeAllListeners",
+    "removeEventListener",
+    "removeListener",
+    "repeat",
+    "replace",
+    "replaceAll",
+    "return",
+    "reverse",
+    "search",
+    "set",
+    "setMaxListeners",
+    "shift",
+    "slice",
+    "some",
+    "sort",
+    "splice",
+    "split",
+    "startsWith",
+    "subarray",
+    "substr",
+    "substring",
+    "take",
+    "then",
+    "throw",
+    "toArray",
+    "toLocaleLowerCase",
+    "toLocaleString",
+    "toLocaleUpperCase",
+    "toLowerCase",
+    "toReversed",
+    "toSorted",
+    "toSpliced",
+    "toString",
+    "toUpperCase",
+    "trim",
+    "trimEnd",
+    "trimLeft",
+    "trimRight",
+    "trimStart",
+    "unshift",
+    "valueOf",
+    "values",
+    "with",
+];
+
+fn is_js_builtin_method(name: &str) -> bool {
+    JS_BUILTIN_METHODS.binary_search(&name).is_ok()
 }
 
 /// Languages whose file boundary follows ESM-style import/export semantics.
@@ -444,7 +690,7 @@ fn is_receiver_less_call(reference: &RefView, context: &dyn ResolutionContext) -
 }
 
 /// A receiver-less JS/TS call can never bind to a method (#1714).
-fn is_bare_js_call(reference: &RefView, context: &dyn ResolutionContext) -> bool {
+pub(crate) fn is_bare_js_call(reference: &RefView, context: &dyn ResolutionContext) -> bool {
     is_js_family(reference.language) && is_receiver_less_call(reference, context)
 }
 
@@ -685,6 +931,14 @@ pub fn match_by_exact_name(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
+    let bare_js = is_bare_js_call(reference, context);
+    // A bare call bound to a store action (#1862) resolves inside that store,
+    // ahead of any same-named function.
+    if bare_js
+        && let Some(action) = crate::js_store::match_js_store_binding_call(reference, context)
+    {
+        return Some(action);
+    }
     let reachable: Vec<Arc<Node>> = apply_language_gate(
         context.get_nodes_by_name_shared(&reference.reference_name),
         reference,
@@ -698,7 +952,6 @@ pub fn match_by_exact_name(
     // importable (#1537/#1536). Filtering BEFORE ranking — not just refusing the
     // winner afterwards — is what lets a legitimate supertype OUTRANK a
     // same-named enum member instead of the whole reference being dropped.
-    let bare_js = is_bare_js_call(reference, context);
     let bare_go = is_bare_go_call(reference, context);
     let candidates: Vec<Arc<Node>> = reachable
         .iter()
@@ -881,7 +1134,7 @@ fn prefer_call_site_file<T: Borrow<Node>>(nodes: Vec<T>, call_site_file: &str) -
     }
 }
 
-fn is_object_literal_language(language: Language) -> bool {
+pub(crate) fn is_object_literal_language(language: Language) -> bool {
     matches!(
         language,
         Language::TypeScript
@@ -892,7 +1145,7 @@ fn is_object_literal_language(language: Language) -> bool {
     )
 }
 
-fn range_within(inner: &Node, outer: &Node) -> bool {
+pub(crate) fn range_within(inner: &Node, outer: &Node) -> bool {
     if inner.start_line < outer.start_line || inner.end_line > outer.end_line {
         return false;
     }
@@ -941,6 +1194,15 @@ pub(crate) fn resolve_object_literal_member(
                     NodeKind::Property | NodeKind::Variable | NodeKind::Constant
                 ))
     };
+    // Only the literal's own property that defines the member counts — the
+    // last one wins — and an identifier-valued member is followed by
+    // `resolve_object_literal_binding` instead (#1932).
+    let property = match object_literal_property(container, member, context) {
+        LiteralLookup::Absent => return None,
+        LiteralLookup::Property(property) if property.binding.is_some() => return None,
+        LiteralLookup::Property(property) => Some(property),
+        LiteralLookup::Unknown => None,
+    };
     let inside = context
         .get_nodes_in_file_shared(&container.file_path)
         .into_iter()
@@ -954,6 +1216,11 @@ pub(crate) fn resolve_object_literal_member(
     let mut candidates = inside
         .into_iter()
         .filter(|node| node.name == member && accepts(node))
+        .filter(|node| {
+            property
+                .as_ref()
+                .is_none_or(|property| property_contains(property, container, node, context))
+        })
         .filter(|candidate| {
             !callable_bodies.iter().any(|body| {
                 body.id != candidate.id
@@ -1522,7 +1789,10 @@ fn local_receiver_type_patterns_tagged(language: Language, r: &str) -> Vec<(Rege
 /// 1-based start line of the tightest function/method enclosing the call
 /// (`enclosingScopeStartLine`, name-matcher.ts:#1108). Bounds the backward scan
 /// so a same-named variable in another function can't leak in.
-fn enclosing_scope_start_line(reference: &RefView, context: &dyn ResolutionContext) -> i64 {
+pub(crate) fn enclosing_scope_start_line(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> i64 {
     let mut start = 1i64;
     for n in context.get_nodes_in_file_shared(&reference.file_path) {
         if !matches!(n.kind, NodeKind::Function | NodeKind::Method)
@@ -1683,14 +1953,16 @@ fn infer_class_field_receiver_type(
 
 /// Resolve a JS/TS `this.<field>.<method>()` exclusively through the field's
 /// declaration on the enclosing class. Unproven/builtin/ambiguous types remain
-/// unresolved rather than falling through to receiver-name heuristics.
+/// unresolved rather than falling through to receiver-name heuristics. An ES
+/// private field (`#items`) is a name of its own: it never reads a public
+/// `items` declaration, nor the reverse (#1987).
 fn match_ts_this_field_call(
     field: &str,
     method_name: &str,
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
-    if field.is_empty() || field.contains('.') || !is_word(field) {
+    if !is_ts_field_name(field) {
         return None;
     }
     let caller = context.get_node_by_id_shared(&reference.from_node_id)?;
@@ -1710,109 +1982,203 @@ fn match_ts_this_field_call(
         return None;
     }
     let owner = &owners[0];
-    let source = context.read_file(&owner.file_path)?;
-    let code = strip_comments_for_regex(&source, CommentLang::TypeScript);
-    let lines: Vec<&str> = code.lines().collect();
-    let start = owner.start_line.saturating_sub(1) as usize;
-    let end = (owner.end_line.max(owner.start_line) as usize).min(lines.len());
-    if start >= end {
+    let facts = context.source_facts(&owner.file_path)?;
+    let declaration = facts.ts_field_declaration(&owner.id, field, |facts| {
+        scan_ts_field_declaration(facts, owner, field, context)
+    })?;
+
+    if declaration.value_type {
+        let value_name = declaration.type_name.rsplit('.').next().unwrap_or_default();
+        let holders = prefer_call_site_file(
+            context.get_nodes_by_name_shared(value_name),
+            &reference.file_path,
+        );
+        for holder in holders.into_iter().filter(|node| {
+            matches!(node.kind, NodeKind::Constant | NodeKind::Variable)
+                && same_language_family(node.language, reference.language)
+        }) {
+            if let Some(resolved) = resolve_object_literal_member(
+                &holder,
+                method_name,
+                reference,
+                context,
+                0.85,
+                ResolvedBy::InstanceMethod,
+            ) {
+                return Some(resolved);
+            }
+        }
         return None;
     }
-    let escaped = regex_escape(field);
-    let typeof_pattern = Regex::new(&format!(
-        r"\b{escaped}\b\s*[?!]?\s*:\s*(?:readonly\s+)?typeof\s+([A-Za-z_$][\w.$]*)"
-    ))
-    .ok()?;
-    let declared_pattern = Regex::new(&format!(
-        r"\b{escaped}\b\s*[?!]?\s*:\s*(?:readonly\s+)?([A-Za-z_$][\w.$]*)"
-    ))
-    .ok()?;
-    let initialized_pattern =
-        Regex::new(&format!(r"\b{escaped}\b\s*=\s*new\s+([A-Za-z_$][\w.$]*)")).ok()?;
-    let parameter_property = Regex::new(&format!(
-        r"\b(?:public|protected|private|readonly)(?:\s+(?:public|protected|private|readonly))*\s+{escaped}\b"
-    ))
-    .ok()?;
+
+    let type_name = declaration.type_name.rsplit('.').next().unwrap_or_default();
+    if !type_name
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_uppercase())
+    {
+        return None;
+    }
+    resolve_method_on_type(
+        type_name,
+        method_name,
+        reference,
+        context,
+        0.85,
+        ResolvedBy::InstanceMethod,
+        None,
+        0,
+    )
+}
+
+/// A public (`mailer`) or ES private (`#mailer`) class field name.
+fn is_ts_field_name(field: &str) -> bool {
+    match field.strip_prefix('#') {
+        Some(private) => {
+            !private.is_empty()
+                && private
+                    .chars()
+                    .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$'))
+        }
+        None => is_word(field),
+    }
+}
+
+/// `this.#field.method` → (`#field`, `method`): upstream's
+/// `/^this\.(#[\w$]+)\.(\w+)$/` (#1987).
+fn split_private_this_field_call(name: &str) -> Option<(&str, &str)> {
+    let (field, method) = name.strip_prefix("this.")?.split_once('.')?;
+    (field.starts_with('#') && is_ts_field_name(field) && is_word(method))
+        .then_some((field, method))
+}
+
+/// The first declaration of `field` on the enclosing class's own lines of the
+/// comment-free source. Inside a method body only a `this.<field>` assignment
+/// counts (`this.mailer = new Mailer()` in a constructor) — a method-local
+/// parameter or variable of the same name is not the field — while a
+/// constructor's parameter properties (`constructor(private mailer: Mailer)`)
+/// read like class-level declarations.
+fn scan_ts_field_declaration(
+    facts: &SourceFacts,
+    owner: &Node,
+    field: &str,
+    context: &dyn ResolutionContext,
+) -> Option<TsFieldDeclaration> {
+    let member_prefix = format!("{}::", owner.qualified_name);
     let owner_members = context
         .get_nodes_in_file_shared(&owner.file_path)
         .into_iter()
         .filter(|node| {
             matches!(node.kind, NodeKind::Method | NodeKind::Function)
-                && node
-                    .qualified_name
-                    .starts_with(&format!("{owner_qualified}::"))
+                && node.qualified_name.starts_with(&member_prefix)
         })
         .collect::<Vec<_>>();
-
-    for (offset, line) in lines[start..end].iter().enumerate() {
-        if line.len() > 10_000 {
+    let (code, lines) = facts.ts_comment_free();
+    let start = owner.start_line.saturating_sub(1) as usize;
+    let end = (owner.end_line.max(owner.start_line) as usize).min(lines.line_count());
+    for index in start..end {
+        let line = lines.line(code, index);
+        // Every declaration pattern spells the field literally.
+        if line.len() > 10_000 || !line.contains(field) {
             continue;
         }
-        let source_line = (start + offset + 1) as i64;
-        if let Some(member) = owner_members.iter().find(|member| {
-            source_line >= member.start_line
-                && source_line <= member.end_line.max(member.start_line)
-        }) && !(member.name == "constructor" && parameter_property.is_match(line))
-        {
-            // A method-local parameter or variable is not a `this` field.
-            continue;
-        }
-        if let Some(value_name) = typeof_pattern
-            .captures(line)
-            .and_then(|captures| captures.get(1))
-            .map(|capture| capture.as_str().rsplit('.').next().unwrap_or_default())
-        {
-            let holders = prefer_call_site_file(
-                context.get_nodes_by_name_shared(value_name),
-                &reference.file_path,
-            );
-            for holder in holders.into_iter().filter(|node| {
-                matches!(node.kind, NodeKind::Constant | NodeKind::Variable)
-                    && same_language_family(node.language, reference.language)
-            }) {
-                if let Some(resolved) = resolve_object_literal_member(
-                    &holder,
-                    method_name,
-                    reference,
-                    context,
-                    0.85,
-                    ResolvedBy::InstanceMethod,
-                ) {
-                    return Some(resolved);
-                }
-            }
-            return None;
-        }
-
-        let type_name = declared_pattern
-            .captures(line)
-            .and_then(|captures| captures.get(1))
-            .or_else(|| {
-                initialized_pattern
-                    .captures(line)
-                    .and_then(|captures| captures.get(1))
+        let source_line = (index + 1) as i64;
+        let this_only = owner_members
+            .iter()
+            .find(|member| {
+                source_line >= member.start_line
+                    && source_line <= member.end_line.max(member.start_line)
             })
-            .map(|capture| capture.as_str().rsplit('.').next().unwrap_or_default());
-        let Some(type_name) = type_name else { continue };
-        if !type_name
-            .chars()
-            .next()
-            .is_some_and(|first| first.is_ascii_uppercase())
-        {
-            return None;
+            .is_some_and(|member| {
+                !(member.name == "constructor" && declares_parameter_property(line, field))
+            });
+        if let Some(declaration) = ts_field_on_line(line, field, this_only) {
+            return Some(declaration);
         }
-        return resolve_method_on_type(
-            type_name,
-            method_name,
-            reference,
-            context,
-            0.85,
-            ResolvedBy::InstanceMethod,
-            None,
-            0,
-        );
     }
     None
+}
+
+/// The declaration patterns, tried in order after a whole-token occurrence of
+/// the field: `field: typeof Value` (the type OF a value — tried first, or the
+/// declared-type pattern would capture the word `typeof`), a declared type
+/// `field?: Mailer` (the capture stops at `<`, `[` or `|`, so a generic or
+/// union yields its head), and an initializer `field = new Mailer()`.
+fn ts_field_patterns() -> &'static [(Regex, bool); 3] {
+    static PATTERNS: OnceLock<[(Regex, bool); 3]> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        [
+            (
+                Regex::new(r"^\s*[?!]?\s*:\s*(?:readonly\s+)?typeof\s+([A-Za-z_$][\w.$]*)")
+                    .expect("typeof field pattern"),
+                true,
+            ),
+            (
+                Regex::new(r"^\s*[?!]?\s*:\s*(?:readonly\s+)?([A-Za-z_$][\w.$]*)")
+                    .expect("declared field pattern"),
+                false,
+            ),
+            (
+                Regex::new(r"^\s*=\s*new\s+([A-Za-z_$][\w.$]*)")
+                    .expect("initialized field pattern"),
+                false,
+            ),
+        ]
+    })
+}
+
+/// The first declaration of `field` on one line, pattern by pattern as the
+/// upstream field regexes would find it. The field must be a whole `[\w$#]`
+/// token — the `(?<![\w$#])` lookbehind of upstream v1.6.1 — so a public
+/// `items` never matches `#items` (#1987); with `this_only`, it must also be
+/// written `this.<field>`. KEEP-RUST: a field ending in `$` (`users$`) is a
+/// whole token too, where upstream's trailing `\b` rejects it.
+fn ts_field_on_line(line: &str, field: &str, this_only: bool) -> Option<TsFieldDeclaration> {
+    let is_token = |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#');
+    let ends = line
+        .match_indices(field)
+        .filter(|(at, _)| {
+            let before = &line[..*at];
+            !before.chars().next_back().is_some_and(is_token)
+                && !line[at + field.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_token)
+                && (!this_only
+                    || before
+                        .strip_suffix("this.")
+                        .is_some_and(|rest| !rest.chars().next_back().is_some_and(is_token)))
+        })
+        .map(|(at, _)| at + field.len())
+        .collect::<Vec<_>>();
+    ts_field_patterns()
+        .iter()
+        .find_map(|(pattern, value_type)| {
+            ends.iter().find_map(|&end| {
+                pattern
+                    .captures(&line[end..])
+                    .and_then(|captures| captures.get(1))
+                    .map(|capture| TsFieldDeclaration {
+                        value_type: *value_type,
+                        type_name: capture.as_str().to_string(),
+                    })
+            })
+        })
+}
+
+/// Whether a constructor line declares `field` as a parameter property
+/// (`private readonly mailer: Mailer`). A private name is never one.
+fn declares_parameter_property(line: &str, field: &str) -> bool {
+    static PARAMETER_PROPERTY: OnceLock<Regex> = OnceLock::new();
+    PARAMETER_PROPERTY
+        .get_or_init(|| {
+            Regex::new(
+                r"\b(?:public|protected|private|readonly)(?:\s+(?:public|protected|private|readonly))*\s+([\w$]+)",
+            )
+            .expect("parameter property pattern")
+        })
+        .captures_iter(line)
+        .any(|captures| captures.get(1).is_some_and(|name| name.as_str() == field))
 }
 
 /// Is the inferred receiver type `type_name` BOUND at the call site (#1566)?
@@ -2083,6 +2449,16 @@ pub fn match_method_call(
         }
     }
 
+    // A TS/JS call through an ES private field of the enclosing class —
+    // `this.#items.add()`, emitted as `this.#items.add` (#1987) — resolves
+    // exactly like `this.<field>` below (#1496). `#` is outside the dotted
+    // receiver grammar, so the shape is matched here.
+    if is_js_family(reference.language)
+        && let Some((field, method)) = split_private_this_field_call(&reference.reference_name)
+    {
+        return match_ts_this_field_call(field, method, reference, context);
+    }
+
     let parsed = parse_method_call(&reference.reference_name, reference.language)?;
     let (object_or_class, method_name) = parsed;
 
@@ -2265,7 +2641,9 @@ pub fn match_method_call(
                 context,
                 0.85,
                 ResolvedBy::InstanceMethod,
-            ) {
+            )
+            .or_else(|| resolve_object_literal_binding(&holder, &method_name, reference, context))
+            {
                 return Some(member);
             }
         }
@@ -2296,6 +2674,18 @@ pub fn match_method_call(
                 });
             }
         }
+    }
+
+    // Built-in method names need a validated receiver (#1987). Typed, imported,
+    // object-literal and direct class receivers have had their chance above;
+    // capitalization, word overlap or a unique method name are not evidence
+    // that `list.map()` / `cache.get()` calls a project class.
+    if reference.reference_kind == EdgeKind::Calls
+        && is_js_family(reference.language)
+        && !matches!(object_or_class.as_str(), "this" | "super")
+        && is_js_builtin_method(&method_name)
+    {
+        return None;
     }
 
     // Strategy 2: instance-variable receiver → capitalized class
@@ -3395,13 +3785,16 @@ pub fn match_reference(
         }
     }
 
-    // A JS/TS call-result receiver carries no proven result type. It stays
-    // unresolved instead of degrading to a global same-named callable (#1683).
+    // A JS/TS/Python call-result receiver carries no proven result type. It
+    // stays unresolved instead of degrading to a global same-named callable:
+    // the fuzzy strategy would split `make().run` on `.` and hand it to any
+    // `run` (#1683). The one exception is a store accessor, whose store is
+    // identified (`useStore.getState().reset`, #1862).
     if reference.reference_kind == EdgeKind::Calls
-        && is_js_family(reference.language)
+        && (is_js_family(reference.language) || reference.language == Language::Python)
         && reference.reference_name.contains("().")
     {
-        return None;
+        return crate::js_store::match_store_accessor_chain(reference, context);
     }
 
     // 2. Method call pattern.
@@ -3923,6 +4316,10 @@ mod tests {
         assert!(same_language_family(Language::TypeScript, Language::Jsx));
         assert!(same_language_family(Language::JavaScript, Language::Tsx));
         assert!(same_language_family(Language::C, Language::Cpp));
+        // C, C++, Objective-C and Swift interoperate natively (v1.6.1).
+        assert!(same_language_family(Language::Swift, Language::Cpp));
+        assert!(same_language_family(Language::ArkTs, Language::TypeScript));
+        assert!(same_language_family(Language::Vue, Language::TypeScript));
         assert!(same_language_family(Language::CSharp, Language::Razor));
         // Identity always matches even for a language with no family.
         assert!(same_language_family(Language::Rust, Language::Rust));
@@ -3933,19 +4330,75 @@ mod tests {
     }
 
     #[test]
-    fn known_family_and_cross_family_predicates() {
-        assert!(is_known_language_family(Language::Java));
-        assert!(is_known_language_family(Language::Cpp));
-        assert!(!is_known_language_family(Language::Rust));
-        assert!(!is_known_language_family(Language::Go));
+    fn code_boundary_covers_singleton_families_and_leaves_config_open() {
+        // Two different code families cross.
+        assert!(crosses_code_boundary(Language::Java, Language::Swift));
+        assert!(crosses_code_boundary(Language::Rust, Language::TypeScript));
+        assert!(crosses_code_boundary(Language::Python, Language::Go));
+        // One family (or one language) does not.
+        assert!(!crosses_code_boundary(Language::Java, Language::Kotlin));
+        assert!(!crosses_code_boundary(Language::Lua, Language::Luau));
+        assert!(!crosses_code_boundary(Language::Rust, Language::Rust));
+        // Config and markup transitions stay open.
+        assert!(!crosses_code_boundary(Language::Yaml, Language::Php));
+        assert!(!crosses_code_boundary(
+            Language::TypeScript,
+            Language::Liquid
+        ));
+    }
 
-        // crosses_known_family: both known + different family.
-        assert!(crosses_known_family(Language::Java, Language::Swift));
-        // same family => does not cross.
-        assert!(!crosses_known_family(Language::Java, Language::Kotlin));
-        // one unknown => does not cross.
-        assert!(!crosses_known_family(Language::Rust, Language::Java));
-        assert!(!crosses_known_family(Language::Java, Language::Rust));
+    #[test]
+    fn cross_family_results_need_bridge_evidence() {
+        let ts_method = mk(
+            "method:Adapter::map",
+            NodeKind::Method,
+            "map",
+            "Adapter::map",
+            "ui/adapter.ts",
+            Language::TypeScript,
+        );
+        let rust_call = refv("map", EdgeKind::Calls, "src/lib.rs", Language::Rust, 1);
+        let ctx = Ctx::default().node_by_id(ts_method.clone());
+        let chosen = || {
+            Some(ResolvedRef {
+                original: rust_call.clone(),
+                target_node_id: ts_method.id.clone(),
+                confidence: 0.5,
+                resolved_by: ResolvedBy::ExactMatch,
+            })
+        };
+        assert!(
+            gate_language_match(chosen(), &rust_call, &ctx).is_none(),
+            "`v.iter().map()` never reaches TS"
+        );
+
+        let exported = {
+            let mut node = mk(
+                "function:add",
+                NodeKind::Function,
+                "add",
+                "add",
+                "go/lib.go",
+                Language::Go,
+            );
+            node.start_line = 4;
+            node.end_line = 4;
+            node
+        };
+        let c_call = refv("add", EdgeKind::Calls, "native/main.c", Language::C, 1);
+        let cgo = Ctx::default()
+            .node_by_id(exported.clone())
+            .file("go/lib.go", "package main\nimport \"C\"\n//export add\nfunc add(a, b C.int) C.int { return a + b }\n");
+        let via_cgo = Some(ResolvedRef {
+            original: c_call.clone(),
+            target_node_id: exported.id.clone(),
+            confidence: 0.5,
+            resolved_by: ResolvedBy::ExactMatch,
+        });
+        assert!(
+            gate_language_match(via_cgo, &c_call, &cgo).is_some(),
+            "a cgo //export is a C ABI bridge"
+        );
     }
 
     #[test]
@@ -3977,43 +4430,6 @@ mod tests {
         let out = apply_language_gate(vec![same.clone(), cross], &r);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "function:a");
-    }
-
-    #[test]
-    fn language_gate_imports_drops_only_cross_known_family() {
-        // Imports edge: only candidates that CROSS a known family are dropped;
-        // an unknown-family candidate (Rust vs TS) is KEPT.
-        let same = mk(
-            "function:a",
-            NodeKind::Function,
-            "f",
-            "f",
-            "src/a.ts",
-            Language::TypeScript,
-        );
-        let cross = mk(
-            "function:b",
-            NodeKind::Function,
-            "f",
-            "f",
-            "src/b.java",
-            Language::Java,
-        );
-        let unknown = mk(
-            "function:c",
-            NodeKind::Function,
-            "f",
-            "f",
-            "src/c.rs",
-            Language::Rust,
-        );
-        let r = refv("f", EdgeKind::Imports, "src/x.ts", Language::TypeScript, 1);
-        let out = apply_language_gate(vec![same, cross, unknown], &r);
-        // TS kept (same family), Java dropped (crosses web↔jvm), Rust kept (unknown family).
-        let ids: Vec<&str> = out.iter().map(|n| n.id.as_str()).collect();
-        assert!(ids.contains(&"function:a"));
-        assert!(ids.contains(&"function:c"));
-        assert!(!ids.contains(&"function:b"));
     }
 
     #[test]
@@ -4534,6 +4950,93 @@ mod tests {
         assert!(is_word("abc_1"));
         assert!(!is_word(""));
         assert!(!is_word("a b"));
+    }
+
+    #[test]
+    fn js_builtin_methods_are_sorted_for_binary_search() {
+        assert!(JS_BUILTIN_METHODS.windows(2).all(|pair| pair[0] < pair[1]));
+        for name in ["map", "get", "then", "addEventListener", "return", "with"] {
+            assert!(is_js_builtin_method(name), "{name}");
+        }
+        for name in ["send", "run", "Map", "mapAll"] {
+            assert!(!is_js_builtin_method(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn private_this_field_calls_split_only_the_exact_shape() {
+        assert_eq!(
+            split_private_this_field_call("this.#items.add"),
+            Some(("#items", "add"))
+        );
+        assert_eq!(
+            split_private_this_field_call("this.#$store.get"),
+            Some(("#$store", "get"))
+        );
+        for name in [
+            "this.items.add",
+            "this.#.add",
+            "this.#items",
+            "this.#a.b.c",
+            "that.#items.add",
+            "this.#items.a-b",
+        ] {
+            assert_eq!(split_private_this_field_call(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn ts_field_declarations_keep_public_and_private_names_apart() {
+        let declared = |line: &str, field: &str, this_only: bool| {
+            ts_field_on_line(line, field, this_only)
+                .map(|found| (found.value_type, found.type_name))
+        };
+        assert_eq!(
+            declared("  #items = new Set<string>();", "#items", false),
+            Some((false, "Set".to_string()))
+        );
+        assert_eq!(declared("  #items = new Set();", "items", false), None);
+        assert_eq!(declared("  items = new Cart();", "#items", false), None);
+        assert_eq!(
+            declared("  private readonly mailer?: ns.Mailer;", "mailer", false),
+            Some((false, "ns.Mailer".to_string()))
+        );
+        assert_eq!(
+            declared("  storage: typeof DraftHubStorage;", "storage", false),
+            Some((true, "DraftHubStorage".to_string()))
+        );
+        assert_eq!(declared("  mailerX: Decoy;", "mailer", false), None);
+        assert_eq!(
+            declared("  users$: Observable<User>;", "users$", false),
+            Some((false, "Observable".to_string()))
+        );
+        // Inside a method body only a `this.<field>` assignment counts.
+        assert_eq!(
+            declared(
+                "  constructor() { this.mailer = new Mailer(); }",
+                "mailer",
+                true
+            ),
+            Some((false, "Mailer".to_string()))
+        );
+        assert_eq!(
+            declared("  run() { const mailer = new Decoy(); }", "mailer", true),
+            None
+        );
+        assert_eq!(
+            declared("  run() { xthis.mailer = new Decoy(); }", "mailer", true),
+            None
+        );
+    }
+
+    #[test]
+    fn parameter_properties_need_a_modifier_before_the_exact_name() {
+        let line = "  constructor(private readonly mailer: Mailer, other: X, public items: Y) {}";
+        assert!(declares_parameter_property(line, "mailer"));
+        assert!(declares_parameter_property(line, "items"));
+        assert!(!declares_parameter_property(line, "other"));
+        assert!(!declares_parameter_property(line, "mail"));
+        assert!(!declares_parameter_property(line, "#mailer"));
     }
 
     #[test]

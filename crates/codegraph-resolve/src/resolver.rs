@@ -15,9 +15,10 @@ use crate::import_resolver::{
     resolve_php_imported_static_call, resolve_via_import,
 };
 use crate::name_matcher::{
-    crosses_known_family, is_js_name_target_visible, is_php_property_receiver_shape,
-    is_python_class_function_ref_target, match_dotted_call_chain, match_function_ref,
-    match_method_call, match_reference, match_scoped_call_chain, same_language_family,
+    crosses_code_boundary, gate_language_match, is_js_name_target_visible,
+    is_php_property_receiver_shape, is_python_class_function_ref_target, match_dotted_call_chain,
+    match_function_ref, match_method_call, match_reference, match_scoped_call_chain,
+    same_language_family,
 };
 use crate::snapshot_context::{SnapshotResolutionContext, build_edge_adjacency};
 use crate::source_facts::SourceFacts;
@@ -70,13 +71,43 @@ fn is_scoped_chain_language(language: Language) -> bool {
     language == Language::Rust
 }
 
-fn is_js_call_result_chain(reference: &RefView) -> bool {
+/// A TS/JS/Python call whose receiver is itself a call, encoded
+/// `<inner>().<method>` (#1683): nothing proves what the inner call returns.
+fn is_call_result_chain(reference: &RefView) -> bool {
+    reference.reference_kind == EdgeKind::Calls
+        && matches!(
+            reference.language,
+            Language::TypeScript
+                | Language::Tsx
+                | Language::JavaScript
+                | Language::Jsx
+                | Language::Python
+        )
+        && reference.reference_name.contains("().")
+}
+
+/// A retained untyped TS/JS member chain — `holder.values.get`, three or more
+/// plain segments not rooted at `this`/`window` (upstream v1.6.1
+/// `isUnresolvedJsMemberCall`, #1862). It is call-site evidence, not
+/// permission to infer a property type: only a framework resolver may bind it.
+fn is_unresolved_js_member_call(reference: &RefView) -> bool {
+    fn is_segment(segment: &str) -> bool {
+        let mut chars = segment.chars();
+        chars
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || matches!(ch, '_' | '$'))
+            && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))
+    }
+    let name = reference.reference_name.as_str();
     reference.reference_kind == EdgeKind::Calls
         && matches!(
             reference.language,
             Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
         )
-        && reference.reference_name.contains("().")
+        && !name.starts_with("this.")
+        && !name.starts_with("window.")
+        && name.split('.').count() >= 3
+        && name.split('.').all(is_segment)
 }
 
 /// The extractor's chained-receiver encoding `<inner>().<method>`
@@ -1097,6 +1128,28 @@ fn c_family_static_function_is_file_local(
     })
 }
 
+/// The one inheritance-eligible node a TypeScript value shares its name and
+/// file with (`sameNamedTypeOfValue`, upstream #2055).
+fn same_named_type_of_value(value: &Node, context: &dyn ResolutionContext) -> Option<Arc<Node>> {
+    if !matches!(value.kind, NodeKind::Constant | NodeKind::Variable)
+        || !matches!(value.language, Language::TypeScript | Language::Tsx)
+    {
+        return None;
+    }
+    let types: Vec<Arc<Node>> = context
+        .get_nodes_in_file_shared(&value.file_path)
+        .into_iter()
+        .filter(|node| {
+            node.name == value.name
+                && crate::types::node_is_eligible_target(EdgeKind::Implements, node)
+        })
+        .collect();
+    let [type_node] = types.as_slice() else {
+        return None;
+    };
+    Some(Arc::clone(type_node))
+}
+
 fn rust_module_dir(file_path: &str) -> String {
     let normalized = file_path.replace('\\', "/");
     let dir = crate::pathutil::dirname(&normalized);
@@ -1523,6 +1576,15 @@ impl ReferenceResolver {
         let resolved = self.gate_import_locality(resolved, reference, context);
         let resolved = self.gate_c_macro_calls(resolved, reference);
         let resolved = self.forward_alias_binding(resolved, reference, context);
+        // Every chosen result — including an alias-forwarded one — obeys the
+        // code-family boundary (upstream v1.6.1 `resolveOne`); framework
+        // bridges keep their calls.
+        let resolved = match &resolved {
+            Some(result) if result.resolved_by == ResolvedBy::Framework => {
+                self.gate_framework_resolver_extension_language(resolved, reference, context)
+            }
+            _ => self.gate_language(resolved, reference, context),
+        };
         let resolved = self.gate_language_visibility(resolved, reference, context);
         let resolved = self.gate_js_visibility(resolved, reference, context);
         (resolved, deferred)
@@ -1670,10 +1732,21 @@ impl ReferenceResolver {
             return Some(result);
         };
         if crate::types::node_is_eligible_target(reference.reference_kind, &target) {
-            Some(result)
-        } else {
-            None
+            return Some(result);
         }
+        // One exception: a TypeScript VALUE sharing its name with a type in the
+        // same file (`export const IFoo = createDecorator<IFoo>('foo')` beside
+        // `export interface IFoo`, VS Code's service idiom). The strategy found
+        // the right file and name; the type declared there is the supertype, so
+        // the edge moves to it instead of being dropped (upstream #2055).
+        if crate::types::is_inheritance_ref(reference.reference_kind)
+            && let Some(type_node) = same_named_type_of_value(&target, context)
+        {
+            let mut moved = result;
+            moved.target_node_id = type_node.id.clone();
+            return Some(moved);
+        }
+        None
     }
 
     fn resolve_one_pure_inner(
@@ -1700,16 +1773,25 @@ impl ReferenceResolver {
         } else {
             &reference.reference_name
         };
-        let js_call_result_chain = is_js_call_result_chain(reference);
+        let call_result_chain = is_call_result_chain(reference);
         if !self.has_any_possible_match_for(existence_name, reference.language)
             && !self.matches_any_import(reference, context)
             && !self
                 .framework_resolver_extensions
                 .iter()
                 .any(|f| f.claims_reference(&reference.reference_name))
-            && !js_call_result_chain
+            && !call_result_chain
         {
-            return (None, None);
+            // A store-bound bare call need not share its action's name
+            // (#1862), so it gets one chance past the existence check.
+            return (
+                self.gate_language(
+                    crate::js_store::match_js_store_binding_call(reference, context),
+                    reference,
+                    context,
+                ),
+                None,
+            );
         }
 
         // Function-as-value refs (#756) get a dedicated, strictly-gated path,
@@ -1774,8 +1856,22 @@ impl ReferenceResolver {
 
         // An imported root in `make().run()` does not prove what `make`
         // returns. Preserve any framework result, but never let import or
-        // unique-name heuristics guess the result type (#1683).
-        if js_call_result_chain {
+        // unique-name heuristics guess the result type (#1683). A retained
+        // untyped member chain is the same kind of evidence: importing its
+        // root does not make the root its call target (#1862).
+        if call_result_chain {
+            // The one call-result receiver with an identified target is a store
+            // accessor (`useStore.getState().reset`, #1862).
+            if let Some(action) = self.gate_language(
+                crate::js_store::match_store_accessor_chain(reference, context),
+                reference,
+                context,
+            ) {
+                candidates.push(action);
+            }
+            return (candidates.into_iter().reduce(highest_confidence), None);
+        }
+        if is_unresolved_js_member_call(reference) {
             return (candidates.into_iter().reduce(highest_confidence), None);
         }
 
@@ -2732,26 +2828,13 @@ impl ReferenceResolver {
         reference: &RefView,
         context: &dyn ResolutionContext,
     ) -> Option<ResolvedRef> {
-        let result = result?;
-        let Some(target_language) = self.language_of_target(&result.target_node_id, context) else {
-            return Some(result);
-        };
-        if reference.reference_kind == EdgeKind::References
-            && !same_language_family(target_language, reference.language)
-        {
-            return None;
-        }
-        if reference.reference_kind == EdgeKind::Imports
-            && crosses_known_family(target_language, reference.language)
-        {
-            return None;
-        }
-        Some(result)
+        gate_language_match(result, reference, context)
     }
 
-    /// Drop a `FrameworkResolver`-strategy result that crosses two known families
-    /// (`gateFrameworkResolverLanguage`, `index.ts:1182-1188`). Never fires in v1 (the
-    /// `FrameworkResolver` extension-point list is empty).
+    /// Framework calls carry their own bridge evidence (a Tauri IPC command, a
+    /// Godot autoload); every other framework result obeys the code-family
+    /// boundary, while config/markup transitions stay open
+    /// (`gateFrameworkLanguage`, upstream v1.6.1).
     fn gate_framework_resolver_extension_language(
         &self,
         result: Option<ResolvedRef>,
@@ -2759,16 +2842,13 @@ impl ReferenceResolver {
         context: &dyn ResolutionContext,
     ) -> Option<ResolvedRef> {
         let result = result?;
-        if !matches!(
-            reference.reference_kind,
-            EdgeKind::References | EdgeKind::Imports
-        ) {
+        if reference.reference_kind == EdgeKind::Calls {
             return Some(result);
         }
-        if let Some(target_language) = self.language_of_target(&result.target_node_id, context) {
-            if crosses_known_family(target_language, reference.language) {
-                return None;
-            }
+        if let Some(target_language) = self.language_of_target(&result.target_node_id, context)
+            && crosses_code_boundary(target_language, reference.language)
+        {
+            return None;
         }
         Some(result)
     }

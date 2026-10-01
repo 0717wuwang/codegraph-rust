@@ -154,6 +154,111 @@ fn is_js_identifier(segment: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))
 }
 
+/// Languages whose member calls go through the TS/JS grammars
+/// (`TS_JS_CHAIN_LANGUAGES`, upstream v1.6.1).
+fn is_ts_js_chain_language(language: Language) -> bool {
+    matches!(
+        language,
+        Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
+    )
+}
+
+/// Receiver kinds (TS/JS grammars) that continue a member chain downward.
+fn is_ts_js_chain_receiver(node: SyntaxNode<'_>) -> bool {
+    matches!(node.kind(), "member_expression" | "subscript_expression")
+}
+
+/// TS/JS wrappers that leave a member call's receiver the same object:
+/// `(x).m()`, `x!.m()`, `(x as T).m()`, `(x satisfies T).m()`, `(<T>x).m()`
+/// and `(await x).m()` all call `m` on what `x` holds.
+const TS_JS_TRANSPARENT_RECEIVER_KINDS: [&str; 6] = [
+    "parenthesized_expression",
+    "non_null_expression",
+    "as_expression",
+    "satisfies_expression",
+    "type_assertion",
+    "await_expression",
+];
+
+/// Strip [`TS_JS_TRANSPARENT_RECEIVER_KINDS`] wrappers off a receiver.
+/// tree-sitter-typescript parses `a && b!.c()` as `(a && b)!.c()`; the `!`
+/// belongs to the right operand, so a non-null over a binary expression peels
+/// to that operand.
+fn peel_ts_js_receiver(node: SyntaxNode<'_>) -> SyntaxNode<'_> {
+    let mut current = node;
+    while TS_JS_TRANSPARENT_RECEIVER_KINDS.contains(&current.kind()) {
+        let mut inner = if current.kind() == "type_assertion" {
+            u32::try_from(current.named_child_count())
+                .ok()
+                .and_then(|count| count.checked_sub(1))
+                .and_then(|last| current.named_child(last))
+        } else {
+            current.named_child(0)
+        };
+        if current.kind() == "non_null_expression" {
+            while let Some(binary) = inner.filter(|inner| inner.kind() == "binary_expression") {
+                inner = child_by_field(binary, "right");
+            }
+        }
+        let Some(inner) = inner else {
+            break;
+        };
+        current = inner;
+    }
+    current
+}
+
+/// Identifier-rooted TS/JS member chains have no inferred property type
+/// (upstream #1566), host API chains included (#1707). The `window.MyNs`
+/// project-global escape stays outside; call-result and `this` receivers have
+/// their own paths.
+fn is_unresolved_ts_js_chain(node: SyntaxNode<'_>, source: &str) -> bool {
+    let mut current = Some(node);
+    while let Some(link) = current.filter(|link| is_ts_js_chain_receiver(*link)) {
+        current = child_by_field(link, "object");
+    }
+    current.is_some_and(|root| root.kind() == "identifier" && node_text(root, source) != "window")
+}
+
+/// The root of a TS/JS receiver chain, looking through
+/// [`peel_ts_js_receiver`] wrappers at every hop.
+fn ts_js_chain_root(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+    let mut current = Some(node);
+    while let Some(link) = current.filter(|link| is_ts_js_chain_receiver(*link)) {
+        current = child_by_field(link, "object").map(peel_ts_js_receiver);
+    }
+    current
+}
+
+/// Whether a TS/JS receiver still collapses to the bare method name: `this` /
+/// `super` (resolution reads the owner off the enclosing class), a member
+/// chain rooted at either or at `window` (the project-global escape of
+/// [`is_unresolved_ts_js_chain`]), and `new C()` (its class is written at the
+/// call).
+fn keeps_bare_ts_js_receiver(node: SyntaxNode<'_>, source: &str) -> bool {
+    let Some(root) = ts_js_chain_root(node) else {
+        return false;
+    };
+    match root.kind() {
+        "this" | "super" => true,
+        "identifier" => node_text(root, source) == "window",
+        kind => root.id() == node.id() && kind == "new_expression",
+    }
+}
+
+/// A retained untyped TS/JS chain (`holder.values.get`): at least three plain
+/// identifier segments, whitespace removed and `?.` read as `.`.
+fn plain_ts_js_chain(text: &str) -> Option<String> {
+    let chain = text
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>()
+        .replace("?.", ".");
+    let segments = chain.split('.').collect::<Vec<_>>();
+    (segments.len() >= 3 && segments.iter().all(|segment| is_js_identifier(segment)))
+        .then_some(chain)
+}
+
 /// Deterministic logical recursion bound for the native AST walker.
 ///
 /// Tree-sitter parses deeply nested input iteratively, but this walker descends
@@ -802,7 +907,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             ),
             None => crate::lang::erlang_clause_header(first, self.source),
         };
-        let docstring = self.preceding_docstring(spec.unwrap_or(node));
+        let docstring = self.docstring_for(spec.unwrap_or(node));
         let exports = crate::lang::erlang_module_exports(self.root, self.source);
         let is_exported = exports.contains(&name, arity);
         let qualified_name = format!("{}/{}", self.build_qualified_name(&name), arity);
@@ -848,7 +953,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             .chars()
             .take(300)
             .collect();
-        let docstring = self.preceding_docstring(node);
+        let docstring = self.docstring_for(node);
         let Some(rec) = self.create_node(
             NodeKind::Struct,
             &name,
@@ -2152,7 +2257,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             end_line: self.source.split('\n').count() as i64,
             start_column: 0,
             end_column: 0,
-            docstring: None,
+            docstring: self.spec.body_docstring(self.root, self.source),
             signature: None,
             visibility: None,
             is_exported: false,
@@ -2346,7 +2451,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             &name,
             node,
             NodeExtra {
-                docstring: self.preceding_docstring(node),
+                docstring: self.docstring_for(node),
                 signature: self.spec.get_signature(node, self.source),
                 visibility: self.spec.get_visibility(node),
                 is_exported: common_js_export || self.spec.is_exported(node, self.source),
@@ -2467,9 +2572,11 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
     }
 
     /// The declarator name for a function passed to the second application of
-    /// a curried wrapper (`const NAME = factory(...)(function () { ... })`).
-    /// Requiring the callee itself to be a call keeps single-call computations
-    /// such as `useMemo` and `array.map` anonymous.
+    /// a curried wrapper (`const NAME = factory(...)(function () { ... })`), or
+    /// the property key when the call is an object member (`{ NAME:
+    /// factory(...)(fn) }`, #1747). Requiring the callee itself to be a call
+    /// keeps single-call computations such as `useMemo` and `array.map`
+    /// anonymous.
     fn curried_wrapper_bound_name(&self, node: SyntaxNode<'tree>) -> Option<String> {
         if !matches!(
             self.spec.language(),
@@ -2494,11 +2601,22 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         {
             return None;
         }
-        let declarator = call.parent()?;
-        if declarator.kind() != "variable_declarator" {
+        let binder = call.parent()?;
+        if binder.kind() == "pair" {
+            // A service is often an object a factory returns, so the wrapper's
+            // result lands in a `pair`; its key names the member, as it does
+            // for `key: () => {}`.
+            let value = child_by_field(binder, "value")?;
+            if value.start_byte() != call.start_byte() || value.end_byte() != call.end_byte() {
+                return None;
+            }
+            let key = child_by_field(binder, "key")?;
+            return js_object_member_name(key, self.source);
+        }
+        if binder.kind() != "variable_declarator" {
             return None;
         }
-        let name = child_by_field(declarator, "name")?;
+        let name = child_by_field(binder, "name")?;
         (name.kind() == "identifier").then(|| node_text(name, self.source))
     }
 
@@ -2530,7 +2648,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             &name,
             node,
             NodeExtra {
-                docstring: self.preceding_docstring(node),
+                docstring: self.docstring_for(node),
                 visibility: self.spec.get_visibility(node),
                 is_exported: self.spec.is_exported(node, self.source),
                 ..NodeExtra::default()
@@ -2574,7 +2692,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             &name,
             node,
             NodeExtra {
-                docstring: self.preceding_docstring(node),
+                docstring: self.docstring_for(node),
                 visibility: self.spec.get_visibility(node),
                 is_exported: self.spec.is_exported(node, self.source),
                 ..NodeExtra::default()
@@ -2622,7 +2740,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             &name,
             node,
             NodeExtra {
-                docstring: self.preceding_docstring(node),
+                docstring: self.docstring_for(node),
                 signature: self.spec.get_signature(node, self.source),
                 visibility: self.spec.get_visibility(node),
                 is_async: self.spec.is_async(node),
@@ -2685,7 +2803,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             &name,
             node,
             NodeExtra {
-                docstring: self.preceding_docstring(node),
+                docstring: self.docstring_for(node),
                 is_exported: self.spec.is_exported(node, self.source),
                 ..NodeExtra::default()
             },
@@ -2710,7 +2828,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             &name,
             node,
             NodeExtra {
-                docstring: self.preceding_docstring(node),
+                docstring: self.docstring_for(node),
                 visibility: self.spec.get_visibility(node),
                 is_exported: self.spec.is_exported(node, self.source),
                 ..NodeExtra::default()
@@ -2804,7 +2922,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             &name,
             node,
             NodeExtra {
-                docstring: self.preceding_docstring(node),
+                docstring: self.docstring_for(node),
                 is_exported: self.spec.is_exported(node, self.source),
                 ..NodeExtra::default()
             },
@@ -2896,7 +3014,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     &node_text(name_node, self.source),
                     node,
                     NodeExtra {
-                        docstring: self.preceding_docstring(node),
+                        docstring: self.docstring_for(node),
                         ..NodeExtra::default()
                     },
                 );
@@ -2914,7 +3032,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         } else {
             NodeKind::Variable
         };
-        let docstring = self.preceding_docstring(node);
+        let docstring = self.docstring_for(node);
         let is_exported = self.spec.is_exported(node, self.source);
 
         for i in 0..node.named_child_count() {
@@ -2969,6 +3087,21 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                     if let Some(owner_id) = declared_id.as_deref() {
                         self.extract_js_object_literal_members(value, owner_id);
                     }
+                } else if let (Some(owner_id), Some(actions)) = (
+                    declared_id.as_deref(),
+                    (value.kind() == "call_expression")
+                        .then(|| initializer_returned_object(value, 0))
+                        .flatten()
+                        .filter(|actions| object_has_inline_functions(*actions))
+                        .filter(|_| is_exported || self.is_exported_later(&name)),
+                ) {
+                    // An exported store — `create((set, get) => ({ reset: () =>
+                    // set({}) }))`, middleware wrappers included — owns the
+                    // inline actions of the object its initializer returns
+                    // (upstream #647/#1862). The initializer is not walked as a
+                    // whole: that would re-attribute every action's calls to
+                    // the store itself.
+                    self.extract_js_object_literal_members(actions, owner_id);
                 } else {
                     match declared_id {
                         Some(id) => {
@@ -2981,6 +3114,20 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                 }
             }
         }
+    }
+
+    /// A top-level binding exported by a LATER statement rather than at its
+    /// declaration: `export default NAME` or `export { NAME }` (upstream
+    /// `isExportedLater`).
+    fn is_exported_later(&self, name: &str) -> bool {
+        if !is_js_identifier(name) {
+            return false;
+        }
+        let name = regex::escape(name);
+        Regex::new(&format!(
+            r"(?m)^[ \t]*export\s+(?:default\s+{name}\s*;?[ \t\r]*$|\{{[^}}]*\b{name}\b[^}}]*\}})"
+        ))
+        .is_ok_and(|pattern| pattern.is_match(self.source))
     }
 
     /// Emit callable members directly declared in one JS-family object literal.
@@ -3009,6 +3156,17 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             let Some(value) = child_by_field(member, "value") else {
                 continue;
             };
+            if value.kind() == "call_expression" {
+                // `key: Effect.fn("…")(function* () {…})` — see
+                // `curried_wrapper_bound_name` (#1747).
+                if let Some(function) = child_by_field(value, "arguments")
+                    .and_then(|arguments| arguments.named_child(0))
+                    && let Some(bound) = self.curried_wrapper_bound_name(function)
+                {
+                    self.extract_function(function, Some(bound));
+                }
+                continue;
+            }
             if !matches!(
                 value.kind(),
                 "arrow_function" | "function_expression" | "generator_function"
@@ -3100,7 +3258,7 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         let values: Vec<_> = expression_list
             .map(|list| list.named_children(&mut list.walk()).collect())
             .unwrap_or_default();
-        let docstring = self.preceding_docstring(node);
+        let docstring = self.docstring_for(node);
 
         for (index, target_node) in targets.into_iter().enumerate() {
             let Some((name, receiver, full_name)) = self.lua_assignment_target(target_node) else {
@@ -3636,10 +3794,22 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
             if is_member_shaped_callee(func) {
                 if let Some(property) = member_name_of(func) {
                     let method_name = node_text(property, self.source);
+                    let ts_js = is_ts_js_chain_language(self.spec.language());
+                    // TS/JS: look through wrappers that keep the receiver the
+                    // same object (`(x).m()`, `x!.m()`, `(x as T).m()`,
+                    // `(await f()).m()`), so the branches below see the
+                    // identifier / call / chain the call is really made on.
                     let receiver = child_by_field(func, "object")
                         .or_else(|| child_by_field(func, "operand"))
                         .or_else(|| child_by_field(func, "argument"))
-                        .or_else(|| func.named_child(0));
+                        .or_else(|| func.named_child(0))
+                        .map(|receiver| {
+                            if ts_js {
+                                peel_ts_js_receiver(receiver)
+                            } else {
+                                receiver
+                            }
+                        });
                     if let Some(receiver) = receiver {
                         if is_literal_receiver(receiver) {
                             return;
@@ -3695,18 +3865,16 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                             } else {
                                 method_name
                             };
-                        } else if receiver.kind() == "call_expression"
-                            && matches!(
-                                self.spec.language(),
-                                Language::TypeScript
-                                    | Language::Tsx
-                                    | Language::JavaScript
-                                    | Language::Jsx
-                            )
+                        } else if (ts_js && receiver.kind() == "call_expression")
+                            || (self.spec.language() == Language::Python
+                                && receiver.kind() == "call")
                         {
                             // Keep a simple inner callee so resolution can
                             // reject an untyped call-result receiver instead of
-                            // degrading it to a bare same-named callable.
+                            // degrading it to a bare same-named callable —
+                            // `make().run()`, `d.setdefault(k, []).append(v)`
+                            // (#1683). An inner callee that is not a plain name
+                            // or member chain has no static receiver at all.
                             let Some(inner) = self.plain_js_inner_callee(receiver) else {
                                 return;
                             };
@@ -3741,25 +3909,64 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
                                 }
                                 _ => method_name,
                             };
-                        } else if matches!(
-                            self.spec.language(),
-                            Language::TypeScript
-                                | Language::Tsx
-                                | Language::JavaScript
-                                | Language::Jsx
-                        ) && let Some(field) = self.js_this_field_of(receiver)
-                        {
+                        } else if ts_js && let Some(field) = self.js_this_field_of(receiver) {
                             // `this.field.method()` is an exclusive typed-field
                             // path; keeping `this` prevents name heuristics from
-                            // guessing an unrelated method.
+                            // guessing an unrelated method. An ES private field
+                            // (`this.#items.add()`) is the same shape and keeps
+                            // its `#` (#1987).
                             callee_name = format!("this.{field}.{method_name}");
+                        } else if ts_js
+                            && is_ts_js_chain_receiver(receiver)
+                            && is_unresolved_ts_js_chain(receiver, self.source)
+                        {
+                            // Keep the source call for effect reporting, but never
+                            // collapse it to a guessed method: resolution lets
+                            // only frameworks with receiver evidence handle these
+                            // qualified chains (upstream #1862).
+                            let Some(chain) = plain_ts_js_chain(&node_text(func, self.source))
+                            else {
+                                return;
+                            };
+                            callee_name = chain;
+                        } else if ts_js && !keeps_bare_ts_js_receiver(receiver, self.source) {
+                            // Any other TS/JS receiver is an expression with no
+                            // static type here — `(a ?? b).map()`,
+                            // `f().list.map()`, `arr[0].run()`,
+                            // `(() => {}).call()`. The bare method name would
+                            // exact-match whichever project method shares it.
+                            // Emit nothing: a silent miss, never a wrong edge
+                            // (upstream #1986).
+                            return;
+                        } else if ts_js {
+                            // `super.m()`, `window.Ns.m()` and `new C().m()`:
+                            // the owner is read off the enclosing class, the
+                            // project global, or the call itself. KEEP-RUST: a
+                            // member chain rooted at `this`/`super` through more
+                            // than one field (`this.a.b.m()`) keeps its last
+                            // segment (#1496) instead of upstream v1.6.1's bare
+                            // name, which would let the name matcher bind the
+                            // enclosing class's same-named method — the very
+                            // self-edge #1496 removed.
+                            let owner_segment = (receiver.kind() == "member_expression"
+                                && ts_js_chain_root(receiver)
+                                    .is_some_and(|root| matches!(root.kind(), "this" | "super")))
+                            .then(|| member_name_of(receiver))
+                            .flatten()
+                            .map(|segment| node_text(segment, self.source))
+                            .filter(|segment| is_plain_receiver_segment(segment));
+                            callee_name = match owner_segment {
+                                Some(segment) => format!("{segment}.{method_name}"),
+                                None => method_name,
+                            };
                         } else if is_member_shaped_callee(receiver) {
-                            // #1496 — a receiver that is itself member-shaped
-                            // (`this.mailer`, `holder.values`, `a.b.c`) keeps its
-                            // LAST segment, so the ref arrives as `obj.method`.
+                            // #1496 — outside TS/JS (handled above), a receiver
+                            // that is itself member-shaped (`self.mailer`,
+                            // `holder.values`, `a.b.c`) keeps its LAST segment,
+                            // so the ref arrives as `obj.method`.
                             // Dropping it would leave resolution unable to
-                            // separate `this.run()` (self-target correct) from
-                            // `this.mailer.send()` (self-target wrong), and a bare
+                            // separate `self.run()` (self-target correct) from
+                            // `self.mailer.send()` (self-target wrong), and a bare
                             // `send` then binds to whichever same-named method is
                             // nearest the call line. One segment, not the full
                             // chain: that is the receiver grammar the name matcher
@@ -3812,7 +4019,12 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         }
         let object = child_by_field(receiver, "object")?;
         let property = child_by_field(receiver, "property")?;
-        if object.kind() != "this" || property.kind() != "property_identifier" {
+        if object.kind() != "this"
+            || !matches!(
+                property.kind(),
+                "property_identifier" | "private_property_identifier"
+            )
+        {
             return None;
         }
         Some(node_text(property, self.source))
@@ -4689,6 +4901,21 @@ impl<'a, 'tree> TreeSitterWalker<'a, 'tree> {
         });
     }
 
+    /// The node's prose from both places it can live — a preceding comment and
+    /// a docstring inside the body — joined when both are present: they are
+    /// two things the author wrote about the same symbol (upstream
+    /// `docstringFor`, #1905).
+    fn docstring_for(&self, node: SyntaxNode<'tree>) -> Option<String> {
+        let preceding = self
+            .preceding_docstring(node)
+            .filter(|text| !text.is_empty());
+        let body = self.spec.body_docstring(node, self.source);
+        match (preceding, body) {
+            (Some(preceding), Some(body)) => Some(format!("{preceding}\n\n{body}")),
+            (preceding, body) => body.or(preceding),
+        }
+    }
+
     fn preceding_docstring(&self, node: SyntaxNode<'tree>) -> Option<String> {
         // Climb out of any wrapper(s) so a comment preceding the WHOLE construct
         // (export-, decorator-, or const-arrow-wrapped) is reachable as a
@@ -4848,6 +5075,76 @@ fn js_object_member_name(node: SyntaxNode<'_>, source: &str) -> Option<String> {
             .chars()
             .all(|ch| ch == '_' || ch == '$' || ch.is_ascii_alphanumeric()))
     .then(|| name.to_string())
+}
+
+/// The object literal a store-initializer call returns through one of its
+/// function arguments — `create((set, get) => ({ … }))` — descending through
+/// nested call arguments so middleware wrappers are unwrapped
+/// (`create(persist((set, get) => ({ … }), { … }))`). Keyed purely on AST
+/// shape, never on library names (upstream `findInitializerReturnedObject`).
+fn initializer_returned_object(call: SyntaxNode<'_>, depth: usize) -> Option<SyntaxNode<'_>> {
+    if depth > 4 {
+        return None;
+    }
+    let arguments = child_by_field(call, "arguments")?;
+    let arguments = arguments
+        .named_children(&mut arguments.walk())
+        .collect::<Vec<_>>();
+    arguments
+        .into_iter()
+        .find_map(|argument| match argument.kind() {
+            "arrow_function" | "function_expression" => function_returned_object(argument),
+            "call_expression" => initializer_returned_object(argument, depth + 1),
+            _ => None,
+        })
+}
+
+/// The object literal a function returns: the `=> ({ … })` arrow form or a
+/// top-level `return { … }` of a block body.
+fn function_returned_object(function: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+    fn as_object(node: SyntaxNode<'_>) -> Option<SyntaxNode<'_>> {
+        match node.kind() {
+            "object" | "object_expression" => Some(node),
+            "parenthesized_expression" => node
+                .named_children(&mut node.walk())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .find_map(as_object),
+            _ => None,
+        }
+    }
+    let body = child_by_field(function, "body")?;
+    if let Some(object) = as_object(body) {
+        return Some(object);
+    }
+    if body.kind() != "statement_block" {
+        return None;
+    }
+    let statements = body.named_children(&mut body.walk()).collect::<Vec<_>>();
+    statements
+        .into_iter()
+        .filter(|statement| statement.kind() == "return_statement")
+        .find_map(|statement| {
+            statement
+                .named_children(&mut statement.walk())
+                .collect::<Vec<_>>()
+                .into_iter()
+                .find_map(as_object)
+        })
+}
+
+/// Whether an object literal declares an inline function member — an action
+/// map, unlike a setup store's all-shorthand `return { foo, bar }`.
+fn object_has_inline_functions(object: SyntaxNode<'_>) -> bool {
+    object
+        .named_children(&mut object.walk())
+        .any(|member| match member.kind() {
+            "method_definition" => true,
+            "pair" => child_by_field(member, "value").is_some_and(|value| {
+                matches!(value.kind(), "arrow_function" | "function_expression")
+            }),
+            _ => false,
+        })
 }
 
 /// The call's callee name when it is a bare identifier or `pkg::fn` (yields
