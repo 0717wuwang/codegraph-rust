@@ -742,7 +742,7 @@ fn cap_metadata_is_regular(metadata: &cap_std::fs::Metadata) -> bool {
     {
         use cap_std::fs::MetadataExt as _;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
-        return metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0;
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0
     }
     #[cfg(not(windows))]
     true
