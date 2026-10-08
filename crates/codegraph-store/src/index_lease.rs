@@ -6,13 +6,13 @@
 //! calls in a bounded loop with a monotonic deadline and cancellation checks.
 
 use std::fs::{File, OpenOptions};
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "test-hooks")]
-use std::io::{Read, Write};
+use std::io::Read;
 
 use codegraph_core::IndexPaths;
 use thiserror::Error;
@@ -304,7 +304,7 @@ impl IndexLease {
             .map_err(|source| classify_create_error(&lock_path, source))?;
         let opened_identity = opened_identity(&file, &lock_path, None)?;
         checkpoint(AcquireCheckpoint::HandleOpened);
-        Self::acquire_file(
+        let lease = Self::acquire_file(
             file,
             PendingAcquisition {
                 lock_path,
@@ -315,7 +315,9 @@ impl IndexLease {
             },
             cancelled,
             checkpoint,
-        )
+        )?;
+        ensure_initial_gitignore(paths, &lease);
+        Ok(lease)
     }
 
     /// Whether this capability represents a shared reader lock.
@@ -555,6 +557,60 @@ fn lease_test_wait(marker: u8, selector_env: &str) {
         .read_exact(&mut release)
         .expect("receive lease test barrier release");
     assert_eq!(release, [b'R'], "invalid lease test barrier release byte");
+}
+
+const INITIAL_GITIGNORE_BYTES: &[u8] = b"*\n";
+
+/// Best-effort Git hygiene for a namespace this process just created. Existing
+/// roots never reach this function, so a custom/config-only root is never
+/// backfilled and unrelated files cannot become hidden retroactively.
+fn ensure_initial_gitignore(paths: &IndexPaths, lease: &IndexLease) {
+    if let Err(error) = create_initial_gitignore(paths, lease) {
+        tracing::warn!(
+            path = %paths.gitignore().display(),
+            %error,
+            "could not create the new index root's .gitignore; the index is unaffected"
+        );
+    }
+}
+
+/// Create, never replace, the new root's nested ignore file. `create_new`
+/// refuses a dangling symlink/reparse point that appears after the metadata
+/// check; the retained exclusive lease binds the operation to this index root.
+fn create_initial_gitignore(paths: &IndexPaths, lease: &IndexLease) -> io::Result<()> {
+    lease
+        .validate_exclusive(paths)
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    let path = paths.gitignore();
+    match std::fs::symlink_metadata(&path) {
+        Ok(metadata) if is_regular(&metadata) => return Ok(()),
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "refusing to replace a non-regular .gitignore entry",
+            ));
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+
+    let mut file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let metadata = std::fs::symlink_metadata(&path)?;
+            if is_regular(&metadata) {
+                return Ok(());
+            }
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "refusing to follow or replace a raced .gitignore alias",
+            ));
+        }
+        Err(error) => return Err(error),
+    };
+    file.write_all(INITIAL_GITIGNORE_BYTES)?;
+    file.flush()?;
+    file.sync_all()
 }
 
 fn validated_path_metadata(lock_path: &Path) -> Result<std::fs::Metadata, IndexLeaseError> {
@@ -860,6 +916,44 @@ mod tests {
             .try_lock()
             .expect("failed creation never locks the competing entry");
         competing_handle.unlock().expect("unlock competing entry");
+    }
+
+    #[test]
+    fn initial_gitignore_never_follows_an_alias_raced_after_lock_validation() {
+        let project = TempProject::new("gitignore-alias-race");
+        let paths = project.paths();
+        let external = project.0.with_file_name(format!(
+            "codegraph-index-lease-external-{}-{}",
+            std::process::id(),
+            NEXT_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
+
+        let mut installed = false;
+        let lease = IndexLease::create_exclusive_with(
+            &paths,
+            deadline(),
+            || false,
+            |point| {
+                if point == AcquireCheckpoint::FinalPathCorroborated && !installed {
+                    symlink(&external, paths.gitignore())
+                        .expect("install dangling gitignore after lock validation");
+                    installed = true;
+                }
+            },
+        )
+        .expect("the index lease remains valid when optional git hygiene is refused");
+
+        assert!(
+            std::fs::symlink_metadata(paths.gitignore())
+                .expect("raced alias remains")
+                .file_type()
+                .is_symlink()
+        );
+        assert!(
+            !external.exists(),
+            "the best-effort gitignore write must not follow the raced alias"
+        );
+        drop(lease);
     }
 
     #[test]
