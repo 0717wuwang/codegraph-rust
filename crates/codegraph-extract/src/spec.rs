@@ -114,6 +114,13 @@ pub trait LanguageSpec: Sync {
         None
     }
 
+    /// Prose that lives INSIDE the node's body rather than in a preceding
+    /// comment — Python's bare first-statement string (upstream
+    /// `getBodyDocstring`, #1905). Cleaned text, or `None`.
+    fn body_docstring(&self, _node: Node<'_>, _source: &str) -> Option<String> {
+        None
+    }
+
     fn get_return_type(&self, _node: Node<'_>, _source: &str) -> Option<String> {
         None
     }
@@ -131,6 +138,13 @@ pub trait LanguageSpec: Sync {
     }
 
     fn is_static(&self, _node: Node<'_>, _source: &str) -> bool {
+        false
+    }
+
+    /// Whether a callable declaration is abstract. C++ uses this for pure
+    /// virtual methods (`virtual int read() = 0;`); other languages inherit the
+    /// concrete default.
+    fn is_abstract(&self, _node: Node<'_>, _source: &str) -> bool {
         false
     }
 

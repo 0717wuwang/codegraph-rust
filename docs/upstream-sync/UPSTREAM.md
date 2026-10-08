@@ -7,25 +7,106 @@
 
 ## Current alignment
 
-- **Tracked colby version:** `1.6.0` (all 15 audited `v1.6.0` PORT families,
-  plus the separately tracked Python #1626 and Lua #1616 fixes, shipped across
-  codegraph-rs `v0.48.2`–`v0.50.1`; see the 2026-08-31 CLOSEOUT entry below.
-  `codegraph context` and custom Lua loader #1617 remain explicit DEFER items)
-- **This project version:** see `Cargo.toml` (`codegraph-rs`, independent line)
-- **Last audit:** `2026-08-27` (refreshed `2026-08-31`) — upstream `v1.6.0`
-  plus its one following docs-only commit was audited through
-  `6a056ec5db35172f9dc348f87b54ea415aa5169e`. The exact new range after the
-  previously closed 104-commit batch is 28 commits and identified 15 PORT
-  families. Waves 0–3 shipped the complete backlog in
-  `v0.48.2`/`v0.48.3`/`v0.49.0`/`v0.50.0`, together with the separately
-  tracked #1626 and #1616 fixes; `v0.50.1` closed two release-smoke defects
-  without changing extraction. Tracked parity is now `1.6.0`
-- **Previous exact boundary:** `c6aaa20358cd6adcd04b87bdef8e5803ad146f3a`
-  (the 104th commit after `v1.5.0`; merge of upstream PR #1516)
-- **Next discovery starts here:** diff
-  `6a056ec5db35172f9dc348f87b54ea415aa5169e..origin/main`; do not re-triage
-  the v1.6 backlog — use `V1_6_TRIAGE_2026-08-27.md`
-- **Upstream repo:** https://github.com/colbymchenry/codegraph
+- **Tracked colby release:** `v1.6.1`. All portable in-scope behavior audited
+  through that release is closed: ported, already present, recorded N/A, or
+  deferred by the owner, as the 2026-10-01 CLOSEOUT entry below lists. The
+  official codegraph-rs `v0.51.0` binaries passed the release smoke recorded
+  there.
+- **Last discovery audit:** the `v1.6.1` tag
+  `f4ddf508516332419ea3c95702810765936cf679`, audited on 2026-09-30 in
+  [`V1_6_1_AUDIT_2026-09-30.md`](V1_6_1_AUDIT_2026-09-30.md): 113 commits from
+  the previous boundary, 111 of them non-merge.
+- **Previous discovery boundary:**
+  `3ed73bc127323e63153bf6ec8354afa82ce36aaf` (the 2026-09-15 main audit,
+  [`POST_V1_6_MAIN_2026-09-15.md`](POST_V1_6_MAIN_2026-09-15.md)).
+- **Next discovery starts here:**
+  `f4ddf508516332419ea3c95702810765936cf679..origin/main`. Do not re-triage the
+  audited `v1.6.1` range.
+- **Upstream repository:** <https://github.com/colbymchenry/codegraph>.
+- **Shipped in codegraph-rs `v0.52.0`, 2026-10-01:**
+  - #286, which makes a full `sync` keep what `index` keeps;
+  - #288, symlink following (#935, #770);
+  - #289, the #1878 git fast path for pending status.
+
+  This closes the two `v0.51.0` exceptions, #770 and #1829/#1878. See the
+  dated entries below, including the `v0.52.0` release record.
+- **Shipped in codegraph-rs `v0.52.1`, 2026-10-01:**
+  - #291, the four port defects found by the retroactive review of the
+    `v1.6.1` port PRs, with extraction version 18;
+  - #292, the Rust 1.98.0 toolchain and MSRV.
+
+  See the dated entries below, including the `v0.52.1` release record.
+- **Shipped in codegraph-rs `v0.52.2`, 2026-10-02:** #295, five KEEP-RUST
+  resolution divergences that fix the findings the retroactive review had kept
+  at upstream behavior, with extraction version 19. See the dated entries
+  below, including the `v0.52.2` release record.
+- **Shipped in codegraph-rs `v0.53.0`, 2026-10-03:**
+  - #298 and #300, the browser viewer (UI family phase 1) behind
+    `CODEGRAPH_UI=1`, drawn to direction D with a light theme;
+  - #303, which makes `sync` re-resolve every edge a same-named candidate's
+    arrival, departure or in-place change can move, so it equals
+    `index --force` again;
+  - #280's dependency updates, with extraction version 20.
+
+  See the dated entries below, including the `v0.53.0` release record.
+- **Shipped in codegraph-rs `v0.53.1`, 2026-10-03:** #307, four KEEP-RUST
+  resolution gates for Rust method calls whose receiver the extractor dropped,
+  with extraction version 21. See the dated entries below, including the
+  `v0.53.1` release record.
+- **Shipped in codegraph-rs `v0.53.2`, 2026-10-03:** #310, mimalloc as the
+  global allocator of the static musl Linux builds. It is a release-build fix,
+  not an upstream port, and changes no graph output. See the dated entries
+  below, including the `v0.53.2` release record.
+- **Shipped in codegraph-rs `v0.53.3`, 2026-10-03:** #314. The kind column of
+  `search`, `callers`, `callees` and `impact` is padded the way upstream pads
+  it, and the store tests' lock probes use their caller's bound. It is a parity
+  fix, not an upstream port, and changes no graph or JSON output. See the dated
+  entries below, including the `v0.53.3` release record.
+- **UI family, phase 1 (browser viewer):** started after the owner selected the
+  Penpot direction D design on 2026-10-02. The viewer — the `codegraph-ui`
+  server over upstream `v1.6.1`'s `ui/` frontend, behind `CODEGRAPH_UI=1` as
+  upstream gates it — is ported, restyled to direction D with a light theme,
+  and shipped in `v0.53.0`; see the 2026-10-02 and 2026-10-03 viewer entries
+  below. The
+  graph-semantic families F1–F12 that shipped beside it (framework navigation
+  edges and routers, the synthesis layer and its schema, cross-tier channels,
+  server route naming, the explore Flow, the React Native bridge) remain
+  deferred, scheduled as phases 2–4: F10/F11 first, then F1–F6 with Screens and
+  Steps, then F7–F9 and F12.
+
+The Rust product and upstream release versions are independent. This Current
+alignment block is the only place that states release parity; dated log entries
+below remain immutable historical evidence.
+
+> **1.6.0 → 1.6.1 sync: COMPLETE** (codegraph-rs `v0.50.3` → `v0.51.0`).
+> Every audited portable, in-scope behavior landed in six porting PRs (#275,
+> #277–#279, #281, #282) on the #271 engineering baseline, and the official
+> `v0.51.0` binaries passed the release smoke in the 2026-10-01 CLOSEOUT entry
+> below. The explicit exceptions are:
+>
+> - **The UI family is DEFERRED** — the viewer and F1–F12, by owner decision
+>   (2026-10-01); see Current alignment above and the audit's re-triage table.
+> - **#770 symlinked-directory watching was DEFERRED at `v0.51.0`**: the scan
+>   did not follow symlinks, so a watcher that did would have watched what was
+>   never indexed. It landed afterwards in #288, together with the #935 scan
+>   port; see the 2026-10-01 symlink entry below.
+> - **#1829 / #1878 git-stamped pending status was a full inventory at
+>   `v0.51.0`**, with the fast path deferred pending a measurement. The fast
+>   path landed afterwards in #289; see the 2026-10-01 pending-status entry below.
+> - **KEEP-RUST divergences** are recorded row by row in the audit — among them
+>   a parameter-pack constructor declines its overload set (upstream admits it
+>   unbounded), a self-closing `<sqlMap/>` is never a statement-map root, and a
+>   `this.a.b.m()` chain keeps its last segment. Three more came out of the
+>   retroactive review, in #291: a store initializer's own calls stay with the
+>   store, an explicit `export default NAME` binding beats an exported
+>   component, and a trim note never claims that gap markers name every elided
+>   symbol. See the 2026-10-01 retroactive-review entry below. Five more, in
+>   #295, fix the findings that review had kept at upstream behavior: Zustand
+>   provenance for every store-action form, no unique-name guess for an
+>   unknowable receiver, three-valued whole `#if` expressions, whole-file
+>   include guards only, and literal paren constructions past
+>   `initializer_list` overloads. See the 2026-10-02 entry.
+> - The `1.5.0 → 1.6.0` and older caveats below carry forward unchanged.
 
 > **1.5.0 → 1.6.0 sync: COMPLETE** (codegraph-rs `v0.48.2` → `v0.50.1`).
 > Every audited portable, in-scope behavior landed across the four waves, and
@@ -90,6 +171,750 @@
 > that records colby parity — do not infer it from `Cargo.toml`.
 
 ## Sync log
+
+### 2026-10-03 — `v0.53.3` RELEASED: #314 shipped
+
+Release-please PR [#315](https://github.com/sunerpy/codegraph-rust/pull/315)
+merged as `81bd7c711bb6fd680113f2a946e927d488c566d6`, and tag `v0.53.3` was cut
+at that exact commit.
+
+- The merge has the tree of the PR's head `b2f83bd`, `7e2db71…`.
+- The owner re-ran the bot's CI run and approved the PR as code owner.
+- The implementation PR #314 merged as `72eefae`, with the tree of its reviewed
+  head `603286d`. The kirocodex review passed in round 1, with no blocking
+  items.
+
+Release workflow run
+[`37143381806`](https://github.com/sunerpy/codegraph-rust/actions/runs/37143381806)
+passed all twelve jobs on its first attempt.
+
+- It ran over main CI run
+  [`37143381765`](https://github.com/sunerpy/codegraph-rust/actions/runs/37143381765),
+  whose required `CI Success` passed.
+- That run's informational Coverage job failed once, in
+  `git_pending::tests::a_system_attributes_file_is_a_conversion_risk`; see the
+  entry on stand-in executables below.
+- The release was published at 2026-10-03T18:25:40Z UTC.
+- The official `codegraph-0.53.3-x86_64-unknown-linux-musl.tar.gz` digest is
+  `769ca112ff554a82b9eabadabc11fa2f0322a40430e875244244a749e3330427`.
+
+Black-box acceptance of the downloaded release, against the official `v0.53.2`:
+
+- **Artifacts.** `SHA256SUMS` and `gh attestation verify` passed for all six
+  archives. The binary reports `codegraph 0.53.3`, and its `.comment` section
+  names rustc 1.98.0.
+- **The kind column.** On the mini fixture, `v0.53.2` prints `functionadd`;
+  `v0.53.3` prints the kind padded to twelve columns in all four commands,
+  for example `function    runDemo` from `callers`.
+- **JSON and graph.** The `--json` output of all four commands and
+  `codegraph export` are byte-identical to `v0.53.2`'s.
+- **Index.** An index built by `v0.53.2` reports `current` to `v0.53.3`; the
+  extraction version is unchanged.
+
+### 2026-10-03 — The kind column of the human output is padded
+
+Not an upstream port: a parity fix. Upstream's CLI prints
+`node.kind.padEnd(12)` before the name (`src/bin/codegraph.ts` at `v1.6.1`).
+The Rust rows use the same `{:<12}{}` layout, but `NodeKind`'s `Display` wrote
+its name with `write_str`, which ignores the formatter's width, so `search`,
+`callers`, `callees` and `impact` printed the kind and the name run together.
+
+#314 makes `NodeKind`, `EdgeKind`, `Language` and `ReferenceSubkind` format
+through `Formatter::pad`. Output written without a width is unchanged:
+`to_string()`, `--json` and the index.
+
+The same PR fixes the cross-process lock probes in the store tests. A probe
+always tried the lock with an 80 ms deadline, whatever bound its caller passed.
+The deadline was set before the child opened and validated the lock file, so on
+a slow Windows runner a probe of a free lock reported `TIMED_OUT`, as it did on
+main's CI at `c03fcbd`. Probes now take the caller's bound.
+
+### 2026-10-03 — Stand-in executables are run once before tests rely on them
+
+Not an upstream port. Three tests write a shell script and run it at once:
+git_pending's fake git, git_pending_fast_path's hanging git, and cli_ui's
+stand-in browser. When another thread of the same test binary forks while the
+script is still open for writing, the child keeps the inherited descriptor until
+it execs, and running the script meanwhile fails with `ETXTBSY`.
+
+- **The failure.** Main's Coverage job on `81bd7c7` failed this way: `git` read
+  the failed start as a failed git, and `conversion_risk` returned `None`.
+- **The reproduction.** On Linux, 8 threads forking `/bin/true` made 313 of
+  3,000 fresh scripts fail to start. Starting each script once, retrying while
+  the error is `ExecutableFileBusy`, left 0 failures in the 7,500 starts that
+  followed.
+- **The fix.** #317 (merged as `aef4efb`) adds that warm-up to the three
+  helpers. The hanging git now uses `exec sleep 30`, and its test checks that
+  the 300 ms timeout actually elapsed; before, a failed start could make the
+  test pass without the timeout ever running.
+
+### 2026-10-03 — `v0.53.2` RELEASED: #310 shipped
+
+Release-please PR [#311](https://github.com/sunerpy/codegraph-rust/pull/311)
+merged as `0b97144c3bc3c45b07aa07206dc73443030f4d36` and cut tag `v0.53.2` at
+that exact commit, with the tree of its head `f4e3103`. The bot's CI run was
+re-run by the owner. The implementation PR #310 merged as `a52a64c`, with the
+tree of its reviewed head `9bbf9be`; the kirocodex review passed in round 2
+(1 → 0).
+
+Release workflow run
+[`37118263946`](https://github.com/sunerpy/codegraph-rust/actions/runs/37118263946)
+passed all twelve jobs on its first attempt, over main CI run
+[`37118263952`](https://github.com/sunerpy/codegraph-rust/actions/runs/37118263952).
+Its two musl build jobs compiled mimalloc's C through zig. The release was
+published at 2026-10-03T11:14:07Z UTC. The
+official `codegraph-0.53.2-x86_64-unknown-linux-musl.tar.gz` digest is
+`b4d55e4c998568877c0afc1032e05304e16cc1b55dd5626665d2154ee414c6d4`.
+
+Black-box acceptance of the downloaded release, against the official
+`v0.53.1`:
+
+- `SHA256SUMS` and `gh attestation verify` passed for all six archives. The
+  binary reports `codegraph 0.53.2`, and its `.comment` section names rustc
+  1.98.0.
+- **Allocator:** both Linux binaries are statically linked and contain
+  mimalloc. The macOS and Windows binaries contain no `mimalloc` string.
+- **Speed:** on the archive of `d26df90`, three runs at 32 threads took
+  8.11–9.19 s against `v0.53.1`'s 110.1 s, 12.0–13.6× faster. Each was also
+  faster than the same binary's 13.25 s at 4 threads. All eight timed runs
+  exited 0 and produced the same graph.
+- **Graph output:** nodes, edges, unresolved references and file rows are
+  identical to `v0.53.1`'s.
+
+### 2026-10-03 — The musl release builds allocate through mimalloc
+
+Not an upstream port. The official Linux archives are static musl builds, and
+indexing with them got slower as threads were added. musl's allocator
+serializes threads, while extraction and resolution allocate in parallel
+through rayon. On the owner's go-ahead the same day, #310 makes mimalloc the
+global allocator on `target_env = "musl"` only:
+
+- the `mimalloc` crate 0.1.52 with feature `v2`, which bundles mimalloc 2.3.2
+  (MIT);
+- a target-gated dependency, so glibc, macOS and Windows builds keep their
+  system allocator and their dependency graph;
+- one `#[global_allocator]` static in the shipped binary, which is also the
+  daemon.
+
+**Why v2.** With its defaults, v3 peaked at 740–750 MB at 32 threads. The crate
+exposes no feature for the settings that lower it, and a shipped binary cannot
+rely on environment variables. v2 peaked at about 500 MB with no tuning.
+
+**Measurement.** The corpus is an archive of `d26df90` (689 files, viewer
+bundle excluded). The command is `codegraph init` with `RAYON_NUM_THREADS` set,
+on a 32-core Linux host, with the Release workflow's toolchain (zig 0.15.1,
+cargo-zigbuild 0.23.0, rustc 1.98.0). Each figure is wall time and peak RSS
+from `/usr/bin/time`. Each cell is one run, except #310 at 32 threads, which
+ran three times.
+Every timed run had to exit 0 and produce the same complete graph (141,628
+canonical rows, hashed after each run).
+
+| threads | `v0.53.1` (musl) | #310 (musl) | local glibc build |
+| --- | --- | --- | --- |
+| 32 | 122.2 s / 249 MB | 7.98–8.42 s / 497–506 MB | 5.20 s / 354 MB |
+| 4 | 68.1 s / 195 MB | 12.8 s / 252 MB | 12.1 s / 227 MB |
+| 1 | 50.6 s / 188 MB | 36.0 s / 218 MB | 38.3 s / 200 MB |
+
+Graph output is unchanged. Nodes, edges, unresolved references and file rows
+match `v0.53.1`'s over every non-timestamp column, so there is no
+extraction-version bump and no golden change. Both musl targets were built
+locally with that toolchain before merge; the `aarch64` binary was built but
+not run.
+
+**Review.** The plan passed the kirocodex plan gate in round 2 (1 → 0); round
+1 asked for the Chinese README mirror. The diff review passed in round 2
+(1 → 0). Round 1 found that the timing harness could report a failed run as a
+time. The numbers above come from the fixed harness, which was shown to stop on
+a failed run, a missing index, and a different graph.
+
+### 2026-10-03 — `v0.53.1` RELEASED: #307 shipped
+
+Release-please PR [#308](https://github.com/sunerpy/codegraph-rust/pull/308)
+merged as `4a6c21b1505af676248f731cf3738bdb0e700cc2` and cut tag `v0.53.1` at
+that exact commit, with the tree of its head `8c67fa4`. The bot's CI run was
+re-run by the owner. The implementation PR #307 merged as `f9f96c3`, with the
+tree of its reviewed head `ec1bf0f`; the kirocodex review passed in round 2
+(1 → 0).
+
+Release workflow run
+[`37104659922`](https://github.com/sunerpy/codegraph-rust/actions/runs/37104659922)
+passed all twelve jobs on its first attempt, over main CI run
+[`37104659935`](https://github.com/sunerpy/codegraph-rust/actions/runs/37104659935).
+The release was published at 2026-10-03T07:08:57Z UTC. The official
+`codegraph-0.53.1-x86_64-unknown-linux-musl.tar.gz` digest is
+`f18521f187234d398627cfa69c4d8750c45d7e9600ecc7fd44377cd8caaaeabc`.
+
+Black-box acceptance of the downloaded release, against the official
+`v0.53.0`:
+
+- `SHA256SUMS` and `gh attestation verify` passed for all six archives. The
+  binary reports `codegraph 0.53.1`, and its `.comment` section names rustc
+  1.98.0.
+- **R2/R3:** `root().join(name)` beside the project's only `join` method binds
+  `root` and `LineIndex::join` under `v0.53.0`, and only `root` now.
+- **R1:** a bare `helper()` whose only namesake is `Store::helper` binds that
+  method under `v0.53.0`, and nothing now.
+- **R4:** an import-free `Err(1)` beside `enum Outcome { Ok, Err }` binds
+  `Outcome::Err` under `v0.53.0` and nothing now. With
+  `use crate::outcome::Outcome::Err;` in scope, `Err(2)` binds it in both.
+- **Upgrade:** an index written by `v0.53.0` (extraction 20) reads `outdated`
+  and becomes `current` after one `sync`.
+
+### 2026-10-03 — Rust method calls that lost their receiver: four KEEP-RUST gates
+
+On 2026-10-03 the owner asked for the cause of `join`, `iter` and `as_str`
+topping this repository's most-called lists to be fixed where it is
+statically decidable. The design passed the kirocodex plan gate in round 4
+(6 → 1 → 1 → 0).
+
+**Cause.** `extract_call` keeps a Rust receiver only in these cases:
+
+- an identifier;
+- `self`;
+- one `self.<field>` hop;
+- a `path::call()` receiver.
+
+Every other receiver leaves the bare method name: a plain call `root()`, a
+deeper field chain, `vec![…]`, `?`, `.await`, indexing, or a chain broken
+across lines. Upstream's `tree-sitter.ts` does the same. Resolution then treated
+`root().join(name)` as a bare call, and the project's only `join` method won at
+exact-match 0.9. That method is `LineIndex::join`, so 964 calls from 169 files
+landed on it.
+
+Upstream has no Rust counterpart to its JS/TS gates (#1987, #1714/#1857,
+#1683). These rules are stricter than upstream `v1.6.1` (`f4ddf50`):
+
+| rule | a Rust `calls` ref | binds |
+| --- | --- | --- |
+| R1 | with neither receiver nor path (`helper()`) | never a method |
+| R2 | whose receiver was dropped (`root().join(x)`) | only a method, never through `use`, never by a fuzzy guess |
+| R3 | whose receiver was dropped, named in `RUST_STD_METHODS` (307 std names) | nothing |
+| R4 | bare `Ok` / `Err` / `Some` / `None` | a project enum variant only when a `use` naming it, or a glob, is in its own block and module |
+
+**Shape.** It is read from the source. The ref's column is the call
+expression's start, so a bare call starts with its name. A dropped receiver
+starts with something else, and its `.name(` follows within 4 KiB. An unknown
+shape (no source, or a column off its line) keeps the old behaviour.
+
+**Measured** on an archive of `6cc9507`: old binary `0.53.0`, new binary this
+change, bundle excluded both times.
+
+- 3,284 edges removed, each attributed to one rule: R3 2,743, R1 296, R4 193,
+  R2 52.
+- A hand review of 20 removed edges per rule found every one false.
+- 48 edges added where a filtered candidate gave way to the right one. In 24 of
+  them a bare `node(…)` now reaches the free fn instead of a same-named method.
+  In 13, `.extract(…)` reaches `FrameworkResolver::extract` because R2 brought
+  the candidates under the ambiguity ceiling.
+- 451 Method-shaped edges with project-specific names survive. About a third
+  of a 20-edge sample are third-party crate methods (`is_match`, `body`) or a std
+  type outside the list (`SocketAddr::port`): the known limit of a std list.
+- No golden of any corpus moved, and `sync` after moving `LineIndex::join`
+  equals `index --force`.
+
+### 2026-10-03 — `v0.53.0` RELEASED: the browser viewer and #303 shipped
+
+Release-please PR [#299](https://github.com/sunerpy/codegraph-rust/pull/299)
+merged as `2ca1fabb32cece7af4e6d337b9bf6cc0ba946ab5` and cut tag `v0.53.0` at
+that exact commit, with the tree of its head `a9f3054`. That head brought `main`
+in through `gh pr update-branch`, so the release PR's CI tested the shipped
+tree. The implementation PRs merged from their reviewed heads with identical
+trees: #298 as `143752a`, #300 as `fee9ae7`, #303 as `a35e065`.
+
+Release workflow run
+[`37094204307`](https://github.com/sunerpy/codegraph-rust/actions/runs/37094204307)
+passed all twelve jobs on its first attempt, over main CI run
+[`37094204330`](https://github.com/sunerpy/codegraph-rust/actions/runs/37094204330).
+The release was published at 2026-10-03T03:56:56Z UTC. The official
+`codegraph-0.53.0-x86_64-unknown-linux-musl.tar.gz` digest is
+`b46c8d3cc37161a333daa53f4258727aae13de78fd37e315214451b5ac52d50f`.
+
+Black-box acceptance of the downloaded release, against the official
+`v0.52.2`:
+
+- `SHA256SUMS` and `gh attestation verify` passed for all six archives. The
+  binary reports `codegraph 0.53.0`, and its `.comment` section names rustc
+  1.98.0.
+- **Viewer gate:** without `CODEGRAPH_UI=1`, `codegraph ui` exits 1 with
+  upstream's "not in this release yet" refusal.
+- **Viewer:** with it, `ui --read-only --port 0` serves `/` under a CSP that
+  allows fonts from `'self'` only, `/api/stats` names the project, and
+  `/api/trails` answers `readOnly: true`. All 16 files of the bundle committed
+  at `v0.53.0` are served byte-for-byte, so the build accepted in #300 is the
+  one that shipped. Its CSS carries the Daylight tokens and its JS the
+  `codegraph-ui.theme` choice.
+- **#303:** a Rust project's `read` calls its own `ok` beside a JavaScript
+  `var ok`. Excluding the JavaScript file and syncing leaves `read → ok` at
+  confidence 0.4 under `v0.52.2`; `v0.53.0` gives 0.9, as `index --force` does.
+- **Upgrade:** an index written by `v0.52.2` (extraction 19) reads `outdated`
+  and becomes `current` after one `sync`.
+
+### 2026-10-03 — `ui/README.md` rewritten for this repository
+
+The imported frontend README described upstream's npm monorepo: its build, the
+`@colbymchenry/codegraph-ui` package and its publishing, and engine files under
+`src/`. It now describes this repository: `make ui` and `make ui-check`, the
+committed bundle the crate embeds, the Rust files behind the server and the
+engine, and what the Rust server does not send yet. Its frontend-design sections
+are upstream's, with their paths, numbers and claims checked against this tree.
+A later sync of upstream `ui/` keeps this README rather than taking upstream's.
+
+### 2026-10-03 — browser viewer RESTYLED: direction D, a local design layer
+
+The ported viewer's frontend now carries the design the owner selected
+([`../design/viewer-d.md`](../design/viewer-d.md), direction D) on top of the
+`v1.6.1` import: tokens, type, shell, view layouts, states, responsive layouts
+and a second, light token set (§3.6). This is codegraph-rs's own design, not an
+upstream change: the wire contract, the routes and the server are untouched, and
+the frontend's models keep upstream's behaviour — only the layout constants the
+components measure against moved, each pinned by name in the suites.
+
+A later sync of upstream `ui/` therefore re-applies this layer rather than
+taking upstream's paper/ink look. The visual differences from the boards, and
+from upstream where they matter, are listed in [`../ui.md`](../ui.md) under
+"Direction D as built".
+
+### 2026-10-02 — browser viewer PORTED: UI family phase 1 (`codegraph ui`, `CODEGRAPH_UI=1`)
+
+The viewer upstream ships in `v1.6.1` — `src/ui-server/**` (the loopback JSON
+API) and `ui/` (the Svelte 5 frontend) — is ported for the first time. Plan:
+`ui-viewer-phase1`, gate PASS in round 4.
+
+**Re-audit of the baseline (2026-10-02):** the latest stable upstream tag is
+still `v1.6.1` (`f4ddf508516332419ea3c95702810765936cf679`); upstream `main` is
+172 commits past it and unreleased, so the viewer is ported at `v1.6.1`. The
+families that feed it stay scheduled:
+
+| phase | families | what the viewer gains |
+| --- | --- | --- |
+| 2 | F10 explore Flow section, F11 branch guards | `when` conditions on Symbol and Flow links; explore leads with the same flow search |
+| 3 | F1 `navigates` edges and fan-out refs, F2–F6 routers (Expo, Next.js, React Router, TanStack, Vue/Nuxt) | the `/api/screens` walk past its early return, and `/api/steps` |
+| 4 | F7 synthesis layer, F8 cross-tier channels, F9 server route naming, F12 React Native bridge | synthesized dispatch hops, cross-tier steps |
+
+| upstream surface | Rust target | disposition |
+| --- | --- | --- |
+| `ui/` frontend (`v1.6.1:ui`, tree `7e3b440035f6745c546e5b10d92eba31144406c2`) | imported verbatim into `ui/` (MIT, `ui/LICENSE`), then one change: `createHttpAdapter` omits `steps` | PORT |
+| `src/ui-server/{index,security,static,assets,open-browser}.ts` | `crates/codegraph-ui` (`server`, `security`, `assets`, `browser`): loopback bind with port fallback, Host/Origin/method/write-marker checks, raw-path refusals, containment chokepoint, CSP, embedded bundle | PORT |
+| `src/ui-server/api/*` — stats, search, node (+ hierarchy), nodes, source (+ highlight), file, filecode, routes, entrypoints, map, deadcode, flow, trails (+ trail-store), events | `crates/codegraph-ui/src/api/*`, wire shapes, limits, error codes and refusals as upstream | PORT |
+| `src/graph/{dead-code,named-symbol-flow,symbol-lookup,type-hierarchy}.ts`, `continuationsFrom`, `src/extraction/syntax-tokens.ts` | `codegraph-graph::{dead_code, named_symbol_flow, symbol_lookup, hierarchy, flow_boundary}`, `codegraph-extract::syntax_tokens`; store SELECTs in `codegraph-store::viewer` | PORT |
+| `findDynamicBoundaries` / `shortlistBoundaryCandidates` | `codegraph-ui::api::boundary` over explore's own `codegraph_mcp::dynamic_boundaries` scanner | PORT |
+| the events source watcher's notify-only `syncFn` | `codegraph_watch::WatchOptions::observe_only`, additive | PORT |
+| `codegraph ui` / `web`, `viewer-gate.ts` | `codegraph-cli` `ui` command, gate before `Cli::parse()` | PORT |
+| `/api/screens` walk, `/api/steps`, `when` conditions | Screens answers upstream's own no-`navigates` early return; Steps is a JSON 404; conditions are absent — phases 2 and 3 (F1–F6, F11) | DEFER |
+| `countImplementers`, `buildTypeHierarchy`'s `overrides: false` | used only by `codegraph_explore` | N/A here |
+| `CODEGRAPH_VIEWER_PATH` | the bundle is embedded in the binary | N/A |
+
+KEEP-RUST, as this index holds the facts: an unresolved import is listed by the
+binding it names, not the module specifier; routes come from this port's
+resolvers (React, Vue, NestJS — not Express or Go); there are no synthesized
+dispatch edges, so no dashed `via …` flow hop and no Go implicit
+implementations in a hierarchy; the flow's directed walk sees every
+`(callee, kind)` pair `get_callees` reports rather than one row per neighbour.
+
+Tests port upstream's suites case by case: `crates/codegraph-ui/tests/*.rs`
+(`ui-server-api`, `ui-server`, routes, `ui-trails`, `ui-events-api`,
+`ui-map-api`, `ui-flow-api`, `ui-filecode-api`, the server half of
+`ui-entrypoints-api`, the engine halves of `type-hierarchy`, `dead-code` and
+`ui-highlight`), `crates/codegraph-cli/tests/cli_ui.rs` (`cli-ui-command` and the
+gate), and `ui/tests/` (the 17 frontend suites, the three mixed suites' model
+cases among them). Golden extraction output is unchanged: no extraction,
+resolution or schema change.
+
+### 2026-10-02 — `v0.52.2` RELEASED: #295 shipped
+
+Release-please PR [#296](https://github.com/sunerpy/codegraph-rust/pull/296)
+merged as `36841bcd398ca0f9bd882a61075ef3a5708b957c` and cut tag `v0.52.2` at
+that exact commit. Its implementation PR #295 merged as `ff52e5c`, from the
+reviewed head `0d3a991` with an identical tree.
+
+Release workflow run
+[`36942112539`](https://github.com/sunerpy/codegraph-rust/actions/runs/36942112539)
+passed all twelve jobs on its first attempt, over main CI run
+[`36942112580`](https://github.com/sunerpy/codegraph-rust/actions/runs/36942112580).
+The release was published at 2026-10-01T23:54:19Z UTC. The official
+`codegraph-0.52.2-x86_64-unknown-linux-musl.tar.gz` digest is
+`fc066b91ad587abd65cb602ccfde4b1a97b4d0dc5d97eff2813581638d25d62e`.
+
+Black-box acceptance of the downloaded release, against the official
+`v0.52.1`, follows the table the plan for #295 fixed in advance:
+
+- `SHA256SUMS` and `gh attestation verify` passed for all six archives. The
+  binary reports `codegraph 0.52.2`, and its `.comment` section names rustc
+  1.98.0.
+- **Zustand provenance:** `run` calls `fake.getState().reset()` on an
+  `otherFactory` store and `useStore.getState().reset()` on a `create` store.
+  Its call targets go from `fake::reset,useStore::reset` to `useStore::reset`.
+- **Unknown receiver:** `pool.submit(self.store.fetch)` with an unannotated
+  `store` gives one reference edge into the only `Store::fetch` before and none
+  now.
+- **`#if 1 || FLAG`:** the `HOOK` call edge, which a definitely visible macro
+  now suppresses, is gone.
+- **Feature-flag default:** `#ifndef FEATURE` / `#define FEATURE` among other
+  code is no guard, so `use2` now calls the real `HOOK2`, where `v0.52.1` had
+  no edge.
+- **Literal paren construction:** `L value(1)` beside
+  `L(std::initializer_list<int>)` now calls `L::L`, the `L(int)` definition;
+  `v0.52.1` declined.
+- **Upgrade:** an index written by `v0.52.1` reads as `outdated`, because the
+  extraction version moved from 18 to 19. `sync` rebuilds it, and it then reads
+  `current`.
+
+### 2026-10-02 — five more KEEP-RUST divergences: the declined retroactive-review findings FIXED (#295)
+
+The 2026-10-01 retroactive-review entry below kept five review findings at
+upstream behavior. On 2026-10-02 the owner asked for all five to be fixed
+beyond upstream `v1.6.1` (`f4ddf50`). Their design passed the kirocodex plan
+review in round 3, with blocking items 6 → 1 → 0. Each item below is a
+KEEP-RUST divergence: stricter than upstream, or more exact. The extraction
+version moves to 19, so an index built at 18 is rebuilt.
+
+| Finding | Upstream `f4ddf50` | Port |
+| ------- | ------------------ | ---- |
+| #277: store actions | `matchStoreAccessorChain` checks Zustand provenance for selectors only, so `otherFactory(() => ({ reset() {} })).getState().reset()` binds | Every store-action form needs a Zustand factory on the initializer's call path to the action function. That path is read by the parser, following the same search that finds the actions. The factories are `create`, `createStore` and `createWithEqualityFn` from `zustand`, `zustand/vanilla` or `zustand/traditional`, the default import, or a namespace member. A selector also needs a hook factory. A wrapped hook such as `createSelectors(create(...))` now binds its selectors. |
+| #278: method values | "Unknown receivers retain the old unique-or-drop discipline" | An unknowable Python or Go receiver leaves the value unresolved, even when one project method bears the name |
+| #282: `#if` | `condition` reads a literal, one `defined` test or a bare name | The whole expression is evaluated three-valued, with C precedence. `&&`/`||` decide whenever one side does, and a definitely undefined name reads 0. Unseen names, `__has_include(...)`, character literals, overflow and malformed text stay unknown. Backslash continuations are spliced first. |
+| #282: guards | `guardsItself` reads any `#ifndef X` followed by `#define X` (empty) or `#define X(` as a guard and forces the branch active | Only a whole-file include guard counts: the test is the first code line, the next directive is an empty `#define X`, and the matching `#endif`, with no `#else`/`#elif` at its depth, is the last code line. A feature-flag default and a fallback `#ifndef MIN` / `#define MIN(a, b)` stay undecided and keep the call. |
+| #282: constructors | any constructor mentioning `initializer_list` declines the set | `T x(<literal>, ...)`, with no `{` in the arguments, drops the constructors whose first parameter is the list; a literal never converts to one. The rest compete by arity. Every other form still declines. |
+
+Each fix was red first; the logs are in `/tmp/evidence-p10/red-*.log`.
+
+### 2026-10-01 — `v0.52.1` RELEASED: #291 and #292 shipped
+
+Release-please PR [#293](https://github.com/sunerpy/codegraph-rust/pull/293)
+merged as `9ca7f9716de38828562295cdc79a3b5a99b52738` and cut tag `v0.52.1` at
+that exact commit.
+
+Release workflow run
+[`36879201833`](https://github.com/sunerpy/codegraph-rust/actions/runs/36879201833)
+passed all twelve jobs on its second attempt.
+
+- **First attempt:** the exact-SHA CI gate failed. On main CI run
+  [`36879201821`](https://github.com/sunerpy/codegraph-rust/actions/runs/36879201821),
+  Windows Clippy could not start sccache, because the Actions cache backend
+  answered 503 (`Egress is over the account`). The release stayed a draft.
+- **Second attempt:** re-running that job passed, and the re-run gate then
+  admitted the release. The six platform builds are from the first attempt.
+
+The release was published at 2026-10-01T15:12:32Z. The official
+`codegraph-0.52.1-x86_64-unknown-linux-musl.tar.gz` digest is
+`73bd59d46588467507152e2783cb06fd001187bc73f5a095b85708991326863d`.
+
+Black-box acceptance of the downloaded release, against the official
+`v0.52.0`:
+
+- `SHA256SUMS` and `gh attestation verify` passed for all six archives. The
+  binary reports `codegraph 0.52.1`, and its `.comment` section names rustc
+  1.98.0, where `v0.52.0` names 1.96.0.
+- **Vue:** two same-name functions on one line of a script block index as two
+  rows; `v0.52.0` kept one.
+- **Store initializer:** `useStore = create(persist(..., { storage:
+  createJSONStorage(...) }))` calls `create`, `createJSONStorage` and
+  `persist`; `v0.52.0` recorded no call.
+- **Default binding:** in a React `.js` module, `consume` calls `upload`
+  through `export default Api`; `v0.52.0` made it call the component
+  `Screen`.
+- **Trim note:** a windowed explore says gap markers name elided symbols "only
+  where room allowed".
+- **Upgrade:** an index written by `v0.52.0` reads as `outdated`, because the
+  extraction version moved from 17 to 18. `sync` re-extracts it, and it then
+  reads `current`.
+
+### 2026-10-01 — Retroactive review of the `v1.6.1` port PRs: four port defects FIXED (#291)
+
+The owner asked for a kirocodex review of the large PRs that merged before
+large changes needed one. The goal gate reviewed each merged commit against its
+parent at `high` effort, with the PR description as the claims under review.
+Then every blocking item was checked against `main` (`c00aa2b`) and upstream
+`v1.6.1` (`f4ddf50`).
+
+| PR   | Verdict | Blocking items | Outcome                                                                     |
+| ---- | ------- | -------------- | --------------------------------------------------------------------------- |
+| #271 | PASS    | 0              | —                                                                           |
+| #275 | PASS    | 0              | —                                                                           |
+| #277 | FAIL    | 2              | one fixed, one kept at upstream behavior                                    |
+| #278 | FAIL    | 4              | two fixed, one kept at upstream behavior, one about evidence only           |
+| #279 | PASS    | 0              | its one defect, the full-sync scope, was already fixed by #286              |
+| #281 | FAIL    | 1              | fixed                                                                       |
+| #282 | FAIL    | 3              | all three kept at upstream behavior                                         |
+
+**Fixed in #291, extraction version 18:**
+
+- **#1349 gap.** The Vue extractor mints its own script-block functions and
+  still called `generate_node_id` directly. Two same-name declarations on one
+  line therefore shared an id, and the store kept one row. Upstream reaches its
+  allocator by delegating Vue scripts to its tree-sitter extractor. The port now
+  uses `NodeIdAllocator` there, with the same block-relative line and UTF-16
+  column.
+- **KEEP-RUST: a store initializer's own calls stay with the store.** After
+  #277, an exported store's inline actions were function nodes, and the rest of
+  the initializer went unwalked. `create`, `persist` and their options' calls
+  were lost; the port had recorded them before #277. Upstream skips the
+  initializer the same way (`membersExtractedSeparately`). The walk now skips
+  only the extracted action values, and it treats the factory closure as the
+  store's body, so a curried `create<S>()(...)` mints no function named after
+  the store.
+- **KEEP-RUST: an explicit `export default NAME` binding beats an exported
+  component.** The React resolver mints component nodes inside `.js` and `.ts`
+  modules. Upstream's lookup (`defaultComponent ?? defaultExportBindingNode ??
+  defaultFnClass`) bound a default import to the module's first exported
+  component. In a module exporting `function Screen() { return <div /> }`
+  beside `const Api = { upload }; export default Api`, `Api.upload()` became a
+  call to `Screen`, and the `upload` edge was lost.
+- **KEEP-RUST: the trim note never claims that gap markers name every elided
+  symbol.** A gap marker names what it hides only from the budget its file has
+  spare. The tail marker after a dropped or windowed cluster names nothing, and
+  a dropped file appears only in the pointer list. Both tiers' notes, like
+  upstream's (`tools.ts:1302`, `:7272`), still said the markers named what was
+  elided. They now say the markers name what room allowed.
+
+**Kept at upstream behavior.** Each of these review findings describes
+upstream's own design, and in each case the upstream source says why:
+
+- **#277:** `.getState().member()` binds for a store built by any factory, not
+  only Zustand's `create`. Upstream's `matchStoreAccessorChain` checks Zustand
+  provenance only for selectors. The member must still sit in that holder's own
+  object literal. A provenance gate would also drop `zustand/vanilla`, wrapped
+  and locally re-exported stores.
+- **#278:** an unknown receiver falls back to a project-unique method name
+  ("Unknown receivers retain the old unique-or-drop discipline"). This
+  predates #278.
+- **#282:** `#if` reads a literal, one `defined()` or a bare name, so a compound
+  condition is unknown and keeps the call. `#ifndef X` followed by an empty
+  `#define X` reads as the guard idiom (`guardsItself`). Any `initializer_list`
+  constructor declines its overload set, because the reference carries arity,
+  not the brace or paren form.
+
+The fourth #278 item asked for an exact-head evidence artifact. #278 merged
+after CI run `36798356332` passed on a tree-identical head.
+
+### 2026-10-01 — `v0.52.0` RELEASED: #286, #288 and #289 shipped
+
+Release-please PR [#287](https://github.com/sunerpy/codegraph-rust/pull/287)
+merged as `4986722e08feca1b39c0aa885eb608d608244e4d` and cut tag `v0.52.0` at
+that exact commit.
+
+Release workflow run
+[`36854318561`](https://github.com/sunerpy/codegraph-rust/actions/runs/36854318561)
+passed all twelve jobs:
+
+- release-please, the source gate, and the tag check;
+- the exact-SHA CI gate, over main CI run
+  [`36854318393`](https://github.com/sunerpy/codegraph-rust/actions/runs/36854318393);
+- six platform builds;
+- asset attachment and publish.
+
+The release was published at 2026-10-01T11:28:53Z. The official
+`codegraph-0.52.0-x86_64-unknown-linux-musl.tar.gz` digest is
+`91668069f916e15330bd819a63d4d898ad7129657dbf18a78072f6b730732d09`.
+
+Black-box acceptance of the downloaded release:
+
+- `SHA256SUMS` and `gh attestation verify` passed for all six archives, and the
+  binary reports `codegraph 0.52.0`.
+- **#935:** on the probe layout
+  `{src/real/a.ts, src/afile.ts -> real/a.ts, src/linkdir -> real, src/extlink -> ../../outside/lib}`,
+  `init` indexes `src/afile.ts`, `src/extlink/out.ts` and `src/real/a.ts`, where
+  `v0.51.0` indexed only `src/real/a.ts`.
+- **#286:** after `init` and `sync`, `.cache/a.ts` is still indexed.
+- **#1878:** in a git repository, an edit committed after `init` is reported
+  by `status` as modified, and the git record is present.
+- **Upgrade:** an index written by the official `v0.51.0` binary reads as
+  `current` under `v0.52.0`, with nothing pending, and `sync` reindexes nothing.
+  The extraction version is unchanged.
+
+### 2026-10-01 — #1878 git-stamped pending status LANDED (#289)
+
+Owner decision, 2026-10-01: port #1878's fast path. The design passed the
+kirocodex plan-convergence review in round 4.
+
+#289 keeps the full inventory as the reference answer. A full build or full sync
+records, under `project_metadata` key `git_pending_state`:
+
+- the commit it started at;
+- every path that may differ from that commit: paths git reported dirty, rows
+  whose stat moved during the build, and paths a fresh scan and the database
+  disagree on.
+
+Incremental syncs add the paths they handle. `status` then classifies only git's
+candidates plus the recorded paths, by the full inventory's own rules.
+
+KEEP-RUST:
+
+- **One record, not two keys.** Upstream keeps a commit key and a dirty-path key.
+- **Race guards:** the stat-moved and fresh-scan comparisons.
+- **Declines to the full inventory**, beyond upstream's missing- or
+  unknown-stamp checks:
+  - a changed scope;
+  - an index built through symlinks;
+  - submodules;
+  - an untracked nested repository;
+  - `assume-unchanged` or `skip-worktree` entries;
+  - an ignored path the scan keeps (the scan honors only the root
+    `.gitignore`);
+  - content or name conversions that let git call changed bytes clean:
+    `core.autocrlf`, any gitattributes source, `core.ignorecase`,
+    `core.precomposeunicode`. Windows CI caught this: a revert rewrote LF as
+    CRLF while `git status` stayed clean;
+  - a git timeout.
+
+Measured on the code at `742bcb4`, release build, warm cache, five runs after
+a warm-up, `codegraph status . --json`. The corpus was a generated repository of
+40,000 TypeScript files on ext4, on a 32-CPU Linux host. Medians, with
+min–max:
+
+| Scenario            | Fast path         | Full inventory    |
+| ------------------- | ----------------- | ----------------- |
+| Clean               | 212 ms (208–215)  | 266 ms (264–266)  |
+| 18 committed edits  | 211 ms (206–219)  | 263 ms (262–264)  |
+
+Both columns reported the same pending changes in every run.
+
+### 2026-10-01 — #935 row CORRECTED; #935 and #770 symlink following LANDED on main (#288)
+
+The 2026-06-24 `v1.0.1 → v1.1.0` entry below records "In-root symlink indexing
+(#935)" as ALREADY-HAVE. That was wrong. The official `v0.51.0` binary indexed
+only `src/real/a.ts` from
+`{src/real/a.ts, src/afile.ts -> real/a.ts, src/linkdir -> real, src/extlink -> ../../outside/lib}`,
+because the scan skipped every symlink. That row stays as written; this entry
+supersedes it.
+
+The owner decided on 2026-10-01 to follow symlinks by default, as upstream does,
+including targets outside the project. Its design passed the kirocodex
+plan-convergence review in round 3. #288 ports both behaviors: the scan follows
+symlinked files and directories (#935), and the watcher watches what the scan
+reached (#770). A binary built from the PR indexes `src/afile.ts`,
+`src/extlink/out.ts` and `src/real/a.ts` from the same tree. `src/linkdir` adds
+nothing, because the real `src/real` wins.
+
+KEEP-RUST divergences:
+
+- **Precedence:** a directory is scanned once, under the logical path with the
+  fewest symlink hops, ties going to the smallest path. Upstream's winner
+  depends on `read_dir` order.
+- **Targets that are not followed:** a link to the project root or an ancestor
+  of it, a link into the canonical `.git` or a reserved index root, and a
+  missing or unreadable target. Upstream re-walks a parent tree under an
+  ancestor link, and skips `.git` and data directories by entry name only.
+- **Retargets keep `sync` equal to `index --force`:** a full build records its
+  links under `project_metadata` key `followed_links`. Full sync and `status`
+  re-read every path behind a new, retargeted or retyped link, and behind every
+  link when the record is missing.
+- **The watcher takes its links from the scan.** It narrows them by its stricter
+  policy, so it never watches a path the scan did not reach. Native-recursive
+  backends add up to 256 supplemental watches; that cap matches upstream. An
+  edit to a file link's target re-indexes the link.
+- **Known limitation, as upstream:** a file link whose target lies outside every
+  scanned directory is not watched; the next full sync picks it up.
+
+#286 (`f23b0bd`) fixed a pre-existing `v0.51.0` defect found along the way. A
+full sync judged scope with the watcher's stricter policy, so it deleted indexed
+files under `.cache`, `vcpkg_installed`, the other watch-only defaults, and
+top-level `.codegraph-*` directories.
+
+Goldens: all 19 re-indexable corpora are byte-identical; they contain no
+symlinks. The change ships in the next release.
+
+### 2026-10-01 — CLOSEOUT: `v1.6.0 → v1.6.1` sync COMPLETE in codegraph-rs `v0.51.0` (tracked parity advanced to `v1.6.1`)
+
+The `v1.6.1` range (`3ed73bc..f4ddf50`, 113 commits) was audited on 2026-09-30
+in [`V1_6_1_AUDIT_2026-09-30.md`](V1_6_1_AUDIT_2026-09-30.md), which records
+every row's disposition and landing PR. The owner decided two questions on
+2026-10-01: #1349's node-id collision handling is ported (a colliding later
+declaration gains a column suffix; the formula is otherwise unchanged), and
+the UI family is deferred to the next round.
+
+The work landed in seven squash-merged PRs:
+
+- [#271](https://github.com/sunerpy/codegraph-rust/pull/271) `79cb21c` —
+  engineering baseline: CI and release hardening, checksum-verified installers;
+- [#275](https://github.com/sunerpy/codegraph-rust/pull/275) `f8e6039` — the
+  2026-09-15 main-range product work, re-based on `v1.6.1`'s final shapes;
+- [#277](https://github.com/sunerpy/codegraph-rust/pull/277) `4231ee5` —
+  receiver evidence, Zustand and object-literal bindings, extraction recall;
+- [#278](https://github.com/sunerpy/codegraph-rust/pull/278) `227f1d2` — node
+  identity (#1349), traversal depth, method values, handler recall;
+- [#279](https://github.com/sunerpy/codegraph-rust/pull/279) `bc301b9` — I/O
+  safety, lifecycle recovery, MyBatis and Liquid recall;
+- [#281](https://github.com/sunerpy/codegraph-rust/pull/281) `678927c` —
+  explore: line anchors and exact targets, named-file budget, same-basename
+  pins, honest completion notes, named gaps, empty-result diagnostics; and
+- [#282](https://github.com/sunerpy/codegraph-rust/pull/282) `34bc8dc` — C/C++
+  translation-unit macro visibility and constructor overloads.
+
+Extraction moved from version 12 to 17. Extraction goldens changed only where a
+port meant them to: #275 added the Scala and Dart corpora (17 → 19 re-indexable
+corpora) and grew the TypeScript (14 → 16 files), C-family (19 → 23 files) and
+Rust corpora; #277 regenerated the TypeScript references and the Python nodes,
+edges and references; #278, #279, #281 and #282 left all 19 corpora
+byte-identical. MCP structural fixtures changed three times: #275
+(`codegraph_callers` gained its `file` parameter in `tools/list`), #278
+(callers and callees now follow `instantiates` edges, upstream #774/#804, so
+the `codegraph_callees`, `codegraph_node` and `codegraph_explore` fixtures show
+`runDemo` constructing `Counter`), and #281 (the `initialize` instructions
+bullet).
+
+Two release-gate defects surfaced on the way and were fixed before the release:
+[#283](https://github.com/sunerpy/codegraph-rust/pull/283) `3183b93` kept two
+Windows-only test flakes (a same-nanosecond temp directory, a two-second full
+sync wait) off main CI, and
+[#284](https://github.com/sunerpy/codegraph-rust/pull/284) `e973f12` exempted
+`.github/scaffold.json` from oxfmt, because release-please's JSON updater
+rewrites it in a shape oxfmt rejects. The release PR's CI went green (run
+[`36824289185`](https://github.com/sunerpy/codegraph-rust/actions/runs/36824289185))
+once its branch was updated with #284, and its merge needed a code-owner approval:
+the `mainPR` ruleset still requires code-owner review, which the CODEOWNERS
+comment says it should not while the repository has one maintainer.
+
+Release-please PR [#272](https://github.com/sunerpy/codegraph-rust/pull/272)
+merged as `4ce8813441d4a4064f0d553f7e766c095ea400ed` and cut tag `v0.51.0` at
+that exact commit. Release workflow run
+[`36825202787`](https://github.com/sunerpy/codegraph-rust/actions/runs/36825202787)
+passed all twelve jobs — release-please, the source gate, the exact-SHA CI gate
+over main CI run
+[`36825202832`](https://github.com/sunerpy/codegraph-rust/actions/runs/36825202832),
+the tag check, six platform builds, asset attachment and publish — and
+published the release at 2026-10-01T06:42:29Z. The official
+`codegraph-0.51.0-x86_64-unknown-linux-musl.tar.gz` digest was
+`f7efb5b106f885ca080d727697d8e2db53de1da374e803b54e41ad740775460d`.
+
+Black-box acceptance of the downloaded release:
+
+- `SHA256SUMS` verified all six archives, and `gh attestation verify` verified
+  all six against `sunerpy/codegraph-rust`; the binary reports
+  `codegraph 0.51.0`;
+- a fresh `init` of the mini fixture indexed three files at extraction version
+  17; `search add` and `callers add` found the function, and the line-anchored
+  `explore "src/math.ts:1 add"` reported `1 file pinned from the query`; and
+- an extraction-version-12 index written by the official `v0.50.3` binary was
+  reported by `status` as outdated with `sync` as the recovery; `sync` migrated
+  it in place to version 17 with no `init`. In the migrated index a
+  function-like `#define` is a `constant` whose call stays unresolved, and
+  `Widget item;` reaches the out-of-line definition through the default
+  declared on its prototype. A copy of the same version-12 index at another
+  path is refused as belonging to a different location, with `init` as the
+  recovery.
+
+Tracked release parity advances to `v1.6.1`; the next discovery starts at the
+`v1.6.1` tag.
+
+### 2026-09-15 — post-v1.6.0 main AUDITED through `3ed73bc`; tracked release stays `v1.6.0`
+
+A fresh upstream clone confirmed that the newest formal release is still
+`v1.6.0`, while main advanced from
+`6a056ec5db35172f9dc348f87b54ea415aa5169e` to
+`3ed73bc127323e63153bf6ec8354afa82ce36aaf`. The exact unreleased range is 119
+commits across 373 changed files (+86,127/-1,745).
+
+The dated report
+[`POST_V1_6_MAIN_2026-09-15.md`](POST_V1_6_MAIN_2026-09-15.md) partitions every
+commit family and records `PORT`, `ALREADY-HAVE`, `N/A`, and `DEFER` decisions.
+It identifies real Rust correctness/safety and CLI/MCP/installer gaps, but none is
+marked LANDED by this audit. The large browser viewer/Screens/Steps family is
+explicitly deferred to an owner-selected Penpot design and a stable upstream
+baseline; it is not mixed into core parity work.
+
+Because upstream has no post-1.6 tag, tracked release parity remains `v1.6.0`.
+Only the discovery boundary advances to `3ed73bc`.
 
 ### 2026-08-31 — Wave 3 LANDED in `v0.50.0`; release-smoke fixes LANDED in `v0.50.1`; `v1.6.0` sync COMPLETE
 

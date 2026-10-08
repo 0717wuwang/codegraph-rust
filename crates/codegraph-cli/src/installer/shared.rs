@@ -356,33 +356,60 @@ pub fn parse_json_object(text: &str) -> Option<Map<String, Value>> {
     }
 }
 
-/// Read an agent config file, distinguishing missing / parsed / unparseable.
+/// Read an agent config file on a WRITE path, distinguishing missing / parsed /
+/// unparseable.
 ///
 /// Tolerates JSONC (comments + trailing commas). A present-but-unparseable file
 /// is backed up to `<path>.backup` and reported as [`ConfigRead::Unparseable`]
 /// WITHOUT being modified, so the caller can skip writing instead of clobbering
 /// the user's config.
 pub fn read_config_file(path: &Path) -> ConfigRead {
+    let read = read_config(path);
+    if matches!(read, ConfigRead::Unparseable) {
+        let _ = fs::copy(path, path.with_extension("backup"));
+    }
+    read
+}
+
+/// Read a JSON/JSONC file into a map, `{}` when missing or unparseable.
+///
+/// Read-only and silent: every target's `detect()` reads its agent's config
+/// on every run, including agents codegraph was never installed into, and
+/// `install --refresh` skips the unconfigured ones on that answer, so a
+/// `.backup` left by a read would touch a config codegraph has no business
+/// touching (upstream #1870). Callers on the WRITE path must NOT use this (it
+/// cannot signal the unparseable case); use [`read_config_file`] and abort on
+/// [`ConfigRead::Unparseable`] there.
+pub fn read_json_file(path: &Path) -> Map<String, Value> {
+    match read_config(path) {
+        ConfigRead::Parsed(map) => map,
+        ConfigRead::Missing | ConfigRead::Unparseable => Map::new(),
+    }
+}
+
+fn read_config(path: &Path) -> ConfigRead {
     let Ok(text) = fs::read_to_string(path) else {
         return ConfigRead::Missing;
     };
     match parse_json_object(&text) {
         Some(map) => ConfigRead::Parsed(map),
-        None => {
-            let _ = fs::copy(path, path.with_extension("backup"));
-            ConfigRead::Unparseable
-        }
+        None => ConfigRead::Unparseable,
     }
 }
 
-/// Read a JSON/JSONC file into a map. Backward-compatible helper that maps
-/// [`ConfigRead::Missing`] to `{}`. Callers on the WRITE path must NOT use this
-/// (it cannot signal the unparseable case); use [`read_config_file`] and abort
-/// on [`ConfigRead::Unparseable`] there.
-pub fn read_json_file(path: &Path) -> Map<String, Value> {
-    match read_config_file(path) {
-        ConfigRead::Parsed(map) => map,
-        ConfigRead::Missing | ConfigRead::Unparseable => Map::new(),
+/// Copy a config about to be replaced to `<path>.backup` when it does not
+/// parse: a read handed the caller `{}` for it, so the write is a replacement,
+/// not an edit. No-op when the file is absent or parses.
+fn backup_unparseable_config(path: &Path) {
+    let Ok(bytes) = fs::read(path) else {
+        return;
+    };
+    if std::str::from_utf8(&bytes)
+        .ok()
+        .and_then(parse_json_object)
+        .is_none()
+    {
+        let _ = fs::copy(path, path.with_extension("backup"));
     }
 }
 
@@ -406,7 +433,11 @@ pub fn atomic_write_file(path: &Path, content: &str) -> std::io::Result<()> {
 
 /// Atomic JSON write with a trailing newline. Ports `writeJsonFile`
 /// (shared.ts:99) — `JSON.stringify(data, null, 2) + '\n'`.
+///
+/// The one place a target replaces a JSON config, so it is also where an
+/// unparseable one is preserved (upstream #1870).
 pub fn write_json_file(path: &Path, data: &Map<String, Value>) -> std::io::Result<()> {
+    backup_unparseable_config(path);
     let mut content = to_upstream_json(&Value::Object(data.clone()));
     content.push('\n');
     atomic_write_file(path, &content)
@@ -419,32 +450,15 @@ pub fn to_upstream_json(value: &Value) -> String {
     serde_json::to_string_pretty(value).unwrap_or_else(|_| "{}".to_string())
 }
 
-// jsonc-parser 0.26 `CstStringLit::new_escaped` escapes only `"`, not `\` or
-// control chars, so a Windows path `C:\Users` emits invalid JSON `"C:\Users"`.
-// Pre-escape everything JSON-significant EXCEPT `"` (the library owns quotes).
-fn escape_for_cst_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            '\u{08}' => out.push_str("\\b"),
-            '\u{0c}' => out.push_str("\\f"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
+// jsonc-parser's `CstStringLit::new_escaped` escapes `"`, `\` and control
+// characters itself (since 0.34; 0.26 escaped only `"`, which made a Windows
+// path `C:\Users` invalid JSON), so a string goes in raw.
 fn to_cst_input(value: &Value) -> CstInputValue {
     match value {
         Value::Null => CstInputValue::Null,
         Value::Bool(b) => CstInputValue::Bool(*b),
         Value::Number(n) => CstInputValue::Number(n.to_string()),
-        Value::String(s) => CstInputValue::String(escape_for_cst_string(s)),
+        Value::String(s) => CstInputValue::String(s.clone()),
         Value::Array(arr) => CstInputValue::Array(arr.iter().map(to_cst_input).collect()),
         Value::Object(map) => CstInputValue::Object(
             map.iter()
@@ -544,6 +558,122 @@ pub fn remove_nested_key_jsonc(
         out.push('\n');
     }
     atomic_write_file(path, &out)?;
+    Ok(FileAction::Removed)
+}
+
+/// Surgically upsert `<root>.<middle>.<leaf> = value` in JSONC while preserving
+/// comments, sibling servers, key order, and formatting. This is the native
+/// OpenCode 2 `mcp.servers.codegraph` shape; keeping the primitive generic stops
+/// targets from replacing the whole `servers` object and dropping user comments.
+pub fn upsert_three_level_key_jsonc(
+    path: &Path,
+    root_key: &str,
+    middle_key: &str,
+    leaf_key: &str,
+    value: &Value,
+    schema_url: Option<&str>,
+) -> std::io::Result<FileAction> {
+    let text = fs::read_to_string(path)?;
+    let existed = !text.trim().is_empty();
+    let parsed = parse_json_object(&text);
+    if let Some(map) = &parsed {
+        let current = map
+            .get(root_key)
+            .and_then(|root| root.get(middle_key))
+            .and_then(|middle| middle.get(leaf_key));
+        if current == Some(value) && (schema_url.is_none() || map.contains_key("$schema")) {
+            return Ok(FileAction::Unchanged);
+        }
+    }
+
+    let root = CstRootNode::parse(&text, &ParseOptions::default())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    let root_object = root.object_value_or_set();
+    let first = root_object
+        .object_value_or_create(root_key)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("`{root_key}` exists but is not an object"),
+            )
+        })?;
+    let second = first.object_value_or_create(middle_key).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("`{root_key}.{middle_key}` exists but is not an object"),
+        )
+    })?;
+    match second.get(leaf_key) {
+        Some(property) => property.set_value(to_cst_input(value)),
+        None => {
+            second.append(leaf_key, to_cst_input(value));
+        }
+    }
+    if let Some(schema) = schema_url
+        && root_object.get("$schema").is_none()
+    {
+        root_object.insert(0, "$schema", CstInputValue::String(schema.to_string()));
+    }
+    let mut output = root.to_string();
+    if text.ends_with('\n') && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    atomic_write_file(path, &output)?;
+    Ok(if existed {
+        FileAction::Updated
+    } else {
+        FileAction::Created
+    })
+}
+
+/// Remove `<root>.<middle>.<leaf>` from JSONC, dropping only wrappers that become
+/// empty. Comments and unrelated entries at every level remain untouched.
+pub fn remove_three_level_key_jsonc(
+    path: &Path,
+    root_key: &str,
+    middle_key: &str,
+    leaf_key: &str,
+) -> std::io::Result<FileAction> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return Ok(FileAction::NotFound);
+    };
+    let present = parse_json_object(&text)
+        .and_then(|map| {
+            map.get(root_key)
+                .and_then(|root| root.get(middle_key))
+                .and_then(|middle| middle.get(leaf_key))
+                .cloned()
+        })
+        .is_some();
+    if !present {
+        return Ok(FileAction::NotFound);
+    }
+
+    let root = CstRootNode::parse(&text, &ParseOptions::default())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    if let Some(root_object) = root.object_value()
+        && let Some(first) = root_object.object_value(root_key)
+        && let Some(second) = first.object_value(middle_key)
+    {
+        if let Some(property) = second.get(leaf_key) {
+            property.remove();
+        }
+        if second.properties().is_empty()
+            && let Some(property) = first.get(middle_key)
+        {
+            property.remove();
+        }
+        if first.properties().is_empty()
+            && let Some(property) = root_object.get(root_key)
+        {
+            property.remove();
+        }
+    }
+    let mut output = root.to_string();
+    if text.ends_with('\n') && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    atomic_write_file(path, &output)?;
     Ok(FileAction::Removed)
 }
 
@@ -1639,6 +1769,36 @@ name = "important-user-tool"
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Reading a config is read-only (upstream #1870): every target's
+    /// `detect()` reads its agent's config on every run, and `install
+    /// --refresh` skips unconfigured agents on that answer, so a read must not
+    /// leave a `.backup` beside a config codegraph never touches. A backup is
+    /// made where a config is about to be replaced, or before a write path
+    /// skips one it cannot parse.
+    #[test]
+    fn reading_an_unparseable_config_leaves_no_backup() {
+        let config = tmp_path("mcp_config.json");
+        let backup = config.with_extension("backup");
+        fs::write(&config, "{ broken").unwrap();
+
+        assert!(read_json_file(&config).is_empty());
+        assert!(!backup.exists(), "a read is not a write");
+
+        assert!(matches!(read_config_file(&config), ConfigRead::Unparseable));
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "{ broken");
+        fs::remove_file(&backup).unwrap();
+
+        let mut data = Map::new();
+        data.insert("k".to_string(), Value::from(1));
+        write_json_file(&config, &data).unwrap();
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "{ broken");
+
+        fs::remove_file(&backup).unwrap();
+        write_json_file(&config, &data).unwrap();
+        assert!(!backup.exists(), "a parseable config needs no backup");
+        let _ = fs::remove_dir_all(config.parent().unwrap());
     }
 
     fn tmp_path(name: &str) -> std::path::PathBuf {

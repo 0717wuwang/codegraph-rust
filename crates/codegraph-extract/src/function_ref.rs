@@ -137,13 +137,23 @@ const OBJC_SPEC: FnRefSpec = c_family_spec(&["selector_expression"], false);
 
 /// Ports `TS_JS_SPEC` (function-ref.ts:177-187).
 const TS_JS_SPEC: FnRefSpec = FnRefSpec {
-    id_types: &["identifier"],
+    // `shorthand_property_identifier`: `{ handleSubmit }` — the object a hook
+    // returns its handlers in, and a namespace object's members.
+    id_types: &["identifier", "shorthand_property_identifier"],
     dispatch: &[
         ("arguments", CaptureMode::Args, None),
         ("assignment_expression", CaptureMode::Rhs, Some("right")),
         ("variable_declarator", CaptureMode::VarInit, Some("value")),
         ("pair", CaptureMode::Value, Some("value")),
         ("array", CaptureMode::List, None),
+        // A JSX attribute value or child — `onPress={handleSubmit}`,
+        // `renderItem={renderRow}`: React's handler-binding idiom. A spread or
+        // a call normalizes to nothing.
+        ("jsx_expression", CaptureMode::List, None),
+        // An object literal's shorthand members — `return { handleApprove }`
+        // from a hook, `const Api = { upload }`. Only a shorthand identifier
+        // normalizes; a `pair` is its own container above.
+        ("object", CaptureMode::List, None),
     ],
     layers: &[],
     unwrap: &[],
@@ -183,7 +193,7 @@ const GO_SPEC: FnRefSpec = FnRefSpec {
     ],
     layers: &[("literal_element", None), ("expression_list", None)],
     unwrap: &[],
-    special: &[],
+    special: &["selector_expression"],
     ungated_modes: &[],
     address_of_only: false,
 };
@@ -290,7 +300,7 @@ const SCALA_SPEC: FnRefSpec = FnRefSpec {
         ("val_definition", CaptureMode::VarInit, Some("value")),
     ],
     layers: &[],
-    unwrap: &[("postfix_expression", None)],
+    unwrap: &[("postfix_expression", None), ("method_value", None)],
     special: &[],
     ungated_modes: &[],
     address_of_only: false,
@@ -573,6 +583,33 @@ impl<'tree> NormalizedRef<'tree> {
             skip_gate: false,
         }
     }
+
+    /// A Python/Go member value: it retains its receiver for scoped
+    /// resolution, so the same-file/import name gate does not apply.
+    fn ungated(name: String, node: SyntaxNode<'tree>) -> Self {
+        Self {
+            name,
+            node,
+            skip_gate: true,
+        }
+    }
+}
+
+/// `^[A-Za-z_]\w*(?:\.[A-Za-z_]\w*)+$` — a statically named member path.
+fn is_dotted_member_value(value: &str) -> bool {
+    let mut segments = value.split('.');
+    let Some(first) = segments.next() else {
+        return false;
+    };
+    let segment_ok = |segment: &str| {
+        let mut chars = segment.chars();
+        chars
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || ch == '_')
+            && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    };
+    let rest = segments.collect::<Vec<_>>();
+    segment_ok(first) && !rest.is_empty() && rest.into_iter().all(segment_ok)
 }
 
 /// Normalize one value expression to zero or more function names + source node.
@@ -766,6 +803,26 @@ fn normalize_special<'tree>(
         // Swift `#selector(fire)` / ObjC `@selector(storeImage:)`
         // (function-ref.ts:685-696).
         "selector_expression" => {
+            // Go `c.store.Fetch` (a `field` child) keeps its receiver path, so
+            // resolution can use the receiver's type before a unique name
+            // (#1820); Swift `#selector(...)` / ObjC `@selector(...)` have no
+            // `field`.
+            if let Some(field) = child_by_field(node, "field") {
+                let value = child_by_field(node, "operand")
+                    .map(|operand| {
+                        format!(
+                            "{}.{}",
+                            node_text(operand, source),
+                            node_text(field, source)
+                        )
+                    })
+                    .unwrap_or_default();
+                return if is_dotted_member_value(&value) {
+                    vec![NormalizedRef::ungated(value, field)]
+                } else {
+                    Vec::new()
+                };
+            }
             let Some(inner) = node.named_child(0) else {
                 return Vec::new();
             };
@@ -808,7 +865,11 @@ fn normalize_special<'tree>(
             }
         }
 
-        // `this.handleClick` (TS/JS) (function-ref.ts:714-721).
+        // TS/JS method values. `this.handleClick` keeps a class-scoped
+        // `this.` prefix; receiver-qualified values keep the same final
+        // receiver segment as direct-call extraction (`api.send`,
+        // `this.mailer.send` -> `mailer.send`). Call-result/index receivers
+        // remain dynamic and are dropped (#1820).
         "member_expression" => {
             let obj = child_by_field(node, "object");
             let prop = child_by_field(node, "property");
@@ -819,20 +880,33 @@ fn normalize_special<'tree>(
                         prop,
                     )];
                 }
+                if prop.kind() == "property_identifier"
+                    && let Some(receiver) = method_value_receiver_segment(obj, source)
+                {
+                    return vec![NormalizedRef::new(
+                        format!("{receiver}.{}", node_text(prop, source)),
+                        prop,
+                    )];
+                }
             }
             Vec::new()
         }
 
-        // `self.handle_click` (Python) (function-ref.ts:724-731).
+        // Python method values keep their whole receiver path —
+        // `self.handle_click`, `self.store.fetch`, `Actual.fetch` — so
+        // resolution can scope the member through the class, a field's type,
+        // a local's type or an import (#1820). A call or subscript receiver is
+        // not statically named and must not collapse to a bare method.
         "attribute" => {
-            let obj = child_by_field(node, "object");
-            let attr = child_by_field(node, "attribute");
-            if let (Some(obj), Some(attr)) = (obj, attr) {
-                if obj.kind() == "identifier" && node_text(obj, source) == "self" {
-                    return vec![NormalizedRef::new(node_text(attr, source), attr)];
-                }
+            let Some(attr) = child_by_field(node, "attribute") else {
+                return Vec::new();
+            };
+            let value = node_text(node, source);
+            if is_dotted_member_value(&value) {
+                vec![NormalizedRef::ungated(value, attr)]
+            } else {
+                Vec::new()
             }
-            Vec::new()
         }
 
         // `this.Run0` (C#) (function-ref.ts:738-746).
@@ -948,6 +1022,34 @@ fn last_named_of_type<'tree>(node: SyntaxNode<'tree>, types: &[&str]) -> Option<
     found
 }
 
+/// Final stable receiver segment for a first-class method value. Mirrors the
+/// direct-call walker's one-segment receiver encoding: a simple receiver is
+/// kept verbatim; a member receiver keeps only its final property/attribute.
+/// Calls, indexing, literals, and other data-flow-dependent receivers return
+/// `None` rather than guessing.
+fn method_value_receiver_segment(node: SyntaxNode<'_>, source: &str) -> Option<String> {
+    let value = match node.kind() {
+        "identifier" | "simple_identifier" => node_text(node, source),
+        "member_expression" => {
+            let object = child_by_field(node, "object")?;
+            let property = child_by_field(node, "property")?;
+            let property = node_text(property, source);
+            if object.kind() == "this" {
+                format!("this.{property}")
+            } else {
+                property
+            }
+        }
+        "attribute" => node_text(child_by_field(node, "attribute")?, source),
+        _ => return None,
+    };
+    if value.starts_with("this.") || is_plain_receiver_segment(&value) {
+        Some(value)
+    } else {
+        None
+    }
+}
+
 /// Content of a PHP string literal node. Ports `phpStringContent`
 /// (function-ref.ts:813-819).
 fn php_string_content(node: SyntaxNode<'_>, source: &str) -> Option<String> {
@@ -1035,6 +1137,15 @@ fn is_simple_name(s: &str) -> bool {
         }
         _ => false,
     }
+}
+
+/// Receiver segment accepted by the direct-call extractor: a single
+/// identifier that is not a self-reference. `$` is valid in JS identifiers.
+fn is_plain_receiver_segment(s: &str) -> bool {
+    !s.is_empty()
+        && !matches!(s, "self" | "this" | "cls" | "super")
+        && s.chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '$')
 }
 
 /// `^[A-Za-z_][\w:]*$` (a qualified `Cls::method` member-pointer name).
@@ -1155,6 +1266,43 @@ class Panel {
     }
 
     #[test]
+    fn tsjs_preserves_receiver_qualified_method_values() {
+        let src = r#"
+class Store { fetch(ids: number[]) { return ids; } }
+class Consumer {
+  store = new Store();
+  wire(store: Store) { register(store.fetch); }
+  assign() { const callback = this.store.fetch; }
+  listValue() { return [this.store.fetch]; }
+  dynamic() { register(factory().fetch); }
+}
+"#;
+        let refs = fn_refs("src/receiver-values.ts", src, Language::TypeScript);
+        assert_eq!(
+            refs.iter()
+                .filter(|reference| reference.reference_name == "store.fetch")
+                .count(),
+            1,
+            "the parameter receiver keeps its own name: names={:?}",
+            names(&refs)
+        );
+        assert_eq!(
+            refs.iter()
+                .filter(|reference| reference.reference_name == "this.store.fetch")
+                .count(),
+            2,
+            "class-field assignment and array forms keep the owner marker: names={:?}",
+            names(&refs)
+        );
+        assert!(
+            !refs
+                .iter()
+                .any(|reference| reference.reference_name == "factory.fetch"),
+            "dynamic call-result receivers must remain unresolved"
+        );
+    }
+
+    #[test]
     fn tsjs_captures_imported_callback_but_gates_unknown_bare_id() {
         // Imported name survives the gate; an unknown bare identifier does not.
         let src = r#"
@@ -1218,8 +1366,67 @@ class W:
         register("blur", handler)
 "#;
         let refs = fn_refs("src/w.py", src, Language::Python);
-        assert!(has_fn_ref(&refs, "on_click"), "names={:?}", names(&refs));
+        // Upstream v1.6.1 #1820: the receiver path is kept as written and the
+        // resolver scopes `self` to the enclosing class.
+        assert!(
+            has_fn_ref(&refs, "self.on_click"),
+            "names={:?}",
+            names(&refs)
+        );
         assert!(has_fn_ref(&refs, "handler"), "names={:?}", names(&refs));
+    }
+
+    #[test]
+    fn python_preserves_method_value_receivers() {
+        let src = r#"
+class Store:
+    def fetch(self, ids):
+        return ids
+
+class Consumer:
+    def own_handler(self, value):
+        return value
+
+    def wire(self, store):
+        register(self.own_handler)
+        register(store.fetch)
+
+    def assign(self):
+        callback = self.store.fetch
+
+    def list_value(self):
+        callbacks = [self.store.fetch]
+
+    def dynamic(self):
+        register(factory().fetch)
+"#;
+        let refs = fn_refs("src/receiver_values.py", src, Language::Python);
+        // Upstream v1.6.1 #1820: every member value keeps its whole receiver
+        // path, so resolution can scope `self`, a field or a local.
+        assert!(
+            has_fn_ref(&refs, "self.own_handler"),
+            "self method must retain its receiver: names={:?}",
+            names(&refs)
+        );
+        assert!(
+            has_fn_ref(&refs, "store.fetch"),
+            "simple receiver method must retain the receiver: names={:?}",
+            names(&refs)
+        );
+        assert_eq!(
+            refs.iter()
+                .filter(|reference| reference.reference_name == "self.store.fetch")
+                .count(),
+            2,
+            "assignment and list forms must retain the field receiver and their owners"
+        );
+        assert!(
+            !refs
+                .iter()
+                .any(|reference| reference.reference_name.ends_with("fetch")
+                    && reference.reference_name.contains("factory")),
+            "dynamic call-result receivers must remain unresolved"
+        );
     }
 
     #[test]
@@ -2086,7 +2293,7 @@ object M {
         let lang = tree_sitter_python::LANGUAGE.into();
         let names = special_names(lang, "reg(self.handler)", "attribute");
         assert!(
-            names.contains(&"handler".to_string()),
+            names.contains(&"self.handler".to_string()),
             "self.attr; names={names:?}"
         );
     }

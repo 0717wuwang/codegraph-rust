@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use crate::connection::Store;
 
-const SQLITE_PARAM_CHUNK_SIZE: usize = 500;
+pub(crate) const SQLITE_PARAM_CHUNK_SIZE: usize = 500;
 
 /// Env var name (#1231): set to `1` to opt out of bulk-index WAL-checkpoint
 /// deferral and keep SQLite's default `wal_autocheckpoint` interval.
@@ -571,6 +571,49 @@ impl Store {
         rows.collect()
     }
 
+    /// Whether any node's name, qualified name, signature or docstring holds an
+    /// FTS token starting with `word` — the posting-list half of upstream's
+    /// `getExploreMissDiagnostics` (#1904). `word` must be letters/digits only.
+    pub fn fts_any_column_has_prefix(&self, word: &str) -> rusqlite::Result<bool> {
+        self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM nodes_fts WHERE nodes_fts MATCH ?1)",
+            params![format!(
+                "{{name qualified_name signature docstring}} : \"{word}\"*"
+            )],
+            |row| row.get::<_, bool>(0),
+        )
+    }
+
+    /// Up to `limit` names of non-file, non-import nodes whose NAME holds an FTS
+    /// token starting with one of `words` (letters/digits only), in index order
+    /// (#1904's retry candidates).
+    pub fn fts_name_prefix_names(
+        &self,
+        words: &[String],
+        limit: usize,
+    ) -> rusqlite::Result<Vec<String>> {
+        if words.is_empty() {
+            return Ok(Vec::new());
+        }
+        let pattern = format!(
+            "name : ({})",
+            words
+                .iter()
+                .map(|word| format!("\"{word}\"*"))
+                .collect::<Vec<_>>()
+                .join(" OR ")
+        );
+        let mut stmt = self.conn.prepare(
+            "SELECT n.name FROM nodes_fts JOIN nodes n ON n.rowid = nodes_fts.rowid \
+             WHERE nodes_fts MATCH ?1 AND n.kind NOT IN ('file', 'import') \
+             ORDER BY nodes_fts.rowid LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+            row.get::<_, String>(0)
+        })?;
+        rows.collect()
+    }
+
     /// Ports `getAllNodeNames` from `upstream db/queries.ts:1655-1661`.
     /// `SELECT DISTINCT name FROM nodes` — the candidate name set for fuzzy fallback.
     pub fn all_node_names(&self) -> rusqlite::Result<Vec<String>> {
@@ -790,10 +833,6 @@ impl Store {
         if refs.is_empty() {
             return Ok(());
         }
-        let from_ids = refs
-            .iter()
-            .map(|unresolved| unresolved.from_node_id.as_str())
-            .collect::<Vec<_>>();
 
         // Snapshot `from_node_id` existence INSIDE a `BEGIN IMMEDIATE` transaction
         // (see `insert_edges`): a concurrent writer deleting the source node
@@ -803,42 +842,7 @@ impl Store {
         let tx = self
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let existing_node_ids = existing_node_ids(&tx, &from_ids)?;
-        {
-            let mut stmt = tx.prepare_cached(
-                r#"
-                INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language, reference_subkind)
-                VALUES (@fromNodeId, @referenceName, @referenceKind, @line, @col, @candidates, @filePath, @language, @referenceSubkind)
-                "#,
-            )?;
-            for unresolved in refs {
-                if !existing_node_ids.contains(&unresolved.from_node_id) {
-                    continue;
-                }
-                let candidates = unresolved
-                    .candidates
-                    .as_ref()
-                    .map(serde_json::to_string)
-                    .transpose()
-                    .map_err(json_to_sql_error)?;
-                let reference_kind = if unresolved.is_function_ref {
-                    "function_ref"
-                } else {
-                    unresolved.reference_kind.as_str()
-                };
-                stmt.execute(named_params! {
-                    "@fromNodeId": unresolved.from_node_id,
-                    "@referenceName": unresolved.reference_name,
-                    "@referenceKind": reference_kind,
-                    "@line": unresolved.line,
-                    "@col": unresolved.col,
-                    "@candidates": candidates,
-                    "@filePath": unresolved.file_path,
-                    "@language": unresolved.language.as_str(),
-                    "@referenceSubkind": unresolved.reference_subkind.map(|s| s.as_str()),
-                })?;
-            }
-        }
+        insert_unresolved_refs_in_connection(&tx, refs)?;
         tx.commit()
     }
 
@@ -1480,6 +1484,85 @@ impl Store {
         Ok(removed)
     }
 
+    /// Atomically replace every resolution-produced edge and unresolved row for
+    /// one source file with the freshly extracted references (#1833 / #1849).
+    ///
+    /// Incremental sync previously committed the two DELETE operations before
+    /// attempting the INSERT. A disk/trigger/constraint failure during that
+    /// insertion permanently removed the last committed relationship. Keeping
+    /// all three operations in one `BEGIN IMMEDIATE` transaction makes the old
+    /// graph answer survive any failed requeue.
+    pub fn replace_resolution_state_from_file(
+        &mut self,
+        file_path: &str,
+        refs: &[UnresolvedRef],
+    ) -> rusqlite::Result<usize> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let removed = tx.execute(
+            r#"DELETE FROM edges
+            WHERE id IN (
+              SELECT e.id
+              FROM edges e
+              JOIN nodes src ON src.id = e.source
+              WHERE src.file_path = ?1
+                AND e.kind != 'contains'
+            )"#,
+            [file_path],
+        )?;
+        tx.execute(
+            "DELETE FROM unresolved_refs WHERE file_path = ?1",
+            [file_path],
+        )?;
+        insert_unresolved_refs_in_connection(&tx, refs)?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
+    /// Atomically replace the resolution state of selected source-site sibling
+    /// groups with freshly extracted references (#1833 / #1849).
+    ///
+    /// Target, edge kind, and reference name are intentionally absent from the
+    /// predicates: resolution may promote an edge kind, and every sibling at one
+    /// source coordinate must move together to preserve multiplicity.
+    pub fn replace_resolution_state_at_sites(
+        &mut self,
+        sites: &[ReferenceSite],
+        refs: &[UnresolvedRef],
+    ) -> rusqlite::Result<usize> {
+        let unique = sites.iter().cloned().collect::<BTreeSet<_>>();
+        if unique.is_empty() {
+            return Ok(0);
+        }
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut removed = 0;
+        {
+            let mut delete_edges = tx.prepare_cached(
+                r#"DELETE FROM edges
+                WHERE source = ?1 AND line = ?2 AND col = ?3
+                  AND kind != 'contains'"#,
+            )?;
+            let mut delete_refs = tx.prepare_cached(
+                r#"DELETE FROM unresolved_refs
+                WHERE from_node_id = ?1 AND line = ?2 AND col = ?3"#,
+            )?;
+            for site in unique {
+                removed += delete_edges.execute(params![
+                    site.from_node_id.as_str(),
+                    site.line,
+                    site.col
+                ])?;
+                delete_refs.execute(params![site.from_node_id.as_str(), site.line, site.col])?;
+            }
+        }
+        insert_unresolved_refs_in_connection(&tx, refs)?;
+        tx.commit()?;
+        Ok(removed)
+    }
+
     /// Distinct source files of every resolution-produced edge whose TARGET node
     /// is named one of `names`. When a synced file changes the set of nodes
     /// sharing a name, the exact-name resolution of refs that already resolved to
@@ -1531,6 +1614,32 @@ impl Store {
         &self,
         names: &[String],
     ) -> rusqlite::Result<Vec<FileReferenceSite>> {
+        self.reference_sites_to_named_targets(names, "!=")
+    }
+
+    /// Same-file counterpart of
+    /// [`Self::reference_sites_of_edges_to_named_targets`]: surviving
+    /// non-`contains` edges whose source and target share a file and whose
+    /// target name is selected. An exact-name resolution's confidence counts every
+    /// node of that name in the project, so a competitor arriving in or leaving
+    /// another file changes an edge inside a file nobody touched. Sync selects
+    /// only names whose candidates changed, not names whose nodes merely moved: a
+    /// candidate outside the referencing file is scored without its position, and
+    /// the same-file target outranks it either way.
+    pub fn reference_sites_of_same_file_edges_to_named_targets(
+        &self,
+        names: &[String],
+    ) -> rusqlite::Result<Vec<FileReferenceSite>> {
+        self.reference_sites_to_named_targets(names, "=")
+    }
+
+    /// The body of both named-target site queries; `file_relation` is the SQL
+    /// operator relating the edge's source and target files, `!=` or `=`.
+    fn reference_sites_to_named_targets(
+        &self,
+        names: &[String],
+        file_relation: &str,
+    ) -> rusqlite::Result<Vec<FileReferenceSite>> {
         if names.is_empty() {
             return Ok(Vec::new());
         }
@@ -1549,7 +1658,7 @@ impl Store {
                 JOIN nodes src ON src.id = e.source
                 WHERE tgt.name IN ({placeholders})
                   AND e.kind != 'contains'
-                  AND src.file_path != tgt.file_path
+                  AND src.file_path {file_relation} tgt.file_path
                 ORDER BY src.file_path, e.source, e.line, e.col"#
             );
             let params = chunk
@@ -1600,7 +1709,7 @@ where
     rows.collect()
 }
 
-fn row_to_node(row: &Row<'_>) -> rusqlite::Result<Node> {
+pub(crate) fn row_to_node(row: &Row<'_>) -> rusqlite::Result<Node> {
     Ok(Node {
         id: row.get("id")?,
         kind: parse_node_kind(row.get::<_, String>("kind")?)?,
@@ -1626,7 +1735,7 @@ fn row_to_node(row: &Row<'_>) -> rusqlite::Result<Node> {
     })
 }
 
-fn row_to_edge(row: &Row<'_>) -> rusqlite::Result<Edge> {
+pub(crate) fn row_to_edge(row: &Row<'_>) -> rusqlite::Result<Edge> {
     Ok(Edge {
         id: row.get("id")?,
         source: row.get("source")?,
@@ -1639,7 +1748,7 @@ fn row_to_edge(row: &Row<'_>) -> rusqlite::Result<Edge> {
     })
 }
 
-fn row_to_file(row: &Row<'_>) -> rusqlite::Result<FileRecord> {
+pub(crate) fn row_to_file(row: &Row<'_>) -> rusqlite::Result<FileRecord> {
     Ok(FileRecord {
         path: row.get("path")?,
         content_hash: row.get("content_hash")?,
@@ -1673,7 +1782,7 @@ fn millis_column(row: &Row<'_>, name: &str) -> rusqlite::Result<i64> {
     }
 }
 
-fn row_to_unresolved_ref(row: &Row<'_>) -> rusqlite::Result<UnresolvedRef> {
+pub(crate) fn row_to_unresolved_ref(row: &Row<'_>) -> rusqlite::Result<UnresolvedRef> {
     let raw_kind = row.get::<_, String>("reference_kind")?;
     let is_function_ref = raw_kind == "function_ref";
     let reference_kind = if is_function_ref {
@@ -1897,6 +2006,58 @@ fn existing_node_ids(
         }
     }
     Ok(out)
+}
+
+/// Insert unresolved references through `conn`, which may be either the Store's
+/// connection or a caller-owned transaction. Keeping the statement body here is
+/// what lets incremental sync compose edge deletion, stale-ref deletion, and
+/// fresh-ref insertion into one crash-safe transaction.
+fn insert_unresolved_refs_in_connection(
+    conn: &Connection,
+    refs: &[UnresolvedRef],
+) -> rusqlite::Result<()> {
+    if refs.is_empty() {
+        return Ok(());
+    }
+    let from_ids = refs
+        .iter()
+        .map(|unresolved| unresolved.from_node_id.as_str())
+        .collect::<Vec<_>>();
+    let existing_node_ids = existing_node_ids(conn, &from_ids)?;
+    let mut stmt = conn.prepare_cached(
+        r#"
+        INSERT INTO unresolved_refs (from_node_id, reference_name, reference_kind, line, col, candidates, file_path, language, reference_subkind)
+        VALUES (@fromNodeId, @referenceName, @referenceKind, @line, @col, @candidates, @filePath, @language, @referenceSubkind)
+        "#,
+    )?;
+    for unresolved in refs {
+        if !existing_node_ids.contains(&unresolved.from_node_id) {
+            continue;
+        }
+        let candidates = unresolved
+            .candidates
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(json_to_sql_error)?;
+        let reference_kind = if unresolved.is_function_ref {
+            "function_ref"
+        } else {
+            unresolved.reference_kind.as_str()
+        };
+        stmt.execute(named_params! {
+            "@fromNodeId": unresolved.from_node_id,
+            "@referenceName": unresolved.reference_name,
+            "@referenceKind": reference_kind,
+            "@line": unresolved.line,
+            "@col": unresolved.col,
+            "@candidates": candidates,
+            "@filePath": unresolved.file_path,
+            "@language": unresolved.language.as_str(),
+            "@referenceSubkind": unresolved.reference_subkind.map(|s| s.as_str()),
+        })?;
+    }
+    Ok(())
 }
 
 fn fts_query(query: &str) -> String {
@@ -3476,6 +3637,28 @@ mod tests {
             file_path: "fallback.rs".to_string(),
             site: None,
         }));
+        assert!(
+            named.iter().all(|entry| entry.file_path != "b.rs"),
+            "the cross-file query leaves same-file edges out"
+        );
+        let same_file = store
+            .reference_sites_of_same_file_edges_to_named_targets(&[
+                "callee".to_string(),
+                "sibling".to_string(),
+            ])
+            .unwrap();
+        assert_eq!(
+            same_file,
+            vec![FileReferenceSite {
+                file_path: "b.rs".to_string(),
+                site: Some(ReferenceSite {
+                    from_node_id: "function:self".to_string(),
+                    line: 10,
+                    col: 2,
+                }),
+            }],
+            "the same-file query returns exactly the edge whose source shares its target's file"
+        );
 
         let unresolved = |name: &str, line: i64| UnresolvedRef {
             id: None,
@@ -3550,6 +3733,90 @@ mod tests {
             unrelated_after[0].id, unrelated_before,
             "an unrelated unresolved row must retain physical identity"
         );
+    }
+
+    fn requeue_fixture(test_name: &str) -> (Store, ReferenceSite, UnresolvedRef) {
+        let mut store = store(test_name);
+        store
+            .upsert_nodes(&[
+                node("function:caller", "caller", "a.rs"),
+                node("function:callee", "callee", "b.rs"),
+            ])
+            .unwrap();
+        let mut old_edge = edge("function:caller", "function:callee", EdgeKind::Calls);
+        old_edge.line = Some(10);
+        old_edge.col = Some(2);
+        store.insert_edges(&[old_edge]).unwrap();
+        let old_ref = UnresolvedRef {
+            id: None,
+            from_node_id: "function:caller".to_string(),
+            reference_name: "old".to_string(),
+            reference_kind: EdgeKind::Calls,
+            line: 10,
+            col: 2,
+            candidates: None,
+            file_path: "a.rs".to_string(),
+            language: Language::Rust,
+            is_function_ref: false,
+            reference_subkind: None,
+        };
+        store
+            .insert_unresolved_refs(std::slice::from_ref(&old_ref))
+            .unwrap();
+        store
+            .connection()
+            .execute_batch(
+                r#"CREATE TRIGGER interrupt_fresh_requeue
+                BEFORE INSERT ON unresolved_refs
+                WHEN NEW.reference_name = 'fresh'
+                BEGIN
+                  SELECT RAISE(ABORT, 'forced requeue interruption');
+                END;"#,
+            )
+            .unwrap();
+        (
+            store,
+            ReferenceSite {
+                from_node_id: "function:caller".to_string(),
+                line: 10,
+                col: 2,
+            },
+            UnresolvedRef {
+                reference_name: "fresh".to_string(),
+                ..old_ref
+            },
+        )
+    }
+
+    fn assert_requeue_rollback(store: &Store) {
+        let edges = store.all_edges().unwrap();
+        assert_eq!(edges.len(), 1, "the last committed edge must survive");
+        assert_eq!(edges[0].source, "function:caller");
+        assert_eq!(edges[0].target, "function:callee");
+        assert_eq!(edges[0].line, Some(10));
+        let refs = store.unresolved_refs_by_file_path("a.rs").unwrap();
+        assert_eq!(refs.len(), 1, "the old unresolved sibling must survive");
+        assert_eq!(refs[0].reference_name, "old");
+    }
+
+    #[test]
+    fn file_requeue_rolls_back_edge_and_ref_deletion_when_insert_fails() {
+        let (mut store, _site, fresh) = requeue_fixture("file-requeue-rollback");
+        let error = store
+            .replace_resolution_state_from_file("a.rs", &[fresh])
+            .expect_err("the trigger must interrupt the requeue");
+        assert!(error.to_string().contains("forced requeue interruption"));
+        assert_requeue_rollback(&store);
+    }
+
+    #[test]
+    fn site_requeue_rolls_back_edge_and_ref_deletion_when_insert_fails() {
+        let (mut store, site, fresh) = requeue_fixture("site-requeue-rollback");
+        let error = store
+            .replace_resolution_state_at_sites(&[site], &[fresh])
+            .expect_err("the trigger must interrupt the requeue");
+        assert!(error.to_string().contains("forced requeue interruption"));
+        assert_requeue_rollback(&store);
     }
 
     #[test]

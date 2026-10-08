@@ -5,14 +5,20 @@
 //! cross-language family gate — mirror the upstream exactly. Every strategy cites its
 //! upstream source range.
 
+use crate::object_literal::{
+    LiteralLookup, object_literal_property, property_contains, resolve_object_literal_binding,
+};
+use crate::source_facts::{SourceFacts, TsFieldDeclaration};
+use crate::strip_comments::{CommentLang, strip_comments_for_regex};
 use crate::types::{
     RefView, ResolutionContext, ResolvedBy, ResolvedRef, declares_type_name, is_esm_language,
-    kind_is_eligible_target,
+    node_is_eligible_target,
 };
 use codegraph_core::types::{EdgeKind, Language, Node, NodeKind};
 use regex::Regex;
 use std::borrow::Borrow;
-use std::sync::{Arc, OnceLock};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Ceiling on same-name candidates a proximity-SCORED strategy will rank
 /// (`AMBIGUOUS_NAME_CEILING`, upstream name-matcher; override
@@ -159,19 +165,27 @@ fn dir_of(path: &str) -> &str {
 }
 
 /// Language families that share a type system / runtime (`LANGUAGE_FAMILY`,
-/// `name-matcher.ts:113-121`).
+/// upstream v1.6.1): C, C++, Objective-C and Swift interoperate natively; ArkTS
+/// and the single-file-component languages are web.
 fn language_family(lang: Language) -> Option<&'static str> {
     match lang {
         Language::Java | Language::Kotlin | Language::Scala => Some("jvm"),
-        Language::Swift | Language::ObjC => Some("apple"),
-        Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx => Some("web"),
-        Language::C | Language::Cpp => Some("c"),
+        Language::Swift | Language::ObjC | Language::C | Language::Cpp => Some("native"),
+        Language::TypeScript
+        | Language::Tsx
+        | Language::JavaScript
+        | Language::Jsx
+        | Language::ArkTs
+        | Language::Svelte
+        | Language::Vue
+        | Language::Astro => Some("web"),
         Language::CSharp | Language::Razor => Some("dotnet"),
+        Language::Cfml => Some("cfml"),
         _ => None,
     }
 }
 
-/// `sameLanguageFamily` (`name-matcher.ts:122-126`).
+/// `sameLanguageFamily`.
 pub fn same_language_family(a: Language, b: Language) -> bool {
     if a == b {
         return true;
@@ -182,27 +196,148 @@ pub fn same_language_family(a: Language, b: Language) -> bool {
     }
 }
 
-/// `isKnownLanguageFamily` (`name-matcher.ts:134-136`).
-pub fn is_known_language_family(lang: Language) -> bool {
-    language_family(lang).is_some()
+/// The code family of `lang` (`CODE_FAMILY`): a multi-language family, or a
+/// singleton for every other programming language. Config and markup formats
+/// have none, so their transitions stay open.
+fn code_family(lang: Language) -> Option<&'static str> {
+    language_family(lang).or(match lang {
+        Language::Python => Some("python"),
+        Language::Go => Some("go"),
+        Language::Rust => Some("rust"),
+        Language::Php => Some("php"),
+        Language::Ruby => Some("ruby"),
+        Language::Dart => Some("dart"),
+        Language::Lua | Language::Luau => Some("lua"),
+        Language::R => Some("r"),
+        Language::Erlang => Some("erlang"),
+        Language::Pascal => Some("pascal"),
+        Language::Solidity => Some("solidity"),
+        Language::Nix => Some("nix"),
+        _ => None,
+    })
 }
 
-/// `crossesKnownFamily` (`name-matcher.ts:147-149`).
-pub fn crosses_known_family(a: Language, b: Language) -> bool {
-    is_known_language_family(a) && is_known_language_family(b) && !same_language_family(a, b)
+/// Whether a reference from `a` to `b` crosses between two code families
+/// (`crossesCodeBoundary`).
+pub fn crosses_code_boundary(a: Language, b: Language) -> bool {
+    matches!((code_family(a), code_family(b)), (Some(fa), Some(fb)) if fa != fb)
 }
 
-/// Drop cross-language candidates from a name lookup (`applyLanguageGate`,
-/// `name-matcher.ts:160-168`).
+/// Cross-family name matches need an actual ABI boundary (`hasBridgeEvidence`):
+/// a native caller reaching a cgo `//export` or a Rust `pub extern "C" fn`, or
+/// a Go `C.name` / Rust `extern "C" { fn name(…) }` caller reaching a C or C++
+/// function. The evidence is scoped to the named free function.
+fn has_bridge_evidence(
+    candidate: &Node,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    if reference.reference_kind != EdgeKind::Calls || candidate.kind != NodeKind::Function {
+        return false;
+    }
+    let name = regex::escape(&candidate.name);
+    static CGO_IMPORT: OnceLock<Regex> = OnceLock::new();
+    let cgo_import = || {
+        CGO_IMPORT
+            .get_or_init(|| Regex::new(r#"(?-u:\b)import\s+(?:\(\s*)?"C""#).expect("cgo import"))
+    };
+    if code_family(reference.language) == Some("native") {
+        let Some(facts) = context.source_facts(&candidate.file_path) else {
+            return false;
+        };
+        if candidate.language == Language::Go {
+            let start = (candidate.start_line.max(2) - 2) as usize;
+            let end =
+                (candidate.end_line.max(candidate.start_line) as usize).min(facts.line_count());
+            let declaration = if start < end {
+                facts.join_lines(start, end, "\n")
+            } else {
+                String::new()
+            };
+            return cgo_import()
+                .is_match(&strip_comments_for_regex(facts.source(), CommentLang::Go))
+                && Regex::new(&format!(r"(?m)^//export {name}\r?\nfunc {name}\s*\("))
+                    .is_ok_and(|export| export.is_match(&declaration));
+        }
+        if candidate.language == Language::Rust {
+            let start = (candidate.start_line.max(1) - 1) as usize;
+            let end =
+                (candidate.end_line.max(candidate.start_line) as usize).min(facts.line_count());
+            let declaration = if start < end {
+                facts.join_lines(start, end, "\n")
+            } else {
+                String::new()
+            };
+            return Regex::new(&format!(
+                r#"(?-u:\b)pub\s+extern\s+"C"\s+fn\s+{name}(?-u:\b)"#
+            ))
+            .is_ok_and(|export| {
+                export.is_match(&strip_comments_for_regex(&declaration, CommentLang::Rust))
+            });
+        }
+    }
+    if matches!(candidate.language, Language::C | Language::Cpp) {
+        let Some(facts) = context.source_facts(&reference.file_path) else {
+            return false;
+        };
+        if reference.language == Language::Go {
+            return cgo_import()
+                .is_match(&strip_comments_for_regex(facts.source(), CommentLang::Go))
+                && reference.reference_name == format!("C.{}", candidate.name);
+        }
+        if reference.language == Language::Rust {
+            return Regex::new(&format!(
+                r#"extern\s+"C"\s*\{{[^}}]*(?-u:\b)fn\s+{name}\s*\("#
+            ))
+            .is_ok_and(|block| {
+                block.is_match(&strip_comments_for_regex(facts.source(), CommentLang::Rust))
+            });
+        }
+    }
+    false
+}
+
+/// Reject a chosen result that crosses a code-family boundary without bridge
+/// evidence (`gateLanguageMatch`). It never shrinks a candidate pool or tries
+/// a replacement, so no lone survivor is manufactured.
+pub(crate) fn gate_language_match(
+    result: Option<ResolvedRef>,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    let result = result?;
+    let Some(target) = context.get_node_by_id_shared(&result.target_node_id) else {
+        return Some(result);
+    };
+    if crosses_code_boundary(reference.language, target.language)
+        && !has_bridge_evidence(&target, reference, context)
+    {
+        return None;
+    }
+    // Rust-only (upstream has no Godot support): a scene, resource, or
+    // project file's path references into scripts stay unresolved rows, which
+    // impact/affected/audit consume path-keyed (F3). Name matching must not
+    // turn them into edges through the open config→code transition.
+    if reference.reference_kind == EdgeKind::References
+        && matches!(
+            reference.language,
+            Language::GodotScene | Language::GodotResource | Language::GodotProject
+        )
+        && target.language != reference.language
+    {
+        return None;
+    }
+    Some(result)
+}
+
+/// Type/value references keep same-family eligibility in the candidate pool:
+/// a native namesake must not hide the actual web type. Calls, imports and
+/// inheritance are gated on the chosen result instead.
 fn apply_language_gate<T: Borrow<Node>>(candidates: Vec<T>, reference: &RefView) -> Vec<T> {
     match reference.reference_kind {
         EdgeKind::References => candidates
             .into_iter()
             .filter(|c| same_language_family(c.borrow().language, reference.language))
-            .collect(),
-        EdgeKind::Imports => candidates
-            .into_iter()
-            .filter(|c| !crosses_known_family(c.borrow().language, reference.language))
             .collect(),
         _ => candidates,
     }
@@ -220,12 +355,19 @@ fn apply_language_gate<T: Borrow<Node>>(candidates: Vec<T>, reference: &RefView)
 /// parent's line range. Class members are unaffected (their parent resolves to a
 /// class-like node), as are top-level symbols and C++ namespace-prefixed names
 /// (the prefix has no node).
-fn is_lexically_reachable(
+pub(crate) fn is_lexically_reachable(
     candidate: &Node,
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> bool {
     if candidate.kind != NodeKind::Function {
+        return true;
+    }
+    // C and C++ have no nested named functions: a function the graph shows
+    // inside another is an extraction artifact (a macro whose designated
+    // initializers derail tree-sitter-c error recovery), not a scope, so it
+    // stays reachable (`NO_NESTED_FUNCTIONS`, upstream #1708).
+    if matches!(candidate.language, Language::C | Language::Cpp) {
         return true;
     }
     let Some(sep) = candidate.qualified_name.rfind("::") else {
@@ -254,28 +396,1071 @@ fn is_lexically_reachable(
             .any(|p| reference.line >= p.start_line && reference.line <= p.end_line)
 }
 
+pub(crate) fn is_js_family(language: Language) -> bool {
+    matches!(
+        language,
+        Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
+    )
+}
+
+/// Method names that require receiver evidence before a JS/TS call links to
+/// project code (`JS_BUILTIN_METHODS`, upstream v1.6.1 #1987): Array / typed
+/// array and collection, String, Promise, Function, EventTarget /
+/// EventEmitter and iterator methods. Sorted for binary search.
+const JS_BUILTIN_METHODS: [&str; 103] = [
+    "add",
+    "addEventListener",
+    "addListener",
+    "apply",
+    "at",
+    "bind",
+    "call",
+    "catch",
+    "charAt",
+    "charCodeAt",
+    "clear",
+    "codePointAt",
+    "concat",
+    "copyWithin",
+    "delete",
+    "dispatchEvent",
+    "drop",
+    "emit",
+    "endsWith",
+    "entries",
+    "eventNames",
+    "every",
+    "fill",
+    "filter",
+    "finally",
+    "find",
+    "findIndex",
+    "findLast",
+    "findLastIndex",
+    "flat",
+    "flatMap",
+    "forEach",
+    "get",
+    "getMaxListeners",
+    "has",
+    "includes",
+    "indexOf",
+    "join",
+    "keys",
+    "lastIndexOf",
+    "listenerCount",
+    "listeners",
+    "localeCompare",
+    "map",
+    "match",
+    "matchAll",
+    "next",
+    "normalize",
+    "off",
+    "on",
+    "once",
+    "padEnd",
+    "padStart",
+    "pop",
+    "prependListener",
+    "prependOnceListener",
+    "push",
+    "rawListeners",
+    "reduce",
+    "reduceRight",
+    "removeAllListeners",
+    "removeEventListener",
+    "removeListener",
+    "repeat",
+    "replace",
+    "replaceAll",
+    "return",
+    "reverse",
+    "search",
+    "set",
+    "setMaxListeners",
+    "shift",
+    "slice",
+    "some",
+    "sort",
+    "splice",
+    "split",
+    "startsWith",
+    "subarray",
+    "substr",
+    "substring",
+    "take",
+    "then",
+    "throw",
+    "toArray",
+    "toLocaleLowerCase",
+    "toLocaleString",
+    "toLocaleUpperCase",
+    "toLowerCase",
+    "toReversed",
+    "toSorted",
+    "toSpliced",
+    "toString",
+    "toUpperCase",
+    "trim",
+    "trimEnd",
+    "trimLeft",
+    "trimRight",
+    "trimStart",
+    "unshift",
+    "valueOf",
+    "values",
+    "with",
+];
+
+fn is_js_builtin_method(name: &str) -> bool {
+    JS_BUILTIN_METHODS.binary_search(&name).is_ok()
+}
+
+/// Languages whose file boundary follows ESM-style import/export semantics.
+/// ArkTS participates in module visibility even though the narrower JS call
+/// inference gates deliberately exclude it (upstream #1719).
+pub(crate) fn is_esm_module_family(language: Language) -> bool {
+    is_js_family(language) || language == Language::ArkTs
+}
+
+/// A JS/TS/ArkTS file containing an import statement but no export is a sealed
+/// module: none of its bindings can be named from another file. Classic scripts,
+/// CommonJS modules, local export clauses, and ambient globals remain visible
+/// (`isSealedModule`, upstream v1.6.1).
+///
+/// Cheapest disqualifiers first, as upstream orders them: an exported node
+/// (answered without reading the file), then the raw text's `import` and
+/// CommonJS markers, and only then the comment- and string-blanked view — a
+/// template literal spelling `import fake from "fake"` is data, not an import.
+/// The decision is memoised per file for the resolution pass.
+fn is_sealed_js_module(file_path: &str, context: &dyn ResolutionContext) -> bool {
+    static HAS_IMPORT: OnceLock<Regex> = OnceLock::new();
+    static HAS_EXPORT: OnceLock<Regex> = OnceLock::new();
+    static HAS_CJS_EXPORT: OnceLock<Regex> = OnceLock::new();
+    if context.file_has_exported_node(file_path) {
+        return false;
+    }
+    let Some(facts) = context.source_facts(file_path) else {
+        return false;
+    };
+    facts.js_sealed_module(|facts| {
+        let source = facts.source();
+        if !source.contains("import") {
+            return false;
+        }
+        // CommonJS assignments can execute inside template interpolations,
+        // which the blanked view hides, so this exemption reads raw source.
+        let has_cjs_export = HAS_CJS_EXPORT
+            .get_or_init(|| {
+                Regex::new(r"(?-u:\b)module\.exports(?-u:\b)|(?-u:\b)exports\s*[.\[]")
+                    .expect("CommonJS export marker")
+            })
+            .is_match(source);
+        if has_cjs_export {
+            return false;
+        }
+        let code = facts.ts_blanked();
+        HAS_IMPORT
+            .get_or_init(|| Regex::new(r#"(?m)^[ \t]*import[\s{*'"]"#).expect("js import marker"))
+            .is_match(code)
+            && !HAS_EXPORT
+                .get_or_init(|| {
+                    Regex::new(r"(?m)^[ \t]*export[\s{*]|^[ \t]*declare\s+global(?-u:\b)")
+                        .expect("js export marker")
+                })
+                .is_match(code)
+    })
+}
+
+/// Post-pipeline visibility gate for JS/TS name targets (`isCrossFileReachable`,
+/// upstream v1.6.1). Applying this after a strategy chooses its target avoids
+/// promoting an unrelated runner-up.
+pub(crate) fn is_js_name_target_visible(
+    candidate: &Node,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    if reference.reference_kind == EdgeKind::Calls
+        && is_esm_module_family(candidate.language)
+        && matches!(candidate.kind, NodeKind::Constant | NodeKind::Variable)
+        && is_json_require_signature(candidate.signature.as_deref().unwrap_or(""))
+    {
+        // `const data = require('./data.json')` names a JSON value; it is
+        // never callable.
+        return false;
+    }
+    candidate.file_path == reference.file_path
+        || !is_esm_module_family(candidate.language)
+        || !is_sealed_js_module(&candidate.file_path, context)
+}
+
+/// `^=\s*require\s*\(\s*(['"])[^'"]+\.json\1\s*\)\s*;?\s*$` (upstream), with
+/// the back-reference spelled out per quote.
+fn is_json_require_signature(signature: &str) -> bool {
+    static JSON_REQUIRE: OnceLock<[Regex; 2]> = OnceLock::new();
+    JSON_REQUIRE
+        .get_or_init(|| {
+            [
+                Regex::new(r#"^=\s*require\s*\(\s*'[^'"]+\.json'\s*\)\s*;?\s*$"#)
+                    .expect("single-quoted JSON require"),
+                Regex::new(r#"^=\s*require\s*\(\s*"[^'"]+\.json"\s*\)\s*;?\s*$"#)
+                    .expect("double-quoted JSON require"),
+            ]
+        })
+        .iter()
+        .any(|pattern| pattern.is_match(signature))
+}
+
+/// Keywords after which a name starts an expression, so the call that follows
+/// has no receiver (`BARE_CALL_KEYWORDS`, upstream v1.6.1; `go`/`defer` are the
+/// Go statement forms).
+const BARE_CALL_KEYWORDS: [&str; 14] = [
+    "return",
+    "await",
+    "yield",
+    "typeof",
+    "void",
+    "new",
+    "else",
+    "case",
+    "throw",
+    "in",
+    "of",
+    "instanceof",
+    "go",
+    "defer",
+];
+
+fn is_ascii_word_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
+}
+
+/// Whether a `calls` ref is RECEIVER-LESS — `serialize(x)`, not
+/// `this.serialize(x)` / `obj.serialize(x)` (`isReceiverLessCall`, upstream
+/// v1.6.1). The extractor emits `this.m()` and `pkg.F().M()` under the bare
+/// member name, so the receiver is read back from the call site's own line:
+/// the text at the ref's column must start with the name, be followed by a
+/// call opener, and be preceded by nothing, an operator/opener, or one of
+/// [`BARE_CALL_KEYWORDS`].
+///
+/// Unlike upstream, the opener may sit on a following line: JavaScript's
+/// automatic semicolon insertion never splits `finish\n()`, so that is a real
+/// bare call. (Go inserts a semicolon after a line-final identifier, so no Go
+/// call takes that shape.)
+fn is_receiver_less_call(reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    if reference.reference_kind != EdgeKind::Calls || reference.reference_name.contains('.') {
+        return false;
+    }
+    let Some(line_index) = (reference.line as usize).checked_sub(1) else {
+        return false;
+    };
+    let Some(facts) = context.source_facts(&reference.file_path) else {
+        return false;
+    };
+    let Some(line) = facts.raw_line(line_index) else {
+        return false;
+    };
+    let name = reference.reference_name.as_str();
+    let column = reference.column.max(0) as usize;
+    if column > line.len() || !line.is_char_boundary(column) || !line[column..].starts_with(name) {
+        return false;
+    }
+    let Some(line_start) = facts.lines().raw_line_start(line_index) else {
+        return false;
+    };
+    let after =
+        facts.source()[line_start + column + name.len()..].trim_start_matches(char::is_whitespace);
+    if !after.starts_with('(') && !after.starts_with('<') {
+        return false;
+    }
+    let before = line[..column].trim_end_matches(char::is_whitespace);
+    let Some(tail) = before.chars().next_back() else {
+        return true;
+    };
+    if !(is_ascii_word_char(tail) || matches!(tail, '.' | '$' | ']' | ')')) {
+        return true;
+    }
+    let word_len = before
+        .bytes()
+        .rev()
+        .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+        .count();
+    BARE_CALL_KEYWORDS.contains(&&before[before.len() - word_len..])
+}
+
+/// A receiver-less JS/TS call can never bind to a method (#1714).
+pub(crate) fn is_bare_js_call(reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    is_js_family(reference.language) && is_receiver_less_call(reference, context)
+}
+
+/// A receiver-less Go call — a func parameter, a local func value, a
+/// package-level function — is never a method, in its own package or in one
+/// the file does not import (#1857, upstream `isBareGoCall`).
+fn is_bare_go_call(reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    reference.language == Language::Go && is_receiver_less_call(reference, context)
+}
+
+/// How a Rust `calls` ref recorded under a bare name was written (KEEP-RUST,
+/// P15). The extractor keeps a receiver only for an identifier, `self`, one
+/// `self.<field>` hop and a `path::call()` receiver; any other receiver —
+/// `root().join(x)`, a deeper field chain, `vec![…]`, `?`, `.await`, indexing, a
+/// chain broken across lines — leaves the bare method name, with the ref's
+/// column at the start of the whole call expression. The source tells the two
+/// apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RustCallShape {
+    /// `join(x)`: neither receiver nor path, so a free function, never a method.
+    Bare,
+    /// `root().join(x)`: a method call whose receiver the extractor dropped.
+    Method,
+}
+
+/// How far past the ref's column a dropped receiver's `.name(` is looked for.
+const RUST_RECEIVER_WINDOW: usize = 4096;
+
+/// The shape of a Rust `calls` ref whose name has neither `.` nor `::`, read from
+/// its source: [`RustCallShape::Bare`] when the call expression starts with the
+/// name and a `(` or `::<` follows, [`RustCallShape::Method`] when it starts with
+/// something else and a `.name(` follows within [`RUST_RECEIVER_WINDOW`].
+/// `None` — no source, a column off its line, neither pattern — keeps every
+/// gate that reads the shape inert.
+pub(crate) fn rust_call_shape(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<RustCallShape> {
+    let name = reference.reference_name.as_str();
+    if reference.language != Language::Rust
+        || reference.reference_kind != EdgeKind::Calls
+        || name.is_empty()
+        || name.contains('.')
+        || name.contains("::")
+    {
+        return None;
+    }
+    let facts = context.source_facts(&reference.file_path)?;
+    let start = rust_ref_offset(reference, &facts)?;
+    let rest = &facts.source()[start..];
+    if let Some(after) = rest.strip_prefix(name) {
+        if after.bytes().next().is_some_and(is_rust_ident_byte) {
+            return None;
+        }
+        let after = after.trim_start();
+        return (after.starts_with('(') || after.starts_with("::<")).then_some(RustCallShape::Bare);
+    }
+    let mut end = rest.len().min(RUST_RECEIVER_WINDOW);
+    while !rest.is_char_boundary(end) {
+        end -= 1;
+    }
+    rust_method_call_follows(&rest[..end], name).then_some(RustCallShape::Method)
+}
+
+/// The byte offset of `reference`'s column in its file, when the column lies on
+/// its line at a char boundary.
+fn rust_ref_offset(reference: &RefView, facts: &SourceFacts) -> Option<usize> {
+    let line_index = usize::try_from(reference.line).ok()?.checked_sub(1)?;
+    let line = facts.raw_line(line_index)?;
+    let column = usize::try_from(reference.column).ok()?;
+    if column > line.len() || !line.is_char_boundary(column) {
+        return None;
+    }
+    Some(facts.lines().raw_line_start(line_index)? + column)
+}
+
+fn is_rust_ident_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_' || byte >= 0x80
+}
+
+/// Whether `text` holds a method call of `name`: one `.`, the whole word
+/// `name`, an optional `::<…>` turbofish, then `(`, with whitespace allowed
+/// between the parts.
+fn rust_method_call_follows(text: &str, name: &str) -> bool {
+    text.match_indices(name).any(|(at, _)| {
+        let bytes = text.as_bytes();
+        let end = at + name.len();
+        if bytes.get(end).is_some_and(|b| is_rust_ident_byte(*b)) {
+            return false;
+        }
+        let before = text[..at].trim_end();
+        if !before.ends_with('.') || before.ends_with("..") {
+            return false;
+        }
+        let mut after = text[end..].trim_start();
+        if let Some(generics) = after.strip_prefix("::<") {
+            let mut depth = 1usize;
+            let Some(close) = generics.bytes().position(|b| {
+                match b {
+                    b'<' => depth += 1,
+                    b'>' => depth -= 1,
+                    _ => {}
+                }
+                depth == 0
+            }) else {
+                return false;
+            };
+            after = generics[close + 1..].trim_start();
+        }
+        after.starts_with('(')
+    })
+}
+
+/// Method names a Rust call whose receiver the extractor dropped may not bind
+/// on the name alone (KEEP-RUST, P15 R3; the Rust analogue of upstream's
+/// `JS_BUILTIN_METHODS`, #1987). Every entry is a stable (Rust 1.98) method,
+/// callable with method syntax, of `Iterator` / `DoubleEndedIterator`,
+/// `Option`, `Result`, slices, `Vec`, `VecDeque`, `str`, `String`, `char` / `u8`
+/// ASCII, integers, `Duration` / `Instant`, the std maps and sets and `Entry`,
+/// `Path` / `PathBuf` / `OsStr` / `DirEntry` / `OpenOptions`, `Mutex` / `RwLock`
+/// / `OnceLock` / `Rc` / `Arc` / `Weak` / `RefCell` / `Cell` / atomics, the
+/// `io` / `fmt` I/O traits, `process::Command` / `Child`, `mpsc`, or the
+/// conversion and comparison traits — a curated subset, the ones commonly
+/// reached through call chains. A unique project method that shares one of
+/// these names is no evidence of the receiver's type: `root().join(name)` is
+/// `Path::join`. Sorted for binary search; changing it is a resolution change.
+const RUST_STD_METHODS: [&str; 307] = [
+    "abs",
+    "all",
+    "ancestors",
+    "and_then",
+    "any",
+    "append",
+    "arg",
+    "args",
+    "as_bytes",
+    "as_deref",
+    "as_deref_mut",
+    "as_micros",
+    "as_millis",
+    "as_mut",
+    "as_nanos",
+    "as_os_str",
+    "as_ref",
+    "as_secs",
+    "as_secs_f64",
+    "as_slice",
+    "as_str",
+    "back",
+    "binary_search",
+    "binary_search_by",
+    "binary_search_by_key",
+    "borrow",
+    "borrow_mut",
+    "by_ref",
+    "bytes",
+    "canonicalize",
+    "capacity",
+    "chain",
+    "char_indices",
+    "chars",
+    "checked_add",
+    "checked_sub",
+    "chunks",
+    "clamp",
+    "clear",
+    "clone",
+    "clone_from",
+    "cloned",
+    "cmp",
+    "collect",
+    "compare_exchange",
+    "components",
+    "concat",
+    "contains",
+    "contains_key",
+    "copied",
+    "count",
+    "current_dir",
+    "cycle",
+    "dedup",
+    "dedup_by_key",
+    "deref",
+    "deref_mut",
+    "difference",
+    "display",
+    "drain",
+    "duration_since",
+    "elapsed",
+    "ends_with",
+    "entry",
+    "enumerate",
+    "env",
+    "env_remove",
+    "eq",
+    "eq_ignore_ascii_case",
+    "err",
+    "exists",
+    "expect",
+    "expect_err",
+    "extend",
+    "extend_from_slice",
+    "extension",
+    "fetch_add",
+    "fetch_sub",
+    "file_name",
+    "file_stem",
+    "file_type",
+    "fill",
+    "filter",
+    "filter_map",
+    "find",
+    "find_map",
+    "first",
+    "flat_map",
+    "flatten",
+    "flush",
+    "fmt",
+    "fold",
+    "for_each",
+    "front",
+    "fuse",
+    "ge",
+    "get",
+    "get_mut",
+    "get_or_init",
+    "get_or_insert",
+    "get_or_insert_with",
+    "gt",
+    "hash",
+    "insert",
+    "insert_str",
+    "inspect",
+    "inspect_err",
+    "intersection",
+    "into",
+    "into_bytes",
+    "into_inner",
+    "into_iter",
+    "into_keys",
+    "into_os_string",
+    "into_string",
+    "into_values",
+    "is_absolute",
+    "is_alphabetic",
+    "is_alphanumeric",
+    "is_ascii",
+    "is_ascii_alphabetic",
+    "is_ascii_alphanumeric",
+    "is_ascii_digit",
+    "is_ascii_lowercase",
+    "is_ascii_punctuation",
+    "is_ascii_uppercase",
+    "is_ascii_whitespace",
+    "is_char_boundary",
+    "is_dir",
+    "is_empty",
+    "is_err",
+    "is_err_and",
+    "is_file",
+    "is_lowercase",
+    "is_none",
+    "is_none_or",
+    "is_ok",
+    "is_ok_and",
+    "is_relative",
+    "is_some",
+    "is_some_and",
+    "is_subset",
+    "is_symlink",
+    "is_uppercase",
+    "is_whitespace",
+    "iter",
+    "iter_mut",
+    "join",
+    "keys",
+    "kill",
+    "kind",
+    "last",
+    "le",
+    "len",
+    "lines",
+    "lock",
+    "lt",
+    "map",
+    "map_err",
+    "map_or",
+    "map_or_else",
+    "map_while",
+    "match_indices",
+    "matches",
+    "max",
+    "max_by",
+    "max_by_key",
+    "metadata",
+    "min",
+    "min_by",
+    "min_by_key",
+    "ne",
+    "next",
+    "nth",
+    "ok",
+    "ok_or",
+    "ok_or_else",
+    "open",
+    "or_default",
+    "or_else",
+    "or_insert",
+    "or_insert_with",
+    "output",
+    "parent",
+    "parse",
+    "partial_cmp",
+    "partition",
+    "path",
+    "peek",
+    "peekable",
+    "pop",
+    "pop_back",
+    "pop_front",
+    "position",
+    "pow",
+    "product",
+    "push",
+    "push_back",
+    "push_front",
+    "push_str",
+    "read",
+    "read_dir",
+    "read_exact",
+    "read_line",
+    "read_link",
+    "read_to_end",
+    "read_to_string",
+    "recv",
+    "reduce",
+    "remove",
+    "repeat",
+    "replace",
+    "replacen",
+    "reserve",
+    "resize",
+    "retain",
+    "rev",
+    "reverse",
+    "rfind",
+    "rposition",
+    "rsplit",
+    "rsplit_once",
+    "rsplitn",
+    "saturating_add",
+    "saturating_sub",
+    "scan",
+    "seek",
+    "send",
+    "set",
+    "set_extension",
+    "skip",
+    "skip_while",
+    "sort",
+    "sort_by",
+    "sort_by_key",
+    "sort_unstable",
+    "sort_unstable_by",
+    "sort_unstable_by_key",
+    "spawn",
+    "split",
+    "split_at",
+    "split_off",
+    "split_once",
+    "split_terminator",
+    "split_whitespace",
+    "splitn",
+    "starts_with",
+    "status",
+    "stderr",
+    "stdin",
+    "stdout",
+    "step_by",
+    "strip_prefix",
+    "strip_suffix",
+    "sum",
+    "swap",
+    "take",
+    "take_while",
+    "to_ascii_lowercase",
+    "to_ascii_uppercase",
+    "to_digit",
+    "to_lowercase",
+    "to_owned",
+    "to_path_buf",
+    "to_str",
+    "to_string",
+    "to_string_lossy",
+    "to_uppercase",
+    "to_vec",
+    "transpose",
+    "trim",
+    "trim_end",
+    "trim_end_matches",
+    "trim_matches",
+    "trim_start",
+    "trim_start_matches",
+    "truncate",
+    "try_borrow",
+    "try_borrow_mut",
+    "try_fold",
+    "try_for_each",
+    "try_into",
+    "try_lock",
+    "try_read",
+    "try_write",
+    "union",
+    "unwrap",
+    "unwrap_err",
+    "unwrap_or",
+    "unwrap_or_default",
+    "unwrap_or_else",
+    "unzip",
+    "upgrade",
+    "values",
+    "values_mut",
+    "wait",
+    "windows",
+    "with_extension",
+    "with_file_name",
+    "wrapping_add",
+    "wrapping_sub",
+    "write",
+    "write_all",
+    "write_fmt",
+    "write_str",
+    "xor",
+    "zip",
+];
+
+fn is_rust_std_method(name: &str) -> bool {
+    RUST_STD_METHODS.binary_search(&name).is_ok()
+}
+
+/// The prelude's enum variants. A bare one is `Option` / `Result`'s unless a
+/// `use` in scope imports a project variant of that name (KEEP-RUST, P15 R4).
+fn is_rust_prelude_variant(name: &str) -> bool {
+    matches!(name, "Ok" | "Err" | "Some" | "None")
+}
+
+/// Whether a `use` visible at `reference`'s call site names its name or is a
+/// glob. Unknown source counts as such a `use`, which keeps today's binding.
+fn rust_variant_import_in_scope(reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    let Some(facts) = context.source_facts(&reference.file_path) else {
+        return true;
+    };
+    let Some(offset) = rust_ref_offset(reference, &facts) else {
+        return true;
+    };
+    facts.rust_use_in_scope(offset, &reference.reference_name)
+}
+
+/// A Rust method call whose receiver the extractor dropped (KEEP-RUST, P15):
+/// `root().join(x)`, or a chain broken across lines. The resolver sends it here
+/// ahead of import resolution, and nowhere else. It never binds through a
+/// `use`, takes no fuzzy guess, binds only a same-named method (R2), and never
+/// one that shares a std method's name (R3); [`match_by_exact_name`] applies
+/// both for this shape.
+pub fn match_rust_lost_receiver_call(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    match_by_exact_name(reference, context)
+}
+
+/// Sticky binding patterns for one plain identifier
+/// (`localBindingPatterns`, upstream v1.6.1), anchored at the offset they are
+/// tried from. `\b`/`\w` are ASCII, as in upstream's JavaScript. The
+/// `function`/`class` form is matched by hand in [`binds_at_sites`].
+struct LocalBindingPatterns {
+    decl: Regex,
+    param: Regex,
+}
+
+impl LocalBindingPatterns {
+    fn new(name: &str) -> Option<Self> {
+        let n = regex::escape(name);
+        // `const { name } = require('./m')` / `= await import('./m')` binds an
+        // IMPORT, not a shadow; group 1 carries the initializer to tell them
+        // apart.
+        let decl = format!(
+            r"^(?-u:\b)(?:const|let|var)\s+(?:{n}(?-u:\b)|[{{\[][^;=]*?(?-u:\b){n}(?-u:\b)[^;=]*?[}}\]])\s*(?:=\s*([^;\n]*))?"
+        );
+        // A parameter: every token before the name in the list is itself a
+        // parameter (identifier, optional type, optional default), each with
+        // exactly one parse, so a string argument containing the word cannot
+        // match and a failing search cannot backtrack combinatorially.
+        let param = format!(
+            r"^\(\s*(?:(?:\.\.\.)?[0-9A-Za-z_$]+(?:\s*(?:\?\s*)?:[^,()]+|\s*=[^,()]+|\s*),\s*)*{n}(?-u:\b)(?:\s*\??\s*:[^,()]*)?(?:\s*=[^,()]*)?(?:\s*,\s*[^()]*)?\)\s*(?::[^=;{{]*)?(?:=>|\{{)"
+        );
+        Some(Self {
+            decl: Regex::new(&decl).ok()?,
+            param: Regex::new(&param).ok()?,
+        })
+    }
+}
+
+/// Binding patterns by name — the same names recur file after file
+/// (`LOCAL_BINDING_PATTERNS`). Compiled only for names whose binding a
+/// cheap necessary-condition check could not already rule out, and capped
+/// lower than upstream's 4096 because a compiled Rust regex is much larger.
+fn local_binding_patterns(name: &str) -> Option<Arc<LocalBindingPatterns>> {
+    const CAP: usize = 1024;
+    type PatternCache = (
+        HashMap<String, Option<Arc<LocalBindingPatterns>>>,
+        std::collections::VecDeque<String>,
+    );
+    static CACHE: OnceLock<Mutex<PatternCache>> = OnceLock::new();
+    let cache =
+        CACHE.get_or_init(|| Mutex::new((HashMap::new(), std::collections::VecDeque::new())));
+    if let Some(patterns) = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .0
+        .get(name)
+    {
+        return patterns.clone();
+    }
+    let patterns = LocalBindingPatterns::new(name).map(Arc::new);
+    let mut guard = cache
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let (map, order) = &mut *guard;
+    if !map.contains_key(name) {
+        if map.len() >= CAP
+            && let Some(oldest) = order.pop_front()
+        {
+            map.remove(&oldest);
+        }
+        map.insert(name.to_string(), patterns.clone());
+        order.push_back(name.to_string());
+    }
+    patterns
+}
+
+fn is_import_binding_value(value: &str) -> bool {
+    static IMPORT_BINDING_VALUE: OnceLock<Regex> = OnceLock::new();
+    IMPORT_BINDING_VALUE
+        .get_or_init(|| {
+            Regex::new(r"^\s*(?:await\s+)?(?:require|import)\s*\(").expect("import binding value")
+        })
+        .is_match(value)
+}
+
+/// Whether a JS/TS file binds `name` itself — as a `const`/`let`/`var`/
+/// `function`/`class` declaration (destructuring included) or as a parameter
+/// of a function or arrow (`isLocallyBoundJsName`, upstream v1.6.1). Such a
+/// binding shadows every same-named symbol in other files, so a bare call to
+/// it has no cross-file candidate. Read from raw source, memoised per
+/// file + name.
+fn is_locally_bound_js_name(name: &str, file_path: &str, context: &dyn ResolutionContext) -> bool {
+    let Some(facts) = context.source_facts(file_path) else {
+        return false;
+    };
+    facts.js_local_binding(name, |facts| {
+        let plain = !name.is_empty()
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'$');
+        if plain {
+            binds_at_sites(facts, name)
+        } else {
+            binds_anywhere(facts.source(), name)
+        }
+    })
+}
+
+/// [`is_locally_bound_js_name`]'s patterns searched through the whole source
+/// (`bindsAnywhere`), for names that are not plain identifiers.
+fn binds_anywhere(source: &str, name: &str) -> bool {
+    let n = regex::escape(name);
+    let unanchored = |pattern: String| Regex::new(&pattern).ok();
+    let decl = unanchored(format!(
+        r"(?-u:\b)(?:const|let|var)\s+(?:{n}(?-u:\b)|[{{\[][^;=]*?(?-u:\b){n}(?-u:\b)[^;=]*?[}}\]])\s*(?:=\s*([^;\n]*))?"
+    ));
+    if let Some(decl) = decl
+        && decl.captures_iter(source).any(|captures| {
+            !is_import_binding_value(captures.get(1).map_or("", |value| value.as_str()))
+        })
+    {
+        return true;
+    }
+    let function = unanchored(format!(r"(?-u:\b)(?:function|class)\s+{n}(?-u:\b)"));
+    let param = unanchored(format!(
+        r"\(\s*(?:(?:\.\.\.)?[0-9A-Za-z_$]+(?:\s*(?:\?\s*)?:[^,()]+|\s*=[^,()]+|\s*),\s*)*{n}(?-u:\b)(?:\s*\??\s*:[^,()]*)?(?:\s*=[^,()]*)?(?:\s*,\s*[^()]*)?\)\s*(?::[^=;{{]*)?(?:=>|\{{)"
+    ));
+    let arrow = unanchored(format!(r"(?:^|[^0-9A-Za-z_$.]){n}\s*=>"));
+    [function, param, arrow]
+        .into_iter()
+        .flatten()
+        .any(|pattern| pattern.is_match(source))
+}
+
+/// [`binds_anywhere`] for a plain identifier, tried only where a match can
+/// start (`bindsAtSites`): a declaration at its keyword (in order, resuming
+/// past each match as a global search does), a parameter at the `(` its list
+/// opens with, and `name =>` at each arrow.
+fn binds_at_sites(facts: &SourceFacts, name: &str) -> bool {
+    let source = facts.source();
+    let sites = facts.js_binding_sites();
+    // Compile the name's patterns only once a site passes its cheap
+    // necessary condition; most names never need them.
+    let mut patterns: Option<Option<Arc<LocalBindingPatterns>>> = None;
+    let mut patterns = || {
+        patterns
+            .get_or_insert_with(|| local_binding_patterns(name))
+            .clone()
+    };
+    let mut from = 0;
+    for &at in &sites.var_decls {
+        if at < from {
+            continue;
+        }
+        // Every decl match spells the name before the first `;` or `=`
+        // after its keyword.
+        let segment_end = source[at..]
+            .find([';', '='])
+            .map_or(source.len(), |offset| at + offset);
+        if !source[at..segment_end].contains(name) {
+            continue;
+        }
+        let Some(patterns) = patterns() else {
+            return false;
+        };
+        let Some(captures) = patterns.decl.captures(&source[at..]) else {
+            continue;
+        };
+        from = at + captures.get(0).map_or(0, |whole| whole.end());
+        if !is_import_binding_value(captures.get(1).map_or("", |value| value.as_str())) {
+            return true;
+        }
+    }
+    // `\b(?:function|class)\s+name\b` at each keyword site.
+    let names_declaration = |at: usize| {
+        let rest = &source[at..];
+        let Some(keyword) = ["function", "class"]
+            .into_iter()
+            .find(|keyword| rest.starts_with(keyword))
+        else {
+            return false;
+        };
+        let after = &rest[keyword.len()..];
+        let spelled = after.trim_start_matches(char::is_whitespace);
+        // `\b` after the name: an ASCII word/non-word transition.
+        spelled.len() < after.len()
+            && spelled.starts_with(name)
+            && name.chars().next_back().is_some_and(is_ascii_word_char)
+                != spelled[name.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_ascii_word_char)
+    };
+    if sites.fn_decls.iter().any(|&at| names_declaration(at)) {
+        return true;
+    }
+    let mut tried = None;
+    let mut search_from = 0;
+    while let Some(found) = source[search_from..].find(name) {
+        let at = search_from + found;
+        search_from = at + 1;
+        let Some(open) = source[..at].rfind('(') else {
+            continue;
+        };
+        if tried == Some(open) || source[..at].rfind(')').is_some_and(|close| close > open) {
+            continue;
+        }
+        tried = Some(open);
+        let Some(patterns) = patterns() else {
+            return false;
+        };
+        if patterns.param.is_match(&source[open..]) {
+            return true;
+        }
+    }
+    // `name =>`: the name ends where the whitespace before the arrow starts.
+    sites.arrows.iter().any(|&arrow| {
+        let end = source[..arrow].trim_end_matches(char::is_whitespace).len();
+        let Some(start) = end.checked_sub(name.len()) else {
+            return false;
+        };
+        source.is_char_boundary(start)
+            && source[start..].starts_with(name)
+            && !source[..start]
+                .chars()
+                .next_back()
+                .is_some_and(|ch| is_ascii_word_char(ch) || matches!(ch, '$' | '.'))
+    })
+}
+
 /// Try to resolve a reference by exact name match (`matchByExactName`,
 /// `name-matcher.ts:173-209`).
 pub fn match_by_exact_name(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
-    let reachable: Vec<Arc<Node>> = apply_language_gate(
-        context.get_nodes_by_name_shared(&reference.reference_name),
-        reference,
-    )
-    .into_iter()
-    // Nested locals are only reachable from inside their container (#1230).
-    .filter(|n| is_lexically_reachable(n, reference, context))
-    .collect();
+    let bare_js = is_bare_js_call(reference, context);
+    // A bare call bound to a store action (#1862) resolves inside that store,
+    // ahead of any same-named function.
+    if bare_js
+        && let Some(action) = crate::js_store::match_js_store_binding_call(reference, context)
+    {
+        return Some(action);
+    }
+    // KEEP-RUST (P15): a bare-named Rust call's shape, read from its source. A
+    // method call whose receiver the extractor dropped never binds a std
+    // method's name (R3).
+    let rust_shape = rust_call_shape(reference, context);
+    if rust_shape == Some(RustCallShape::Method) && is_rust_std_method(&reference.reference_name) {
+        return None;
+    }
+    let rust_bare = rust_shape == Some(RustCallShape::Bare);
+    let rust_method = rust_shape == Some(RustCallShape::Method);
+    let same_name = context.get_nodes_by_name_shared(&reference.reference_name);
+    // `NAME(...)` where NAME is a function-like macro somewhere in the project
+    // is an expansion or a call to a same-named function — never the macro
+    // itself (#1839), and never a type that happens to share the name (#2070:
+    // expat's `PREFIX(scanRef)(…)` bound an unrelated `struct PREFIX`). Neither
+    // is a candidate at all, so neither makes the reference look ambiguous or
+    // counts toward the same-name ceiling.
+    let macro_call = reference.reference_kind == EdgeKind::Calls
+        && matches!(reference.language, Language::C | Language::Cpp)
+        && same_name
+            .iter()
+            .any(|n| crate::c_macro_visibility::is_define_constant(n));
+    let reachable: Vec<Arc<Node>> = apply_language_gate(same_name, reference)
+        .into_iter()
+        .filter(|n| !macro_call || matches!(n.kind, NodeKind::Function | NodeKind::Method))
+        // Nested locals are only reachable from inside their container (#1230).
+        .filter(|n| is_lexically_reachable(n, reference, context))
+        .collect();
 
     // A same-named non-type is not a supertype, and a type member is not
     // importable (#1537/#1536). Filtering BEFORE ranking — not just refusing the
     // winner afterwards — is what lets a legitimate supertype OUTRANK a
     // same-named enum member instead of the whole reference being dropped.
+    let bare_go = is_bare_go_call(reference, context);
     let candidates: Vec<Arc<Node>> = reachable
         .iter()
-        .filter(|n| kind_is_eligible_target(reference.reference_kind, n.kind))
+        .filter(|n| node_is_eligible_target(reference.reference_kind, n))
+        // A receiver-less JS/TS, Go or Rust call cannot reach a method (#1714,
+        // #1857; P15 R1).
+        .filter(|n| !((bare_js || bare_go || rust_bare) && n.kind == NodeKind::Method))
+        // A Rust method call whose receiver was dropped reaches only a method:
+        // never a function, type, enum member or import (P15 R2).
+        .filter(|n| !rust_method || n.kind == NodeKind::Method)
+        // A bare `Ok` / `Err` / `Some` / `None` is the prelude's unless a `use`
+        // in its scope imports a project variant of that name (P15 R4).
+        .filter(|n| {
+            !(rust_bare
+                && n.kind == NodeKind::EnumMember
+                && is_rust_prelude_variant(&reference.reference_name)
+                && !rust_variant_import_in_scope(reference, context))
+        })
+        // A name the file binds itself shadows every other file's symbol of
+        // that name, so a bare call has no cross-file candidate.
+        .filter(|n| {
+            !(bare_js
+                && n.file_path != reference.file_path
+                && is_locally_bound_js_name(
+                    &reference.reference_name,
+                    &reference.file_path,
+                    context,
+                ))
+        })
         .cloned()
         .collect();
 
@@ -420,7 +1605,10 @@ pub fn match_by_qualified_name(
 /// `a/svc`. No-op when there are <2 candidates or none share the call site's
 /// file. The partition is STABLE (preserves within-group order), so edge output
 /// stays deterministic.
-fn prefer_call_site_file<T: Borrow<Node>>(nodes: Vec<T>, call_site_file: &str) -> Vec<T> {
+pub(crate) fn prefer_call_site_file<T: Borrow<Node>>(
+    nodes: Vec<T>,
+    call_site_file: &str,
+) -> Vec<T> {
     if nodes.len() < 2 {
         return nodes;
     }
@@ -441,7 +1629,7 @@ fn prefer_call_site_file<T: Borrow<Node>>(nodes: Vec<T>, call_site_file: &str) -
     }
 }
 
-fn is_object_literal_language(language: Language) -> bool {
+pub(crate) fn is_object_literal_language(language: Language) -> bool {
     matches!(
         language,
         Language::TypeScript
@@ -452,7 +1640,7 @@ fn is_object_literal_language(language: Language) -> bool {
     )
 }
 
-fn range_within(inner: &Node, outer: &Node) -> bool {
+pub(crate) fn range_within(inner: &Node, outer: &Node) -> bool {
     if inner.start_line < outer.start_line || inner.end_line > outer.end_line {
         return false;
     }
@@ -501,6 +1689,15 @@ pub(crate) fn resolve_object_literal_member(
                     NodeKind::Property | NodeKind::Variable | NodeKind::Constant
                 ))
     };
+    // Only the literal's own property that defines the member counts — the
+    // last one wins — and an identifier-valued member is followed by
+    // `resolve_object_literal_binding` instead (#1932).
+    let property = match object_literal_property(container, member, context) {
+        LiteralLookup::Absent => return None,
+        LiteralLookup::Property(property) if property.binding.is_some() => return None,
+        LiteralLookup::Property(property) => Some(property),
+        LiteralLookup::Unknown => None,
+    };
     let inside = context
         .get_nodes_in_file_shared(&container.file_path)
         .into_iter()
@@ -514,6 +1711,11 @@ pub(crate) fn resolve_object_literal_member(
     let mut candidates = inside
         .into_iter()
         .filter(|node| node.name == member && accepts(node))
+        .filter(|node| {
+            property
+                .as_ref()
+                .is_none_or(|property| property_contains(property, container, node, context))
+        })
         .filter(|candidate| {
             !callable_bodies.iter().any(|body| {
                 body.id != candidate.id
@@ -570,8 +1772,10 @@ pub(crate) fn resolve_method_on_type(
     let matches: Vec<Arc<Node>> = method_candidates
         .into_iter()
         .filter(|m| {
+            // One language family shares one type system: a `.tsx` caller
+            // reaches a `.ts` class's method (upstream #1862).
             m.kind == NodeKind::Method
-                && m.language == reference.language
+                && same_language_family(m.language, reference.language)
                 && (m.qualified_name == want || m.qualified_name.ends_with(&format!("::{want}")))
         })
         .collect();
@@ -1006,6 +2210,12 @@ fn local_receiver_type_patterns_tagged(language: Language, r: &str) -> Vec<(Rege
         ],
         Language::Python => vec![
             format!(r"\b{r}\b\s*=\s*([A-Z][\w.]*)\s*\("),
+            // Quoted forward references are ordinary Python annotations (and
+            // the form produced by `from __future__ import annotations`). Keep
+            // this stricter shape before the unquoted annotation pattern so
+            // `obj: "pkg.Type"` recovers the same receiver type as
+            // `obj: pkg.Type` (#1684).
+            format!(r#"\b{r}\b\s*:\s*["']([A-Z][\w.]*)["']"#),
             format!(r"\b{r}\b\s*:\s*([A-Z][\w.]*)"),
         ],
         Language::Java => vec![
@@ -1074,7 +2284,10 @@ fn local_receiver_type_patterns_tagged(language: Language, r: &str) -> Vec<(Rege
 /// 1-based start line of the tightest function/method enclosing the call
 /// (`enclosingScopeStartLine`, name-matcher.ts:#1108). Bounds the backward scan
 /// so a same-named variable in another function can't leak in.
-fn enclosing_scope_start_line(reference: &RefView, context: &dyn ResolutionContext) -> i64 {
+pub(crate) fn enclosing_scope_start_line(
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> i64 {
     let mut start = 1i64;
     for n in context.get_nodes_in_file_shared(&reference.file_path) {
         if !matches!(n.kind, NodeKind::Function | NodeKind::Method)
@@ -1100,7 +2313,7 @@ fn enclosing_scope_start_line(reference: &RefView, context: &dyn ResolutionConte
 /// languages without patterns or when no declaration is found. Bounded to the
 /// enclosing scope. The caller validates the method via `resolve_method_on_type`,
 /// so a mis-inference produces no edge.
-fn infer_local_receiver_type(
+pub(crate) fn infer_local_receiver_type(
     receiver_name: &str,
     reference: &RefView,
     context: &dyn ResolutionContext,
@@ -1231,6 +2444,236 @@ fn infer_class_field_receiver_type(
         }
     }
     None
+}
+
+/// Resolve a JS/TS `this.<field>.<method>()` exclusively through the field's
+/// declaration on the enclosing class. Unproven/builtin/ambiguous types remain
+/// unresolved rather than falling through to receiver-name heuristics. An ES
+/// private field (`#items`) is a name of its own: it never reads a public
+/// `items` declaration, nor the reverse (#1987).
+fn match_ts_this_field_call(
+    field: &str,
+    method_name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    if !is_ts_field_name(field) {
+        return None;
+    }
+    let caller = context.get_node_by_id_shared(&reference.from_node_id)?;
+    let (owner_qualified, _) = caller.qualified_name.rsplit_once("::")?;
+    let owner_name = owner_qualified.rsplit("::").next()?;
+    let owners = context
+        .get_nodes_by_name_shared(owner_name)
+        .into_iter()
+        .filter(|node| {
+            node.file_path == reference.file_path
+                && same_language_family(node.language, reference.language)
+                && matches!(node.kind, NodeKind::Class | NodeKind::Component)
+                && node.qualified_name == owner_qualified
+        })
+        .collect::<Vec<_>>();
+    if owners.len() != 1 {
+        return None;
+    }
+    let owner = &owners[0];
+    let facts = context.source_facts(&owner.file_path)?;
+    let declaration = facts.ts_field_declaration(&owner.id, field, |facts| {
+        scan_ts_field_declaration(facts, owner, field, context)
+    })?;
+
+    if declaration.value_type {
+        let value_name = declaration.type_name.rsplit('.').next().unwrap_or_default();
+        let holders = prefer_call_site_file(
+            context.get_nodes_by_name_shared(value_name),
+            &reference.file_path,
+        );
+        for holder in holders.into_iter().filter(|node| {
+            matches!(node.kind, NodeKind::Constant | NodeKind::Variable)
+                && same_language_family(node.language, reference.language)
+        }) {
+            if let Some(resolved) = resolve_object_literal_member(
+                &holder,
+                method_name,
+                reference,
+                context,
+                0.85,
+                ResolvedBy::InstanceMethod,
+            ) {
+                return Some(resolved);
+            }
+        }
+        return None;
+    }
+
+    let type_name = declaration.type_name.rsplit('.').next().unwrap_or_default();
+    if !type_name
+        .chars()
+        .next()
+        .is_some_and(|first| first.is_ascii_uppercase())
+    {
+        return None;
+    }
+    resolve_method_on_type(
+        type_name,
+        method_name,
+        reference,
+        context,
+        0.85,
+        ResolvedBy::InstanceMethod,
+        None,
+        0,
+    )
+}
+
+/// A public (`mailer`) or ES private (`#mailer`) class field name.
+fn is_ts_field_name(field: &str) -> bool {
+    match field.strip_prefix('#') {
+        Some(private) => {
+            !private.is_empty()
+                && private
+                    .chars()
+                    .all(|ch| ch.is_alphanumeric() || matches!(ch, '_' | '$'))
+        }
+        None => is_word(field),
+    }
+}
+
+/// `this.#field.method` → (`#field`, `method`): upstream's
+/// `/^this\.(#[\w$]+)\.(\w+)$/` (#1987).
+fn split_private_this_field_call(name: &str) -> Option<(&str, &str)> {
+    let (field, method) = name.strip_prefix("this.")?.split_once('.')?;
+    (field.starts_with('#') && is_ts_field_name(field) && is_word(method))
+        .then_some((field, method))
+}
+
+/// The first declaration of `field` on the enclosing class's own lines of the
+/// comment-free source. Inside a method body only a `this.<field>` assignment
+/// counts (`this.mailer = new Mailer()` in a constructor) — a method-local
+/// parameter or variable of the same name is not the field — while a
+/// constructor's parameter properties (`constructor(private mailer: Mailer)`)
+/// read like class-level declarations.
+fn scan_ts_field_declaration(
+    facts: &SourceFacts,
+    owner: &Node,
+    field: &str,
+    context: &dyn ResolutionContext,
+) -> Option<TsFieldDeclaration> {
+    let member_prefix = format!("{}::", owner.qualified_name);
+    let owner_members = context
+        .get_nodes_in_file_shared(&owner.file_path)
+        .into_iter()
+        .filter(|node| {
+            matches!(node.kind, NodeKind::Method | NodeKind::Function)
+                && node.qualified_name.starts_with(&member_prefix)
+        })
+        .collect::<Vec<_>>();
+    let (code, lines) = facts.ts_comment_free();
+    let start = owner.start_line.saturating_sub(1) as usize;
+    let end = (owner.end_line.max(owner.start_line) as usize).min(lines.line_count());
+    for index in start..end {
+        let line = lines.line(code, index);
+        // Every declaration pattern spells the field literally.
+        if line.len() > 10_000 || !line.contains(field) {
+            continue;
+        }
+        let source_line = (index + 1) as i64;
+        let this_only = owner_members
+            .iter()
+            .find(|member| {
+                source_line >= member.start_line
+                    && source_line <= member.end_line.max(member.start_line)
+            })
+            .is_some_and(|member| {
+                !(member.name == "constructor" && declares_parameter_property(line, field))
+            });
+        if let Some(declaration) = ts_field_on_line(line, field, this_only) {
+            return Some(declaration);
+        }
+    }
+    None
+}
+
+/// The declaration patterns, tried in order after a whole-token occurrence of
+/// the field: `field: typeof Value` (the type OF a value — tried first, or the
+/// declared-type pattern would capture the word `typeof`), a declared type
+/// `field?: Mailer` (the capture stops at `<`, `[` or `|`, so a generic or
+/// union yields its head), and an initializer `field = new Mailer()`.
+fn ts_field_patterns() -> &'static [(Regex, bool); 3] {
+    static PATTERNS: OnceLock<[(Regex, bool); 3]> = OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        [
+            (
+                Regex::new(r"^\s*[?!]?\s*:\s*(?:readonly\s+)?typeof\s+([A-Za-z_$][\w.$]*)")
+                    .expect("typeof field pattern"),
+                true,
+            ),
+            (
+                Regex::new(r"^\s*[?!]?\s*:\s*(?:readonly\s+)?([A-Za-z_$][\w.$]*)")
+                    .expect("declared field pattern"),
+                false,
+            ),
+            (
+                Regex::new(r"^\s*=\s*new\s+([A-Za-z_$][\w.$]*)")
+                    .expect("initialized field pattern"),
+                false,
+            ),
+        ]
+    })
+}
+
+/// The first declaration of `field` on one line, pattern by pattern as the
+/// upstream field regexes would find it. The field must be a whole `[\w$#]`
+/// token — the `(?<![\w$#])` lookbehind of upstream v1.6.1 — so a public
+/// `items` never matches `#items` (#1987); with `this_only`, it must also be
+/// written `this.<field>`. KEEP-RUST: a field ending in `$` (`users$`) is a
+/// whole token too, where upstream's trailing `\b` rejects it.
+fn ts_field_on_line(line: &str, field: &str, this_only: bool) -> Option<TsFieldDeclaration> {
+    let is_token = |ch: char| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '#');
+    let ends = line
+        .match_indices(field)
+        .filter(|(at, _)| {
+            let before = &line[..*at];
+            !before.chars().next_back().is_some_and(is_token)
+                && !line[at + field.len()..]
+                    .chars()
+                    .next()
+                    .is_some_and(is_token)
+                && (!this_only
+                    || before
+                        .strip_suffix("this.")
+                        .is_some_and(|rest| !rest.chars().next_back().is_some_and(is_token)))
+        })
+        .map(|(at, _)| at + field.len())
+        .collect::<Vec<_>>();
+    ts_field_patterns()
+        .iter()
+        .find_map(|(pattern, value_type)| {
+            ends.iter().find_map(|&end| {
+                pattern
+                    .captures(&line[end..])
+                    .and_then(|captures| captures.get(1))
+                    .map(|capture| TsFieldDeclaration {
+                        value_type: *value_type,
+                        type_name: capture.as_str().to_string(),
+                    })
+            })
+        })
+}
+
+/// Whether a constructor line declares `field` as a parameter property
+/// (`private readonly mailer: Mailer`). A private name is never one.
+fn declares_parameter_property(line: &str, field: &str) -> bool {
+    static PARAMETER_PROPERTY: OnceLock<Regex> = OnceLock::new();
+    PARAMETER_PROPERTY
+        .get_or_init(|| {
+            Regex::new(
+                r"\b(?:public|protected|private|readonly)(?:\s+(?:public|protected|private|readonly))*\s+([\w$]+)",
+            )
+            .expect("parameter property pattern")
+        })
+        .captures_iter(line)
+        .any(|captures| captures.get(1).is_some_and(|name| name.as_str() == field))
 }
 
 /// Is the inferred receiver type `type_name` BOUND at the call site (#1566)?
@@ -1501,6 +2944,16 @@ pub fn match_method_call(
         }
     }
 
+    // A TS/JS call through an ES private field of the enclosing class —
+    // `this.#items.add()`, emitted as `this.#items.add` (#1987) — resolves
+    // exactly like `this.<field>` below (#1496). `#` is outside the dotted
+    // receiver grammar, so the shape is matched here.
+    if is_js_family(reference.language)
+        && let Some((field, method)) = split_private_this_field_call(&reference.reference_name)
+    {
+        return match_ts_this_field_call(field, method, reference, context);
+    }
+
     let parsed = parse_method_call(&reference.reference_name, reference.language)?;
     let (object_or_class, method_name) = parsed;
 
@@ -1511,6 +2964,15 @@ pub fn match_method_call(
     if reference.language == Language::Rust {
         if let Some(field) = object_or_class.strip_prefix("self.") {
             return match_rust_self_field_call(field, &method_name, reference, context);
+        }
+        if object_or_class == "self" {
+            return match_rust_self_call(&method_name, reference, context);
+        }
+    }
+
+    if is_js_family(reference.language) {
+        if let Some(field) = object_or_class.strip_prefix("this.") {
+            return match_ts_this_field_call(field, &method_name, reference, context);
         }
     }
 
@@ -1594,6 +3056,40 @@ pub fn match_method_call(
             ) {
                 return Some(typed);
             }
+        } else {
+            match crate::awaited::infer_awaited_receiver(&object_or_class, reference, context) {
+                crate::awaited::AwaitedInference::NotApplicable => {}
+                crate::awaited::AwaitedInference::Unresolved => return None,
+                crate::awaited::AwaitedInference::Inferred {
+                    type_name,
+                    file_path,
+                } => {
+                    // Resolve on the awaited type from its own file, and accept
+                    // only a method that file's type declares (upstream v1.6.1).
+                    let mut at_type = reference.clone();
+                    at_type.file_path = file_path.clone();
+                    let typed = resolve_method_on_type(
+                        &type_name,
+                        &method_name,
+                        &at_type,
+                        context,
+                        0.9,
+                        ResolvedBy::InstanceMethod,
+                        None,
+                        0,
+                    )?;
+                    let target = context.get_node_by_id_shared(&typed.target_node_id)?;
+                    if target.qualified_name.starts_with(&format!("{type_name}::"))
+                        && target.file_path != file_path
+                    {
+                        return None;
+                    }
+                    return Some(ResolvedRef {
+                        original: reference.clone(),
+                        ..typed
+                    });
+                }
+            }
         }
     }
 
@@ -1640,7 +3136,9 @@ pub fn match_method_call(
                 context,
                 0.85,
                 ResolvedBy::InstanceMethod,
-            ) {
+            )
+            .or_else(|| resolve_object_literal_binding(&holder, &method_name, reference, context))
+            {
                 return Some(member);
             }
         }
@@ -1653,10 +3151,12 @@ pub fn match_method_call(
         context.get_nodes_by_name_shared(&object_or_class),
         &reference.file_path,
     ) {
+        // A Scala `object` owns methods callable as `Obj.method()` (#1824).
         if matches!(
             class_node.kind,
             NodeKind::Class | NodeKind::Struct | NodeKind::Union | NodeKind::Interface
-        ) {
+        ) || crate::types::is_scala_singleton(&class_node)
+        {
             if class_node.language != reference.language {
                 continue;
             }
@@ -1671,6 +3171,18 @@ pub fn match_method_call(
         }
     }
 
+    // Built-in method names need a validated receiver (#1987). Typed, imported,
+    // object-literal and direct class receivers have had their chance above;
+    // capitalization, word overlap or a unique method name are not evidence
+    // that `list.map()` / `cache.get()` calls a project class.
+    if reference.reference_kind == EdgeKind::Calls
+        && is_js_family(reference.language)
+        && !matches!(object_or_class.as_str(), "this" | "super")
+        && is_js_builtin_method(&method_name)
+    {
+        return None;
+    }
+
     // Strategy 2: instance-variable receiver → capitalized class
     // (name-matcher.ts:852-880), call-site file first (#1079).
     let capitalized = capitalize(&object_or_class);
@@ -1682,7 +3194,8 @@ pub fn match_method_call(
             if matches!(
                 class_node.kind,
                 NodeKind::Class | NodeKind::Struct | NodeKind::Union | NodeKind::Interface
-            ) {
+            ) || crate::types::is_scala_singleton(&class_node)
+            {
                 if class_node.language != reference.language {
                     continue;
                 }
@@ -1866,6 +3379,81 @@ fn strip_rust_field_line_comments(line: &str) -> String {
     }
     output.push_str(rest);
     output
+}
+
+/// Resolve `self.method()` on the Rust type that owns the calling method.
+///
+/// The extractor preserves this shape as `self.<method>` so the resolver can
+/// read the owner from the caller's qualified name. This is deliberately an
+/// exclusive, exact match: if the caller is not a method, the owner is absent,
+/// or more than one method claims the same owner-qualified name, the reference
+/// stays unresolved instead of falling through to proximity/name heuristics.
+fn match_rust_self_call(
+    method_name: &str,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<ResolvedRef> {
+    if method_name.is_empty() || !is_word(method_name) {
+        return None;
+    }
+    let caller = context.get_node_by_id_shared(&reference.from_node_id)?;
+    if caller.language != Language::Rust || caller.kind != NodeKind::Method {
+        return None;
+    }
+    let (owner, _) = caller.qualified_name.rsplit_once("::")?;
+    if owner.is_empty() {
+        return None;
+    }
+    let wanted = format!("{owner}::{method_name}");
+    let mut owned: Vec<Arc<Node>> = context
+        .get_nodes_by_name_shared(method_name)
+        .into_iter()
+        .filter(|candidate| {
+            candidate.language == Language::Rust
+                && candidate.kind == NodeKind::Method
+                && candidate.qualified_name == wanted
+        })
+        .collect();
+    // Rust qualified names omit module paths, so two modules can each declare
+    // `Target`; matching `Target::reset` alone then proves nothing. With more
+    // than one owner declaration, require exactly one in the caller's file and
+    // a method in that file (upstream #1882). A unique owner still permits
+    // impl blocks split across files.
+    let owners = context
+        .get_nodes_by_qualified_name_shared(owner)
+        .into_iter()
+        .filter(|node| {
+            node.language == Language::Rust
+                && matches!(
+                    node.kind,
+                    NodeKind::Struct
+                        | NodeKind::Enum
+                        | NodeKind::Union
+                        | NodeKind::Trait
+                        | NodeKind::Class
+                )
+        })
+        .collect::<Vec<_>>();
+    if owners.len() > 1 {
+        if owners
+            .iter()
+            .filter(|node| node.file_path == caller.file_path)
+            .count()
+            != 1
+        {
+            return None;
+        }
+        owned.retain(|node| node.file_path == caller.file_path);
+    }
+    let [target] = owned.as_slice() else {
+        return None;
+    };
+    Some(ResolvedRef {
+        original: reference.clone(),
+        target_node_id: target.id.clone(),
+        confidence: 0.9,
+        resolved_by: ResolvedBy::QualifiedName,
+    })
 }
 
 /// Resolve `self.field.method()` through the field type declared on the
@@ -2321,6 +3909,16 @@ fn find_best_match<'a, T: Borrow<Node>>(
             _ => {}
         }
 
+        // A Scala companion `object` is a module and may share both name and
+        // file with its trait/class. It remains type-eligible for languages that
+        // do inherit/include modules, but an actual type must win an inheritance
+        // tie deterministically (#1824).
+        if crate::types::is_inheritance_ref(reference.reference_kind)
+            && candidate.kind == NodeKind::Module
+        {
+            score -= 50.0;
+        }
+
         if candidate.is_exported {
             score += 10.0;
         }
@@ -2343,6 +3941,12 @@ fn find_best_match<'a, T: Borrow<Node>>(
 /// Fuzzy match — last resort with lower confidence (`matchFuzzy`,
 /// `name-matcher.ts:1060-1088`).
 pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Option<ResolvedRef> {
+    // A Rust method call whose receiver was dropped takes no fuzzy guess
+    // (KEEP-RUST, P15 R2); a bare Rust call still never reaches a method (R1).
+    let rust_shape = rust_call_shape(reference, context);
+    if rust_shape == Some(RustCallShape::Method) {
+        return None;
+    }
     let lower_name = reference.reference_name.to_lowercase();
     let candidates = context.get_nodes_by_lower_name_shared(&lower_name);
     if candidates.len() > ambiguous_name_ceiling() {
@@ -2369,17 +3973,39 @@ pub fn match_fuzzy(reference: &RefView, context: &dyn ResolutionContext) -> Opti
         callable_candidates
     };
 
-    if final_candidates.len() == 1 {
-        let is_cross_language = final_candidates[0].language != reference.language;
-        return Some(ResolvedRef {
-            original: reference.clone(),
-            target_node_id: final_candidates[0].id.clone(),
-            confidence: if is_cross_language { 0.3 } else { 0.5 },
-            resolved_by: ResolvedBy::Fuzzy,
-        });
+    // Every gate below judges the ONE candidate this strategy would commit to,
+    // never the candidate set: filtering the unreachable ones out of a crowd
+    // would leave a single survivor and hand it every call of that name.
+    // These gates may reject a unique guess; they must never manufacture one
+    // (upstream v1.6.1 `matchFuzzy`). Cross-file visibility and sealed modules
+    // are enforced post-pipeline for every strategy.
+    let [candidate] = final_candidates.as_slice() else {
+        return None;
+    };
+    let bare_js_rejects = is_bare_js_call(reference, context)
+        && (candidate.kind == NodeKind::Method
+            || (candidate.file_path != reference.file_path
+                && is_locally_bound_js_name(
+                    &reference.reference_name,
+                    &reference.file_path,
+                    context,
+                )));
+    if bare_js_rejects
+        || (candidate.kind == NodeKind::Method
+            && (is_bare_go_call(reference, context) || rust_shape == Some(RustCallShape::Bare)))
+        // A builtin method call (`res.text()`) whose only same-named project
+        // symbol is some function's closure must decline (#1708).
+        || !is_lexically_reachable(candidate, reference, context)
+    {
+        return None;
     }
-
-    None
+    let is_cross_language = candidate.language != reference.language;
+    Some(ResolvedRef {
+        original: reference.clone(),
+        target_node_id: candidate.id.clone(),
+        confidence: if is_cross_language { 0.3 } else { 0.5 },
+        resolved_by: ResolvedBy::Fuzzy,
+    })
 }
 
 /// Resolve a `::`-scoped factory chain (`matchScopedCallChain`,
@@ -2661,6 +4287,18 @@ pub fn match_reference(
         }
     }
 
+    // A JS/TS/Python call-result receiver carries no proven result type. It
+    // stays unresolved instead of degrading to a global same-named callable:
+    // the fuzzy strategy would split `make().run` on `.` and hand it to any
+    // `run` (#1683). The one exception is a store accessor, whose store is
+    // identified (`useStore.getState().reset`, #1862).
+    if reference.reference_kind == EdgeKind::Calls
+        && (is_js_family(reference.language) || reference.language == Language::Python)
+        && reference.reference_name.contains("().")
+    {
+        return crate::js_store::match_store_accessor_chain(reference, context);
+    }
+
     // 2. Method call pattern.
     if let Some(result) = match_method_call(reference, context) {
         return Some(result);
@@ -2691,17 +4329,42 @@ pub(crate) fn is_python_class_function_ref_target(language: Language, kind: Node
     language == Language::Python && kind == NodeKind::Class
 }
 
-/// Resolve a `function_ref` (callback-as-value) reference: exact name,
-/// function/method targets plus Python class targets (Python bare methods remain
-/// excluded), same language family, same-file first, cross-file only when unique.
-/// No fuzzy fallback. `this.<member>` refs are resolved elsewhere
-/// (resolve_this_member_fn_ref). Ports `matchFunctionRef` (name-matcher.ts:179-310).
+/// Resolve a `function_ref` (callback-as-value) reference. Receiver-qualified
+/// method values reuse the ordinary method-call target selection (#1820); bare
+/// names use exact function/method targets plus Python class targets (Python
+/// bare methods remain excluded), same language family, same-file first, and
+/// cross-file only when unique. No fuzzy fallback. `this.<member>` refs are
+/// resolved elsewhere (`resolve_this_member_fn_ref`). Ports `matchFunctionRef`
+/// (name-matcher.ts:179-310) plus the issue #1820 extension.
 pub fn match_function_ref(
     reference: &RefView,
     context: &dyn ResolutionContext,
 ) -> Option<ResolvedRef> {
-    if reference.reference_name.starts_with("this.") {
+    if reference
+        .reference_name
+        .strip_prefix("this.")
+        .is_some_and(|member| !member.contains('.'))
+    {
         return None;
+    }
+
+    // Python and Go member values retain their receiver path and resolve
+    // through the receiver's scope before a unique name (upstream #1820).
+    if matches!(reference.language, Language::Python | Language::Go)
+        && reference.reference_name.contains('.')
+    {
+        return crate::member_value::match_member_function_ref(reference, context);
+    }
+
+    // Receiver-qualified first-class method value (#1820): reuse the exact
+    // same conservative target selection as `obj.method(...)`, but preserve
+    // the original `references` kind and label the result as function-ref.
+    // This gives callback wiring and direct calls identical receiver inference
+    // without fabricating an immediate `calls` edge.
+    if match_dot_call(&reference.reference_name).is_some() {
+        let mut resolved = match_method_call(reference, context)?;
+        resolved.resolved_by = ResolvedBy::FunctionRef;
+        return Some(resolved);
     }
 
     // A bare identifier cannot be a method value in JS/TS/C++/Python/PHP
@@ -3163,6 +4826,10 @@ mod tests {
         assert!(same_language_family(Language::TypeScript, Language::Jsx));
         assert!(same_language_family(Language::JavaScript, Language::Tsx));
         assert!(same_language_family(Language::C, Language::Cpp));
+        // C, C++, Objective-C and Swift interoperate natively (v1.6.1).
+        assert!(same_language_family(Language::Swift, Language::Cpp));
+        assert!(same_language_family(Language::ArkTs, Language::TypeScript));
+        assert!(same_language_family(Language::Vue, Language::TypeScript));
         assert!(same_language_family(Language::CSharp, Language::Razor));
         // Identity always matches even for a language with no family.
         assert!(same_language_family(Language::Rust, Language::Rust));
@@ -3173,19 +4840,75 @@ mod tests {
     }
 
     #[test]
-    fn known_family_and_cross_family_predicates() {
-        assert!(is_known_language_family(Language::Java));
-        assert!(is_known_language_family(Language::Cpp));
-        assert!(!is_known_language_family(Language::Rust));
-        assert!(!is_known_language_family(Language::Go));
+    fn code_boundary_covers_singleton_families_and_leaves_config_open() {
+        // Two different code families cross.
+        assert!(crosses_code_boundary(Language::Java, Language::Swift));
+        assert!(crosses_code_boundary(Language::Rust, Language::TypeScript));
+        assert!(crosses_code_boundary(Language::Python, Language::Go));
+        // One family (or one language) does not.
+        assert!(!crosses_code_boundary(Language::Java, Language::Kotlin));
+        assert!(!crosses_code_boundary(Language::Lua, Language::Luau));
+        assert!(!crosses_code_boundary(Language::Rust, Language::Rust));
+        // Config and markup transitions stay open.
+        assert!(!crosses_code_boundary(Language::Yaml, Language::Php));
+        assert!(!crosses_code_boundary(
+            Language::TypeScript,
+            Language::Liquid
+        ));
+    }
 
-        // crosses_known_family: both known + different family.
-        assert!(crosses_known_family(Language::Java, Language::Swift));
-        // same family => does not cross.
-        assert!(!crosses_known_family(Language::Java, Language::Kotlin));
-        // one unknown => does not cross.
-        assert!(!crosses_known_family(Language::Rust, Language::Java));
-        assert!(!crosses_known_family(Language::Java, Language::Rust));
+    #[test]
+    fn cross_family_results_need_bridge_evidence() {
+        let ts_method = mk(
+            "method:Adapter::map",
+            NodeKind::Method,
+            "map",
+            "Adapter::map",
+            "ui/adapter.ts",
+            Language::TypeScript,
+        );
+        let rust_call = refv("map", EdgeKind::Calls, "src/lib.rs", Language::Rust, 1);
+        let ctx = Ctx::default().node_by_id(ts_method.clone());
+        let chosen = || {
+            Some(ResolvedRef {
+                original: rust_call.clone(),
+                target_node_id: ts_method.id.clone(),
+                confidence: 0.5,
+                resolved_by: ResolvedBy::ExactMatch,
+            })
+        };
+        assert!(
+            gate_language_match(chosen(), &rust_call, &ctx).is_none(),
+            "`v.iter().map()` never reaches TS"
+        );
+
+        let exported = {
+            let mut node = mk(
+                "function:add",
+                NodeKind::Function,
+                "add",
+                "add",
+                "go/lib.go",
+                Language::Go,
+            );
+            node.start_line = 4;
+            node.end_line = 4;
+            node
+        };
+        let c_call = refv("add", EdgeKind::Calls, "native/main.c", Language::C, 1);
+        let cgo = Ctx::default()
+            .node_by_id(exported.clone())
+            .file("go/lib.go", "package main\nimport \"C\"\n//export add\nfunc add(a, b C.int) C.int { return a + b }\n");
+        let via_cgo = Some(ResolvedRef {
+            original: c_call.clone(),
+            target_node_id: exported.id.clone(),
+            confidence: 0.5,
+            resolved_by: ResolvedBy::ExactMatch,
+        });
+        assert!(
+            gate_language_match(via_cgo, &c_call, &cgo).is_some(),
+            "a cgo //export is a C ABI bridge"
+        );
     }
 
     #[test]
@@ -3217,43 +4940,6 @@ mod tests {
         let out = apply_language_gate(vec![same.clone(), cross], &r);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].id, "function:a");
-    }
-
-    #[test]
-    fn language_gate_imports_drops_only_cross_known_family() {
-        // Imports edge: only candidates that CROSS a known family are dropped;
-        // an unknown-family candidate (Rust vs TS) is KEPT.
-        let same = mk(
-            "function:a",
-            NodeKind::Function,
-            "f",
-            "f",
-            "src/a.ts",
-            Language::TypeScript,
-        );
-        let cross = mk(
-            "function:b",
-            NodeKind::Function,
-            "f",
-            "f",
-            "src/b.java",
-            Language::Java,
-        );
-        let unknown = mk(
-            "function:c",
-            NodeKind::Function,
-            "f",
-            "f",
-            "src/c.rs",
-            Language::Rust,
-        );
-        let r = refv("f", EdgeKind::Imports, "src/x.ts", Language::TypeScript, 1);
-        let out = apply_language_gate(vec![same, cross, unknown], &r);
-        // TS kept (same family), Java dropped (crosses web↔jvm), Rust kept (unknown family).
-        let ids: Vec<&str> = out.iter().map(|n| n.id.as_str()).collect();
-        assert!(ids.contains(&"function:a"));
-        assert!(ids.contains(&"function:c"));
-        assert!(!ids.contains(&"function:b"));
     }
 
     #[test]
@@ -3777,6 +5463,93 @@ mod tests {
     }
 
     #[test]
+    fn js_builtin_methods_are_sorted_for_binary_search() {
+        assert!(JS_BUILTIN_METHODS.windows(2).all(|pair| pair[0] < pair[1]));
+        for name in ["map", "get", "then", "addEventListener", "return", "with"] {
+            assert!(is_js_builtin_method(name), "{name}");
+        }
+        for name in ["send", "run", "Map", "mapAll"] {
+            assert!(!is_js_builtin_method(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn private_this_field_calls_split_only_the_exact_shape() {
+        assert_eq!(
+            split_private_this_field_call("this.#items.add"),
+            Some(("#items", "add"))
+        );
+        assert_eq!(
+            split_private_this_field_call("this.#$store.get"),
+            Some(("#$store", "get"))
+        );
+        for name in [
+            "this.items.add",
+            "this.#.add",
+            "this.#items",
+            "this.#a.b.c",
+            "that.#items.add",
+            "this.#items.a-b",
+        ] {
+            assert_eq!(split_private_this_field_call(name), None, "{name}");
+        }
+    }
+
+    #[test]
+    fn ts_field_declarations_keep_public_and_private_names_apart() {
+        let declared = |line: &str, field: &str, this_only: bool| {
+            ts_field_on_line(line, field, this_only)
+                .map(|found| (found.value_type, found.type_name))
+        };
+        assert_eq!(
+            declared("  #items = new Set<string>();", "#items", false),
+            Some((false, "Set".to_string()))
+        );
+        assert_eq!(declared("  #items = new Set();", "items", false), None);
+        assert_eq!(declared("  items = new Cart();", "#items", false), None);
+        assert_eq!(
+            declared("  private readonly mailer?: ns.Mailer;", "mailer", false),
+            Some((false, "ns.Mailer".to_string()))
+        );
+        assert_eq!(
+            declared("  storage: typeof DraftHubStorage;", "storage", false),
+            Some((true, "DraftHubStorage".to_string()))
+        );
+        assert_eq!(declared("  mailerX: Decoy;", "mailer", false), None);
+        assert_eq!(
+            declared("  users$: Observable<User>;", "users$", false),
+            Some((false, "Observable".to_string()))
+        );
+        // Inside a method body only a `this.<field>` assignment counts.
+        assert_eq!(
+            declared(
+                "  constructor() { this.mailer = new Mailer(); }",
+                "mailer",
+                true
+            ),
+            Some((false, "Mailer".to_string()))
+        );
+        assert_eq!(
+            declared("  run() { const mailer = new Decoy(); }", "mailer", true),
+            None
+        );
+        assert_eq!(
+            declared("  run() { xthis.mailer = new Decoy(); }", "mailer", true),
+            None
+        );
+    }
+
+    #[test]
+    fn parameter_properties_need_a_modifier_before_the_exact_name() {
+        let line = "  constructor(private readonly mailer: Mailer, other: X, public items: Y) {}";
+        assert!(declares_parameter_property(line, "mailer"));
+        assert!(declares_parameter_property(line, "items"));
+        assert!(!declares_parameter_property(line, "other"));
+        assert!(!declares_parameter_property(line, "mail"));
+        assert!(!declares_parameter_property(line, "#mailer"));
+    }
+
+    #[test]
     fn parse_method_call_prefers_dot_then_colon() {
         assert_eq!(
             parse_method_call("obj.m", Language::TypeScript),
@@ -3919,6 +5692,130 @@ mod tests {
         assert_eq!(resolved.target_node_id, "method:inner-run");
         assert_eq!(resolved.resolved_by, ResolvedBy::InstanceMethod);
         assert!((resolved.confidence - 0.85).abs() < 1e-9);
+    }
+
+    #[test]
+    fn arkts_import_only_module_is_sealed_across_files() {
+        let candidate = mk(
+            "function:hidden",
+            NodeKind::Function,
+            "hidden",
+            "hidden",
+            "src/private.ets",
+            Language::ArkTs,
+        );
+        let reference = refv(
+            "hidden",
+            EdgeKind::Calls,
+            "src/consumer.ets",
+            Language::ArkTs,
+            1,
+        );
+        let context = Ctx::default().file(
+            "src/private.ets",
+            "import { fs } from '@ohos.file.fs';\nfunction hidden() { return fs; }\n",
+        );
+
+        assert!(
+            !is_js_name_target_visible(&candidate, &reference, &context),
+            "ArkTS shares the ESM sealed-module boundary"
+        );
+    }
+
+    #[test]
+    fn rust_self_call_uses_the_callers_impl_owner_and_declines_uncertainty() {
+        let caller = mk(
+            "method:target-run",
+            NodeKind::Method,
+            "run",
+            "Target::run",
+            "src/target.rs",
+            Language::Rust,
+        );
+        let target = mk(
+            "method:target-reset",
+            NodeKind::Method,
+            "reset",
+            "Target::reset",
+            "src/target.rs",
+            Language::Rust,
+        );
+        let decoy = mk(
+            "method:decoy-reset",
+            NodeKind::Method,
+            "reset",
+            "Decoy::reset",
+            "src/target.rs",
+            Language::Rust,
+        );
+        let unrelated_missing = mk(
+            "method:other-missing",
+            NodeKind::Method,
+            "missing",
+            "Other::missing",
+            "src/other.rs",
+            Language::Rust,
+        );
+        let ctx = Ctx::default()
+            .node_by_id(caller)
+            .name("reset", vec![decoy, target])
+            .name("missing", vec![unrelated_missing]);
+        let mut reference = refv(
+            "self.reset",
+            EdgeKind::Calls,
+            "src/target.rs",
+            Language::Rust,
+            40,
+        );
+        reference.from_node_id = "method:target-run".to_string();
+
+        let resolved = match_method_call(&reference, &ctx).expect("owner-qualified method");
+        assert_eq!(resolved.target_node_id, "method:target-reset");
+        assert_eq!(resolved.resolved_by, ResolvedBy::QualifiedName);
+        assert!((resolved.confidence - 0.9).abs() < f64::EPSILON);
+
+        reference.reference_name = "self.missing".to_string();
+        assert!(
+            match_method_call(&reference, &ctx).is_none(),
+            "a method absent from the enclosing type must not bind to another type"
+        );
+
+        let duplicate = mk(
+            "method:target-reset-duplicate",
+            NodeKind::Method,
+            "reset",
+            "Target::reset",
+            "src/target.rs",
+            Language::Rust,
+        );
+        let ambiguous = Ctx::default()
+            .node_by_id(mk(
+                "method:target-run",
+                NodeKind::Method,
+                "run",
+                "Target::run",
+                "src/target.rs",
+                Language::Rust,
+            ))
+            .name(
+                "reset",
+                vec![
+                    mk(
+                        "method:target-reset",
+                        NodeKind::Method,
+                        "reset",
+                        "Target::reset",
+                        "src/target.rs",
+                        Language::Rust,
+                    ),
+                    duplicate,
+                ],
+            );
+        reference.reference_name = "self.reset".to_string();
+        assert!(
+            match_method_call(&reference, &ambiguous).is_none(),
+            "two owner-qualified candidates must remain unresolved"
+        );
     }
 
     #[test]
@@ -8554,5 +10451,583 @@ mod tests {
         );
         let res = match_by_exact_name(&r, &ctx).expect("type alias is a legal supertype");
         assert_eq!(res.target_node_id, "type_alias:Shape");
+    }
+
+    // ================= v1.6.1 gate ports ======================================
+
+    fn at_column(
+        name: &str,
+        kind: EdgeKind,
+        path: &str,
+        lang: Language,
+        line: i64,
+        column: i64,
+    ) -> RefView {
+        let mut reference = refv(name, kind, path, lang, line);
+        reference.column = column;
+        reference
+    }
+
+    #[test]
+    fn receiver_less_call_reads_the_call_site_line() {
+        let source = "serialize(x);\nthis.serialize(x);\n  return helper();\nobj.helper();\nx = helper ();\nfinish\n  ();\nnew Foo();\nxreturn helper();\n";
+        let ctx = Ctx::default().file("a.ts", source);
+        let bare = |name: &str, line: i64, column: i64| {
+            is_bare_js_call(
+                &at_column(
+                    name,
+                    EdgeKind::Calls,
+                    "a.ts",
+                    Language::TypeScript,
+                    line,
+                    column,
+                ),
+                &ctx,
+            )
+        };
+        assert!(bare("serialize", 1, 0));
+        assert!(!bare("serialize", 2, 5), "this.serialize has a receiver");
+        assert!(bare("helper", 3, 9), "a keyword opens an expression");
+        assert!(!bare("helper", 4, 4), "obj.helper has a receiver");
+        assert!(bare("helper", 5, 4), "an operator precedes a bare call");
+        assert!(bare("finish", 6, 0), "ASI never splits `finish\\n()`");
+        assert!(bare("Foo", 8, 4), "`new` is a bare-call keyword");
+        assert!(
+            !bare("helper", 9, 8),
+            "a word that merely ends in a keyword is not one"
+        );
+        assert!(
+            !bare("serialize", 1, 1),
+            "the name must start at the column"
+        );
+        // Go shares the check, with its own statement keywords.
+        let go = Ctx::default().file("m.go", "\tgo work()\n\tp.work()\n");
+        assert!(is_bare_go_call(
+            &at_column("work", EdgeKind::Calls, "m.go", Language::Go, 1, 4),
+            &go
+        ));
+        assert!(!is_bare_go_call(
+            &at_column("work", EdgeKind::Calls, "m.go", Language::Go, 2, 3),
+            &go
+        ));
+        // Only `calls` refs, and only the owning language family.
+        assert!(!is_bare_js_call(
+            &at_column(
+                "serialize",
+                EdgeKind::References,
+                "a.ts",
+                Language::TypeScript,
+                1,
+                0
+            ),
+            &ctx
+        ));
+        assert!(!is_bare_go_call(
+            &at_column(
+                "serialize",
+                EdgeKind::Calls,
+                "a.ts",
+                Language::TypeScript,
+                1,
+                0
+            ),
+            &ctx
+        ));
+    }
+
+    // ====== KEEP-RUST P15 — Rust calls that lost their receiver ======
+
+    #[test]
+    fn rust_call_shape_reads_bare_and_dropped_receiver_calls() {
+        let source = "    join(x);\n    parse::<u8>(s);\n    root().join(x);\n    root()\n        .join(x);\n    joined(x);\n    root().joined(x);\n    0..len();\n    root().collect::<Vec<_>>(x);\n";
+        let ctx = Ctx::default().file("src/a.rs", source);
+        let shape = |name: &str, line: i64, column: i64| {
+            rust_call_shape(
+                &at_column(
+                    name,
+                    EdgeKind::Calls,
+                    "src/a.rs",
+                    Language::Rust,
+                    line,
+                    column,
+                ),
+                &ctx,
+            )
+        };
+        assert_eq!(shape("join", 1, 4), Some(RustCallShape::Bare));
+        assert_eq!(
+            shape("parse", 2, 4),
+            Some(RustCallShape::Bare),
+            "a turbofish still opens a bare call"
+        );
+        assert_eq!(
+            shape("join", 3, 4),
+            Some(RustCallShape::Method),
+            "root().join dropped its receiver"
+        );
+        assert_eq!(
+            shape("join", 4, 4),
+            Some(RustCallShape::Method),
+            "the `.join(` may sit on a later line"
+        );
+        assert_eq!(shape("join", 6, 4), None, "`joined(` is another name");
+        assert_eq!(shape("join", 7, 4), None, "`.joined(` is not `.join(`");
+        assert_eq!(
+            shape("len", 8, 7),
+            Some(RustCallShape::Bare),
+            "a range end is a bare call"
+        );
+        assert_eq!(
+            shape("collect", 9, 4),
+            Some(RustCallShape::Method),
+            "a turbofish after a dropped receiver"
+        );
+        assert_eq!(shape("join", 1, 400), None, "a column past the line end");
+        assert_eq!(shape("join", 99, 0), None, "a line past the file end");
+        // Only Rust `calls` refs whose name has no `.` / `::`, and only with source.
+        let unknown = |name: &str, kind: EdgeKind, path: &str, lang: Language| {
+            rust_call_shape(&at_column(name, kind, path, lang, 1, 4), &ctx)
+        };
+        assert_eq!(
+            unknown("join", EdgeKind::References, "src/a.rs", Language::Rust),
+            None
+        );
+        assert_eq!(
+            unknown("p.join", EdgeKind::Calls, "src/a.rs", Language::Rust),
+            None
+        );
+        assert_eq!(
+            unknown("a::join", EdgeKind::Calls, "src/a.rs", Language::Rust),
+            None
+        );
+        assert_eq!(
+            unknown("join", EdgeKind::Calls, "src/missing.rs", Language::Rust),
+            None
+        );
+        assert_eq!(
+            unknown("join", EdgeKind::Calls, "src/a.rs", Language::TypeScript),
+            None
+        );
+    }
+
+    #[test]
+    fn rust_receiver_gates_narrow_exact_name_candidates() {
+        let source = "fn f() {\n    root().join(x);\n    store().nodes_by_ids(x);\n    helper();\n    root().build();\n    Err(1);\n}\n";
+        let method = |name: &str, qualified: &str| {
+            mk(
+                &format!("method:{name}"),
+                NodeKind::Method,
+                name,
+                qualified,
+                "src/lib.rs",
+                Language::Rust,
+            )
+        };
+        let function = |name: &str| {
+            mk(
+                &format!("function:{name}"),
+                NodeKind::Function,
+                name,
+                name,
+                "src/util.rs",
+                Language::Rust,
+            )
+        };
+        let at = |name: &str, line: i64| {
+            at_column(name, EdgeKind::Calls, "src/a.rs", Language::Rust, line, 4)
+        };
+        let target = |reference: &RefView, ctx: &Ctx| {
+            match_by_exact_name(reference, ctx).map(|r| r.target_node_id)
+        };
+
+        // R3: a lone project method sharing a std method's name binds nothing.
+        let ctx = Ctx::default()
+            .file("src/a.rs", source)
+            .name("join", vec![method("join", "LineIndex::join")]);
+        assert_eq!(target(&at("join", 2), &ctx), None);
+        // R2: a project-specific name binds its lone method, never a free function.
+        let ctx = Ctx::default().file("src/a.rs", source).name(
+            "nodes_by_ids",
+            vec![method("nodes_by_ids", "Store::nodes_by_ids")],
+        );
+        assert_eq!(
+            target(&at("nodes_by_ids", 3), &ctx).as_deref(),
+            Some("method:nodes_by_ids")
+        );
+        let ctx = Ctx::default()
+            .file("src/a.rs", source)
+            .name("build", vec![function("build")]);
+        assert_eq!(target(&at("build", 5), &ctx), None);
+        // R1: a bare call binds the free fn, and never a method.
+        let ctx = Ctx::default().file("src/a.rs", source).name(
+            "helper",
+            vec![method("helper", "Store::helper"), function("helper")],
+        );
+        assert_eq!(
+            target(&at("helper", 4), &ctx).as_deref(),
+            Some("function:helper")
+        );
+        let ctx = Ctx::default()
+            .file("src/a.rs", source)
+            .name("helper", vec![method("helper", "Store::helper")]);
+        assert_eq!(target(&at("helper", 4), &ctx), None);
+        // R4: a bare `Err` is the prelude's unless a `use` in scope imports one.
+        let variant = mk(
+            "enum_member:Err",
+            NodeKind::EnumMember,
+            "Err",
+            "Outcome::Err",
+            "src/outcome.rs",
+            Language::Rust,
+        );
+        let ctx = Ctx::default()
+            .file("src/a.rs", source)
+            .name("Err", vec![variant.clone()]);
+        assert_eq!(target(&at("Err", 6), &ctx), None);
+        let imported = format!("use crate::outcome::Outcome::Err;\n{source}");
+        let ctx = Ctx::default()
+            .file("src/a.rs", &imported)
+            .name("Err", vec![variant]);
+        assert_eq!(
+            target(&at("Err", 7), &ctx).as_deref(),
+            Some("enum_member:Err")
+        );
+        // No source: the shape is unknown and today's binding stands.
+        let ctx = Ctx::default().name("join", vec![method("join", "LineIndex::join")]);
+        assert_eq!(target(&at("join", 2), &ctx).as_deref(), Some("method:join"));
+    }
+
+    #[test]
+    fn rust_receiver_gates_close_the_fuzzy_fallback() {
+        // Fuzzy matching is case-insensitive, so `Join` / `Helper` are its only
+        // candidates for `join` / `helper`; the shapes still gate them.
+        let source = "fn f() {\n    root().join(x);\n    helper(x);\n}\n";
+        let lone = |name: &str, kind: NodeKind| {
+            vec![mk(
+                &format!("{kind:?}:{name}"),
+                kind,
+                name,
+                name,
+                "src/x.rs",
+                Language::Rust,
+            )]
+        };
+        let fuzzy = |name: &str, line: i64, ctx: &Ctx| {
+            match_fuzzy(
+                &at_column(name, EdgeKind::Calls, "src/a.rs", Language::Rust, line, 4),
+                ctx,
+            )
+        };
+        let ctx = Ctx::default()
+            .file("src/a.rs", source)
+            .lower("join", lone("Join", NodeKind::Method));
+        assert!(
+            fuzzy("join", 2, &ctx).is_none(),
+            "a dropped receiver takes no fuzzy guess"
+        );
+        let ctx = Ctx::default()
+            .file("src/a.rs", source)
+            .lower("helper", lone("Helper", NodeKind::Method));
+        assert!(
+            fuzzy("helper", 3, &ctx).is_none(),
+            "a bare call never reaches a method"
+        );
+        let ctx = Ctx::default()
+            .file("src/a.rs", source)
+            .lower("helper", lone("Helper", NodeKind::Function));
+        assert!(
+            fuzzy("helper", 3, &ctx).is_some(),
+            "a bare call may still reach a function"
+        );
+    }
+
+    #[test]
+    fn rust_std_methods_are_sorted_and_unique() {
+        assert!(RUST_STD_METHODS.windows(2).all(|pair| pair[0] < pair[1]));
+        for name in [
+            "join",
+            "iter",
+            "as_str",
+            "is_empty",
+            "take",
+            "get_or_init",
+            "open",
+            "path",
+        ] {
+            assert!(is_rust_std_method(name), "{name}");
+        }
+        for name in ["nodes_by_ids", "current_db", "downgrade", "json"] {
+            assert!(!is_rust_std_method(name), "{name}");
+        }
+    }
+
+    #[test]
+    fn binding_sites_agree_with_the_full_search_for_plain_names() {
+        let sources = [
+            "const helper = 1;\nhelper();",
+            "let { a, helper } = obj;\n",
+            "var [x, helper] = arr;",
+            "const { helper } = require('./m');\nhelper();",
+            "const helper = await import('./m');",
+            "const t = await helper();",
+            "function helper() {}\n",
+            "class helper {}\n",
+            "function f(a, helper = 1, ...rest) { return helper; }",
+            "const g = (x, helper) => helper(x);",
+            "items.map(helper => helper.id);",
+            "const h = (name: string = \"helper\") => name;",
+            "call(\"helper\");\nhelper();",
+            "obj.helper => 1;",
+            "function helperish() {}\nconst helperX = 1;",
+            "export const $helper = 1;",
+            "const a = 1; const helper = require('./x'); const helper = 2;",
+            "function f(\n  a: number,\n  helper?: string,\n) {}",
+        ];
+        for source in sources {
+            let facts = SourceFacts::new(Arc::from(source));
+            for name in ["helper", "$helper", "a", "helperish", "name"] {
+                assert_eq!(
+                    binds_at_sites(&facts, name),
+                    binds_anywhere(source, name),
+                    "{name:?} in {source:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn local_binding_exempts_import_initialisers() {
+        let ctx = Ctx::default()
+            .file("a.js", "const { run } = require('./m');\nrun();\n")
+            .file("b.js", "const run = makeRunner();\nrun();\n")
+            .file("c.js", "function go(run) { run(); }\n");
+        assert!(!is_locally_bound_js_name("run", "a.js", &ctx));
+        assert!(is_locally_bound_js_name("run", "b.js", &ctx));
+        assert!(is_locally_bound_js_name("run", "c.js", &ctx));
+        assert!(!is_locally_bound_js_name("run", "missing.js", &ctx));
+    }
+
+    #[test]
+    fn sealed_module_reads_code_not_literals() {
+        let exported = {
+            let mut node = mk(
+                "function:x",
+                NodeKind::Function,
+                "x",
+                "x",
+                "exported.js",
+                Language::JavaScript,
+            );
+            node.is_exported = true;
+            node
+        };
+        let ctx = Ctx::default()
+            .file(
+                "template.js",
+                "const t = `\nimport fake from \"fake\";\n`;\nfunction globalFn() {}\n",
+            )
+            .file(
+                "sealed.js",
+                "import fs from 'node:fs';\nfunction hidden() { return fs; }\n",
+            )
+            .file(
+                "common.js",
+                "import os from 'node:os';\nmodule.exports = { helper };\n",
+            )
+            .file(
+                "comment.js",
+                "// import x from 'y';\nfunction classic() {}\n",
+            )
+            .file("exported.js", "import a from './a';\nfunction x() {}\n")
+            .file(
+                "ambient.ts",
+                "import a from './a';\ndeclare global { interface W {} }\n",
+            )
+            .nodes_in_file("exported.js", vec![exported]);
+        assert!(
+            !is_sealed_js_module("template.js", &ctx),
+            "a template spelling import is data"
+        );
+        assert!(is_sealed_js_module("sealed.js", &ctx));
+        assert!(
+            !is_sealed_js_module("common.js", &ctx),
+            "CommonJS exports stay visible"
+        );
+        assert!(
+            !is_sealed_js_module("comment.js", &ctx),
+            "a commented import is not a module marker"
+        );
+        assert!(
+            !is_sealed_js_module("exported.js", &ctx),
+            "an exported node needs no text scan"
+        );
+        assert!(
+            !is_sealed_js_module("ambient.ts", &ctx),
+            "declare global is an export"
+        );
+        assert!(!is_sealed_js_module("missing.js", &ctx));
+    }
+
+    #[test]
+    fn json_require_constant_is_not_a_call_target() {
+        let mut data = mk(
+            "constant:data",
+            NodeKind::Constant,
+            "data",
+            "data",
+            "cfg.js",
+            Language::JavaScript,
+        );
+        data.signature = Some("= require('./data.json');".to_string());
+        let mut plain = data.clone();
+        plain.signature = Some("= require('./data');".to_string());
+        let ctx = Ctx::default().file(
+            "cfg.js",
+            "const data = require('./data.json');\nmodule.exports = { data };\n",
+        );
+        let call = refv("data", EdgeKind::Calls, "use.js", Language::JavaScript, 1);
+        assert!(!is_js_name_target_visible(&data, &call, &ctx));
+        assert!(is_js_name_target_visible(&plain, &call, &ctx));
+        let value = refv(
+            "data",
+            EdgeKind::References,
+            "use.js",
+            Language::JavaScript,
+            1,
+        );
+        assert!(
+            is_js_name_target_visible(&data, &value, &ctx),
+            "only calls are rejected"
+        );
+    }
+
+    #[test]
+    fn fuzzy_judges_the_survivor_instead_of_filtering_the_crowd() {
+        let method = mk(
+            "method:Other::save",
+            NodeKind::Method,
+            "save",
+            "Other::save",
+            "other.ts",
+            Language::TypeScript,
+        );
+        let function = mk(
+            "function:save",
+            NodeKind::Function,
+            "save",
+            "save",
+            "lib.ts",
+            Language::TypeScript,
+        );
+        let ctx = Ctx::default()
+            .file("a.ts", "save();\n")
+            .lower("save", vec![method.clone(), function.clone()]);
+        let reference = at_column("save", EdgeKind::Calls, "a.ts", Language::TypeScript, 1, 0);
+        assert!(
+            match_fuzzy(&reference, &ctx).is_none(),
+            "two candidates stay ambiguous even though one is a method"
+        );
+        let lone_method = Ctx::default()
+            .file("a.ts", "save();\n")
+            .lower("save", vec![method]);
+        assert!(
+            match_fuzzy(&reference, &lone_method).is_none(),
+            "a bare call never reaches a method"
+        );
+        let lone_function = Ctx::default()
+            .file("a.ts", "save();\n")
+            .lower("save", vec![function]);
+        assert_eq!(
+            match_fuzzy(&reference, &lone_function).map(|r| r.target_node_id),
+            Some("function:save".to_string())
+        );
+    }
+
+    #[test]
+    fn fuzzy_declines_a_closure_but_c_nesting_stays_reachable() {
+        let mut inner = mk(
+            "function:outer::inner",
+            NodeKind::Function,
+            "inner",
+            "outer::inner",
+            "lib.js",
+            Language::JavaScript,
+        );
+        inner.start_line = 2;
+        inner.end_line = 3;
+        let mut outer = mk(
+            "function:outer",
+            NodeKind::Function,
+            "outer",
+            "outer",
+            "lib.js",
+            Language::JavaScript,
+        );
+        outer.start_line = 1;
+        outer.end_line = 4;
+        let ctx = Ctx::default()
+            .file("use.js", "x.inner();\n")
+            .lower("inner", vec![inner.clone()])
+            .qualified("outer", vec![outer.clone()]);
+        let reference = at_column(
+            "inner",
+            EdgeKind::Calls,
+            "use.js",
+            Language::JavaScript,
+            1,
+            2,
+        );
+        assert!(
+            match_fuzzy(&reference, &ctx).is_none(),
+            "#1708: a closure is not reachable"
+        );
+
+        let mut c_inner = inner;
+        c_inner.language = Language::C;
+        c_inner.file_path = "pid.c".to_string();
+        let mut c_outer = outer;
+        c_outer.language = Language::C;
+        c_outer.file_path = "pid.c".to_string();
+        let c_ctx = Ctx::default()
+            .file("main.c", "inner();\n")
+            .lower("inner", vec![c_inner])
+            .qualified("outer", vec![c_outer]);
+        let c_reference = at_column("inner", EdgeKind::Calls, "main.c", Language::C, 1, 0);
+        assert!(
+            match_fuzzy(&c_reference, &c_ctx).is_some(),
+            "C has no nested functions"
+        );
+    }
+
+    #[test]
+    fn exact_match_keeps_bare_go_calls_off_methods() {
+        let method = mk(
+            "method:T::run",
+            NodeKind::Method,
+            "run",
+            "T::run",
+            "t.go",
+            Language::Go,
+        );
+        let function = mk(
+            "function:run",
+            NodeKind::Function,
+            "run",
+            "run",
+            "run.go",
+            Language::Go,
+        );
+        let ctx = Ctx::default()
+            .file("main.go", "\trun()\n\tt.run()\n")
+            .name("run", vec![method.clone(), function]);
+        let bare = at_column("run", EdgeKind::Calls, "main.go", Language::Go, 1, 1);
+        assert_eq!(
+            match_by_exact_name(&bare, &ctx).map(|r| r.target_node_id),
+            Some("function:run".to_string())
+        );
+        let only_method = Ctx::default()
+            .file("main.go", "\trun()\n")
+            .name("run", vec![method]);
+        assert!(match_by_exact_name(&bare, &only_method).is_none());
     }
 }

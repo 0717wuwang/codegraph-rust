@@ -7,24 +7,31 @@
 //! `FrameworkResolver` extension point and callback synthesis) is deferred to v1
 //! follow-ups — see `KNOWN_DIFFS.md`. Resolution is synchronous (rusqlite).
 
+use crate::alias_binding::resolve_alias_binding;
 use crate::framework::FrameworkResolver;
 use crate::import_resolver::{
-    is_bound_to_out_of_repo_module, is_php_include_path_ref, python_module_member_is_claimed,
-    resolve_jvm_import, resolve_via_import,
+    PhpImportedStaticCallResolution, is_bound_to_out_of_repo_module, is_php_include_path_ref,
+    python_module_member_is_claimed, resolve_jvm_import, resolve_php_imported_static_call,
+    resolve_via_import,
 };
 use crate::name_matcher::{
-    crosses_known_family, is_php_property_receiver_shape, is_python_class_function_ref_target,
-    match_dotted_call_chain, match_function_ref, match_method_call, match_reference,
-    match_scoped_call_chain, same_language_family,
+    crosses_code_boundary, gate_language_match, is_js_name_target_visible,
+    is_php_property_receiver_shape, is_python_class_function_ref_target, match_dotted_call_chain,
+    match_function_ref, match_method_call, match_reference, match_scoped_call_chain,
+    same_language_family,
 };
 use crate::snapshot_context::{SnapshotResolutionContext, build_edge_adjacency};
+use crate::source_facts::SourceFacts;
+use crate::strip_comments::{CommentLang, strip_comments_for_regex};
 use crate::types::{
     RefView, ResolutionContext, ResolutionResult, ResolutionStats, ResolvedBy, ResolvedRef,
 };
 use codegraph_core::types::{Edge, EdgeKind, Language, Node, NodeKind, UnresolvedRef};
+use codegraph_extract::lang::{cpp_constructor_shape, parse_cpp_constructor_reference_name};
 use codegraph_store::Store;
 use codegraph_store::queries::ReferenceSite;
 use rayon::prelude::*;
+use regex::Regex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, OnceLock};
 
@@ -64,6 +71,45 @@ fn is_scoped_chain_language(language: Language) -> bool {
     language == Language::Rust
 }
 
+/// A TS/JS/Python call whose receiver is itself a call, encoded
+/// `<inner>().<method>` (#1683): nothing proves what the inner call returns.
+fn is_call_result_chain(reference: &RefView) -> bool {
+    reference.reference_kind == EdgeKind::Calls
+        && matches!(
+            reference.language,
+            Language::TypeScript
+                | Language::Tsx
+                | Language::JavaScript
+                | Language::Jsx
+                | Language::Python
+        )
+        && reference.reference_name.contains("().")
+}
+
+/// A retained untyped TS/JS member chain — `holder.values.get`, three or more
+/// plain segments not rooted at `this`/`window` (upstream v1.6.1
+/// `isUnresolvedJsMemberCall`, #1862). It is call-site evidence, not
+/// permission to infer a property type: only a framework resolver may bind it.
+fn is_unresolved_js_member_call(reference: &RefView) -> bool {
+    fn is_segment(segment: &str) -> bool {
+        let mut chars = segment.chars();
+        chars
+            .next()
+            .is_some_and(|ch| ch.is_ascii_alphabetic() || matches!(ch, '_' | '$'))
+            && chars.all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$'))
+    }
+    let name = reference.reference_name.as_str();
+    reference.reference_kind == EdgeKind::Calls
+        && matches!(
+            reference.language,
+            Language::TypeScript | Language::Tsx | Language::JavaScript | Language::Jsx
+        )
+        && !name.starts_with("this.")
+        && !name.starts_with("window.")
+        && name.split('.').count() >= 3
+        && name.split('.').all(is_segment)
+}
+
 /// The extractor's chained-receiver encoding `<inner>().<method>`
 /// (`CHAIN_SHAPE`, `index.ts:44`).
 fn has_chain_shape(name: &str) -> bool {
@@ -75,6 +121,216 @@ fn has_chain_shape(name: &str) -> bool {
     !inner.is_empty()
         && !method.is_empty()
         && method.chars().all(|c| c.is_alphanumeric() || c == '_')
+}
+
+/// Whether a constructor signature names `initializer_list` as a whole word.
+fn mentions_initializer_list(signature: &str) -> bool {
+    let bytes = signature.as_bytes();
+    signature
+        .match_indices("initializer_list")
+        .any(|(start, word)| {
+            let end = start + word.len();
+            (start == 0 || !(bytes[start - 1].is_ascii_alphanumeric() || bytes[start - 1] == b'_'))
+                && bytes
+                    .get(end)
+                    .is_none_or(|byte| !(byte.is_ascii_alphanumeric() || *byte == b'_'))
+        })
+}
+
+/// Whether the FIRST parameter of a constructor signature (`(a, b)` or a
+/// prototype's `(a, b);`) names `initializer_list`.
+fn first_parameter_mentions_initializer_list(signature: &str) -> bool {
+    let Some(open) = signature.find('(') else {
+        return false;
+    };
+    let mut depth = 0usize;
+    for (offset, byte) in signature[open + 1..].bytes().enumerate() {
+        match byte {
+            b'(' | b'<' | b'[' | b'{' => depth += 1,
+            b')' if depth == 0 => {
+                return mentions_initializer_list(&signature[open + 1..open + 1 + offset]);
+            }
+            b',' if depth == 0 => {
+                return mentions_initializer_list(&signature[open + 1..open + 1 + offset]);
+            }
+            b')' | b'>' | b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    false
+}
+
+/// Whether the C++ construction `reference` anchors is `T x(<literal>, …)`:
+/// the anchor is the `(` of the initializer, its balanced argument text holds
+/// no `{` (a braced list, or a lambda body, could be or build an
+/// initializer_list), and the first argument is a literal — numeric,
+/// character, string, `true`, `false` or `nullptr`. Such an argument can never
+/// be, or convert to, a `std::initializer_list`.
+fn paren_construction_from_a_literal(reference: &RefView, context: &dyn ResolutionContext) -> bool {
+    static LITERAL: OnceLock<Regex> = OnceLock::new();
+    let literal = LITERAL.get_or_init(|| {
+        Regex::new(concat!(
+            r"^(?:true|false|nullptr",
+            r"|[-+]?(?:0[xX][0-9a-fA-F']+|0[bB][01']+",
+            r"|[0-9][0-9']*(?:\.[0-9']*)?(?:[eE][-+]?[0-9']+)?",
+            r"|\.[0-9][0-9']*(?:[eE][-+]?[0-9']+)?)[uUlLfFzZ]*",
+            r#"|(?:u8|u|U|L)?'(?:\\.|[^'\\])+'"#,
+            r#"|(?:u8|u|U|L)?"(?:\\.|[^"\\])*")$"#,
+        ))
+        .expect("C++ literal pattern")
+    });
+    let Some(facts) = context.source_facts(&reference.file_path) else {
+        return false;
+    };
+    let (Some(line), Ok(column)) = (
+        usize::try_from(reference.line)
+            .ok()
+            .and_then(|line| line.checked_sub(1)),
+        usize::try_from(reference.column),
+    ) else {
+        return false;
+    };
+    let Some(start) = facts.lines().raw_line_start(line) else {
+        return false;
+    };
+    let source = facts.source();
+    let Some(text) = source.get(start + column..) else {
+        return false;
+    };
+    let Some(arguments) = cpp_paren_arguments(text) else {
+        return false;
+    };
+    literal.is_match(first_cpp_argument(arguments).trim())
+}
+
+/// The text inside the balanced `( … )` that `text` opens, or `None` when it
+/// does not open one, never closes, or holds a `{` outside quotes and
+/// comments.
+fn cpp_paren_arguments(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    if bytes.first() != Some(&b'(') {
+        return None;
+    }
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => i = skip_cpp_quoted(bytes, i, b'"'),
+            // A digit separator (`1'000`) follows a word character.
+            b'\'' if i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') => {
+                i = skip_cpp_quoted(bytes, i, b'\'');
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                i = text[i..].find('\n').map_or(bytes.len(), |end| i + end);
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i = text[i + 2..].find("*/").map(|end| i + 2 + end + 2)?;
+            }
+            b'{' => return None,
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return text.get(1..i);
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// The index just past the literal quoted by `quote` that opens at `start`.
+fn skip_cpp_quoted(bytes: &[u8], start: usize, quote: u8) -> usize {
+    let mut i = start + 1;
+    while i < bytes.len() && bytes[i] != quote {
+        i += if bytes[i] == b'\\' { 2 } else { 1 };
+    }
+    i + 1
+}
+
+/// The first comma-separated argument of an argument list's inner text.
+fn first_cpp_argument(arguments: &str) -> &str {
+    let bytes = arguments.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'"' => {
+                i = skip_cpp_quoted(bytes, i, b'"');
+                continue;
+            }
+            b'\'' if i == 0 || !(bytes[i - 1].is_ascii_alphanumeric() || bytes[i - 1] == b'_') => {
+                i = skip_cpp_quoted(bytes, i, b'\'');
+                continue;
+            }
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b',' if depth == 0 => return &arguments[..i],
+            _ => {}
+        }
+        i += 1;
+    }
+    arguments
+}
+
+fn cpp_type_spelling_matches(spelled: &str, qualified: &str) -> bool {
+    if spelled.contains("::") {
+        qualified == spelled
+            || qualified
+                .strip_suffix(spelled)
+                .is_some_and(|prefix| prefix.ends_with("::"))
+    } else {
+        qualified.rsplit("::").next() == Some(spelled)
+    }
+}
+
+/// Pick one C++ type owner without using file proximity as namespace proof.
+/// An unqualified spelling may be resolved by the caller's lexical qualified
+/// scope (longest segment-aligned prefix), otherwise the project must contain
+/// exactly one matching owner. Equal-best candidates remain unresolved.
+fn unique_cpp_type_owner(
+    mut candidates: Vec<Arc<Node>>,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> Option<Arc<Node>> {
+    candidates.sort_by(|left, right| left.id.cmp(&right.id));
+    candidates.dedup_by(|left, right| left.id == right.id);
+    if candidates.len() == 1 {
+        return candidates.pop();
+    }
+    let from = context.get_node_by_id_shared(&reference.from_node_id)?;
+    let caller_scope = from
+        .qualified_name
+        .rsplit_once("::")
+        .map_or("", |(scope, _)| scope);
+    let mut scoped = candidates
+        .into_iter()
+        .filter_map(|candidate| {
+            let owner_scope = candidate
+                .qualified_name
+                .rsplit_once("::")
+                .map_or("", |(scope, _)| scope);
+            let in_scope = owner_scope.is_empty()
+                || caller_scope == owner_scope
+                || caller_scope
+                    .strip_prefix(owner_scope)
+                    .is_some_and(|tail| tail.starts_with("::"));
+            let depth = if owner_scope.is_empty() {
+                0
+            } else {
+                owner_scope.split("::").count()
+            };
+            in_scope.then_some((depth, candidate))
+        })
+        .collect::<Vec<_>>();
+    let best_depth = scoped.iter().map(|(depth, _)| *depth).max()?;
+    scoped.retain(|(depth, _)| *depth == best_depth);
+    (scoped.len() == 1).then(|| scoped.pop().expect("one scoped owner").1)
 }
 
 /// Node-count threshold at/above which batched resolution switches from the
@@ -745,6 +1001,196 @@ fn cpp_built_ins() -> &'static BTreeSet<&'static str> {
     })
 }
 
+fn c_family_static_function_is_file_local(
+    target: &Node,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    let translation_unit = [".c", ".cc", ".cpp", ".cxx", ".c++", ".m", ".mm"]
+        .iter()
+        .any(|extension| target.file_path.to_ascii_lowercase().ends_with(extension));
+    if !matches!(
+        target.language,
+        Language::C | Language::Cpp | Language::ObjC
+    ) || target.kind != NodeKind::Function
+        || target.file_path == reference.file_path
+        || !translation_unit
+    {
+        return false;
+    }
+    let Some(facts) = context.source_facts(&target.file_path) else {
+        return false;
+    };
+    facts.node_decision("c_static", &target.id, |facts| {
+        let line_count = facts.line_count();
+        if line_count == 0 {
+            return false;
+        }
+        // A tree-sitter `function_definition` starts at its storage/type
+        // specifier. Inspect only this definition's bounded header (never the
+        // preceding line, which may be a different one-line static function).
+        let line = (target.start_line.max(1) - 1) as usize;
+        let end = (line + 16).min(line_count);
+        if line >= end {
+            return false;
+        }
+        let head = facts.join_lines(line, end, "\n");
+        let head = head.split_once('{').map_or(head.as_str(), |(head, _)| head);
+        let head = strip_comments_for_regex(head, CommentLang::Java);
+        static STATIC_RE: OnceLock<Regex> = OnceLock::new();
+        STATIC_RE
+            .get_or_init(|| Regex::new(r"(?:^|[\s;}])static(?:\s|$)").expect("C static regex"))
+            .is_match(&head)
+    })
+}
+
+/// The one inheritance-eligible node a TypeScript value shares its name and
+/// file with (`sameNamedTypeOfValue`, upstream #2055).
+fn same_named_type_of_value(value: &Node, context: &dyn ResolutionContext) -> Option<Arc<Node>> {
+    if !matches!(value.kind, NodeKind::Constant | NodeKind::Variable)
+        || !matches!(value.language, Language::TypeScript | Language::Tsx)
+    {
+        return None;
+    }
+    let types: Vec<Arc<Node>> = context
+        .get_nodes_in_file_shared(&value.file_path)
+        .into_iter()
+        .filter(|node| {
+            node.name == value.name
+                && crate::types::node_is_eligible_target(EdgeKind::Implements, node)
+        })
+        .collect();
+    let [type_node] = types.as_slice() else {
+        return None;
+    };
+    Some(Arc::clone(type_node))
+}
+
+fn rust_module_dir(file_path: &str) -> String {
+    let normalized = file_path.replace('\\', "/");
+    let dir = crate::pathutil::dirname(&normalized);
+    let base = crate::pathutil::basename(&normalized);
+    if matches!(base, "lib.rs" | "main.rs" | "mod.rs") {
+        dir
+    } else {
+        let stem = base.strip_suffix(".rs").unwrap_or(base);
+        if dir.is_empty() {
+            stem.to_string()
+        } else {
+            format!("{dir}/{stem}")
+        }
+    }
+}
+
+fn rust_method_is_trait_visible(target: &Node, context: &dyn ResolutionContext) -> bool {
+    if target.kind != NodeKind::Method {
+        return false;
+    }
+    // A trait's own (default) method is as visible as the trait itself.
+    if let Some((owner, _)) = target.qualified_name.rsplit_once("::")
+        && context
+            .get_nodes_by_name_shared(owner.rsplit("::").next().unwrap_or(owner))
+            .iter()
+            .any(|node| {
+                node.language == Language::Rust
+                    && node.kind == NodeKind::Trait
+                    && node.qualified_name == owner
+            })
+    {
+        return true;
+    }
+    let Some(facts) = context.source_facts(&target.file_path) else {
+        return false;
+    };
+    facts.node_decision("rust_trait_impl", &target.id, |facts| {
+        rust_method_is_in_trait_impl(facts, target.start_line)
+    })
+}
+
+/// Whether the method starting at 1-based `start_line` sits in an
+/// `impl Trait for Type` block (`isRustTraitImplMethod`, upstream v1.6.1):
+/// read upward to the nearest `impl` header; a top-level item line above the
+/// method means it was not inside an impl at all.
+fn rust_method_is_in_trait_impl(facts: &SourceFacts, start_line: i64) -> bool {
+    static IMPL_HEADER: OnceLock<Regex> = OnceLock::new();
+    static TOP_LEVEL_ITEM: OnceLock<Regex> = OnceLock::new();
+    static FOR_CLAUSE: OnceLock<Regex> = OnceLock::new();
+    let impl_header = IMPL_HEADER.get_or_init(|| {
+        Regex::new(r"^\s*(pub(\([^)]*\))?\s+)?(unsafe\s+)?impl(?-u:\b)").expect("Rust impl header")
+    });
+    let top_level_item = TOP_LEVEL_ITEM.get_or_init(|| {
+        Regex::new(r"^(pub(\([^)]*\))?\s+)?(fn|struct|enum|mod|trait|const|static|type)(?-u:\b)")
+            .expect("Rust top-level item")
+    });
+    let for_clause =
+        FOR_CLAUSE.get_or_init(|| Regex::new(r"\sfor\s").expect("Rust impl for clause"));
+    let Some(mut index) = usize::try_from(start_line)
+        .ok()
+        .and_then(|line| line.checked_sub(2))
+    else {
+        return false;
+    };
+    loop {
+        let line = facts.raw_line(index).unwrap_or("");
+        if impl_header.is_match(line) {
+            let code = line.split_once("//").map_or(line, |(code, _)| code);
+            return for_clause.is_match(code);
+        }
+        if top_level_item.is_match(line) {
+            return false;
+        }
+        let Some(previous) = index.checked_sub(1) else {
+            return false;
+        };
+        index = previous;
+    }
+}
+
+fn target_is_visible_across_files(
+    target: &Node,
+    reference: &RefView,
+    context: &dyn ResolutionContext,
+) -> bool {
+    if target.file_path == reference.file_path {
+        return true;
+    }
+    if c_family_static_function_is_file_local(target, reference, context) {
+        return false;
+    }
+    if matches!(
+        target.language,
+        Language::Kotlin
+            | Language::Java
+            | Language::CSharp
+            | Language::Swift
+            | Language::Scala
+            | Language::Dart
+            | Language::Php
+    ) && target.visibility.as_deref() == Some("private")
+    {
+        return false;
+    }
+    if target.language == Language::Go
+        && target
+            .name
+            .chars()
+            .next()
+            .is_some_and(|first| first.is_ascii_lowercase())
+    {
+        return crate::pathutil::dirname(&target.file_path)
+            == crate::pathutil::dirname(&reference.file_path);
+    }
+    if target.language == Language::Rust && target.visibility.as_deref() == Some("private") {
+        if rust_method_is_trait_visible(target, context) {
+            return true;
+        }
+        let owner = rust_module_dir(&target.file_path);
+        let from = reference.file_path.replace('\\', "/");
+        return !owner.is_empty() && from.starts_with(&format!("{owner}/"));
+    }
+    true
+}
+
 /// Orchestrates reference resolution using multiple strategies
 /// (`ReferenceResolver`, `index.ts:199-1189`).
 ///
@@ -754,12 +1200,21 @@ fn cpp_built_ins() -> &'static BTreeSet<&'static str> {
 /// `FrameworkResolver`s).
 pub struct ReferenceResolver {
     project_root: String,
+    /// Largest file resolution reads, the project's extraction limit
+    /// (`indexing.max_file_size`), handed to every context the resolver builds.
+    max_file_size: u64,
     /// Detected `FrameworkResolver` implementations (`frameworks` field,
     /// `index.ts:264`). Empty until [`Self::initialize`] detects react/vue/nestjs.
     framework_resolver_extensions: Vec<Box<dyn FrameworkResolver>>,
     /// Distinct symbol names known to the graph, for the fast pre-filter
     /// (`knownNames`, `index.ts:224`). Populated by `warm_caches`.
     known_names: Option<BTreeSet<String>>,
+    /// Per-file directive summaries and per-root macro timelines for C/C++
+    /// translation-unit macro visibility (#1838), filled on demand by the
+    /// parallel resolver and cleared with the other resolution caches. Every
+    /// entry is a pure function of the files, so evaluation order cannot reach
+    /// the output.
+    macro_visibility: std::sync::Mutex<crate::c_macro_visibility::MacroVisibility>,
     /// `this.<member>` fn-refs whose member wasn't on the enclosing class
     /// itself — retried in the supertype pass once implements/extends edges
     /// exist (`deferredThisMemberRefs`, index.ts:214 / #808). A `Mutex` (not
@@ -781,11 +1236,32 @@ impl ReferenceResolver {
     pub fn new(project_root: impl Into<String>) -> Self {
         Self {
             project_root: project_root.into(),
+            max_file_size: codegraph_core::config::DEFAULT_MAX_FILE_SIZE,
             framework_resolver_extensions: Vec::new(),
             known_names: None,
+            macro_visibility: std::sync::Mutex::default(),
             deferred_this_member_refs: std::sync::Mutex::new(Vec::new()),
             deferred_chain_refs: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Read files up to the addressed project's extraction limit
+    /// (`indexing.max_file_size`) instead of the default one, so resolution
+    /// never reads a file extraction would skip and never skips one it indexed.
+    #[must_use]
+    pub fn with_max_file_size(mut self, max_file_size: u64) -> Self {
+        self.max_file_size = max_file_size;
+        self
+    }
+
+    /// A store-backed resolution context for this resolver's project and file
+    /// size limit.
+    pub fn store_context<'a>(
+        &self,
+        store: &'a Store,
+    ) -> crate::context::StoreResolutionContext<'a> {
+        crate::context::StoreResolutionContext::new(store, &self.project_root)
+            .with_max_file_size(self.max_file_size)
     }
 
     /// Detect the project's frameworks and populate the resolver's
@@ -807,7 +1283,7 @@ impl ReferenceResolver {
     pub fn run_post_extract(&self, store: &mut Store) -> anyhow::Result<usize> {
         let mut all_updates: Vec<Node> = Vec::new();
         {
-            let context = crate::context::StoreResolutionContext::new(store, &self.project_root);
+            let context = self.store_context(store);
             for resolver in &self.framework_resolver_extensions {
                 if let Some(nodes) = resolver.post_extract(&context) {
                     all_updates.extend(nodes);
@@ -875,8 +1351,11 @@ impl ReferenceResolver {
             context,
             extensions,
             |relative| {
-                std::fs::read_to_string(std::path::Path::new(&self.project_root).join(relative))
-                    .ok()
+                crate::context::read_source_file(
+                    &std::path::Path::new(&self.project_root).join(relative),
+                    relative,
+                    self.max_file_size,
+                )
             },
         )
     }
@@ -929,6 +1408,10 @@ impl ReferenceResolver {
     pub fn warm_caches(&mut self, context: &dyn ResolutionContext) {
         let names: BTreeSet<String> = context.known_node_names().into_iter().collect();
         self.known_names = Some(names);
+        *self
+            .macro_visibility
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Default::default();
     }
 
     /// Resolve all unresolved references (`resolveAll`, `index.ts:511-572`).
@@ -960,6 +1443,12 @@ impl ReferenceResolver {
                         .entry(result.resolved_by.as_str().to_string())
                         .or_insert(0) += 1;
                     resolved.push(result);
+                }
+                None if parse_cpp_constructor_reference_name(&reference.reference_name)
+                    .is_some() =>
+                {
+                    // Internal claimed reference: a miss means "no uniquely
+                    // proven constructor", not a dangling source call.
                 }
                 None => unresolved.push(reference.clone()),
             }
@@ -1019,7 +1508,106 @@ impl ReferenceResolver {
         let (resolved, deferred) = self.resolve_one_pure_inner(reference, context);
         let resolved = self.gate_target_kind(resolved, reference, context);
         let resolved = self.gate_import_locality(resolved, reference, context);
+        let resolved = self.gate_c_macro_calls(resolved, reference, context);
+        let resolved = self.forward_alias_binding(resolved, reference, context);
+        // Every chosen result — including an alias-forwarded one — obeys the
+        // code-family boundary (upstream v1.6.1 `resolveOne`); framework
+        // bridges keep their calls.
+        let resolved = match &resolved {
+            Some(result) if result.resolved_by == ResolvedBy::Framework => {
+                self.gate_framework_resolver_extension_language(resolved, reference, context)
+            }
+            _ => self.gate_language(resolved, reference, context),
+        };
+        let resolved = self.gate_language_visibility(resolved, reference, context);
+        let resolved = self.gate_js_visibility(resolved, reference, context);
         (resolved, deferred)
+    }
+
+    /// C/C++ preprocessor binding gate (upstream #1838). A call spelled like
+    /// a function-like macro definitely visible at the call site, or a name
+    /// only macros bear, is an expansion, not a call; and a `#define` is a
+    /// value, never a callee, whichever strategy produced it. (A receiver-less
+    /// Go call is kept off methods inside the name matchers, #1857.)
+    fn gate_c_macro_calls(
+        &self,
+        result: Option<ResolvedRef>,
+        reference: &RefView,
+        context: &dyn ResolutionContext,
+    ) -> Option<ResolvedRef> {
+        let result = result?;
+        if reference.reference_kind != EdgeKind::Calls {
+            return Some(result);
+        }
+        if context
+            .get_node_by_id_shared(&result.target_node_id)
+            .is_some_and(|target| crate::c_macro_visibility::is_define_constant(&target))
+        {
+            return None;
+        }
+        if crate::c_macro_visibility::is_visible_macro(&self.macro_visibility, reference, context) {
+            return None;
+        }
+        Some(result)
+    }
+
+    fn gate_language_visibility(
+        &self,
+        result: Option<ResolvedRef>,
+        reference: &RefView,
+        context: &dyn ResolutionContext,
+    ) -> Option<ResolvedRef> {
+        let result = result?;
+        if result.resolved_by == ResolvedBy::Framework {
+            // A framework resolver supplies its own reachability proof (for
+            // example a private Rust `#[tauri::command]` invoked from TS).
+            // Language-local name matching rules must not erase that bridge.
+            return Some(result);
+        }
+        let Some(target) = context.get_node_by_id_shared(&result.target_node_id) else {
+            return Some(result);
+        };
+        target_is_visible_across_files(&target, reference, context).then_some(result)
+    }
+
+    fn forward_alias_binding(
+        &self,
+        result: Option<ResolvedRef>,
+        reference: &RefView,
+        context: &dyn ResolutionContext,
+    ) -> Option<ResolvedRef> {
+        let mut result = result?;
+        if reference.reference_kind != EdgeKind::Calls {
+            return Some(result);
+        }
+        let Some(target) = context.get_node_by_id_shared(&result.target_node_id) else {
+            return Some(result);
+        };
+        let member = reference
+            .reference_name
+            .rsplit_once('.')
+            .map(|(_, member)| member);
+        let Some(forwarded) = resolve_alias_binding(&target, member, context) else {
+            return Some(result);
+        };
+        if forwarded.id != result.target_node_id {
+            result.target_node_id = forwarded.id;
+            result.confidence = result.confidence.min(0.85);
+        }
+        Some(result)
+    }
+
+    fn gate_js_visibility(
+        &self,
+        result: Option<ResolvedRef>,
+        reference: &RefView,
+        context: &dyn ResolutionContext,
+    ) -> Option<ResolvedRef> {
+        let result = result?;
+        let Some(target) = context.get_node_by_id_shared(&result.target_node_id) else {
+            return Some(result);
+        };
+        is_js_name_target_visible(&target, reference, context).then_some(result)
     }
 
     /// Drop a result whose reference name is bound by an import from OUTSIDE the
@@ -1080,11 +1668,22 @@ impl ReferenceResolver {
         let Some(target) = context.get_node_by_id_shared(&result.target_node_id) else {
             return Some(result);
         };
-        if crate::types::kind_is_eligible_target(reference.reference_kind, target.kind) {
-            Some(result)
-        } else {
-            None
+        if crate::types::node_is_eligible_target(reference.reference_kind, &target) {
+            return Some(result);
         }
+        // One exception: a TypeScript VALUE sharing its name with a type in the
+        // same file (`export const IFoo = createDecorator<IFoo>('foo')` beside
+        // `export interface IFoo`, VS Code's service idiom). The strategy found
+        // the right file and name; the type declared there is the supertype, so
+        // the edge moves to it instead of being dropped (upstream #2055).
+        if crate::types::is_inheritance_ref(reference.reference_kind)
+            && let Some(type_node) = same_named_type_of_value(&target, context)
+        {
+            let mut moved = result;
+            moved.target_node_id = type_node.id.clone();
+            return Some(moved);
+        }
+        None
     }
 
     fn resolve_one_pure_inner(
@@ -1092,6 +1691,13 @@ impl ReferenceResolver {
         reference: &RefView,
         context: &dyn ResolutionContext,
     ) -> (Option<ResolvedRef>, Option<DeferredIntent>) {
+        // C++ local object initialization is encoded separately from ordinary
+        // calls. It is a claimed reference: only one lexically-owned type and
+        // one constructor accepting the recorded arity may resolve, and a miss
+        // must never fall through to a same-spelled class/function (#1839).
+        if parse_cpp_constructor_reference_name(&reference.reference_name).is_some() {
+            return (self.resolve_cpp_constructor(reference, context), None);
+        }
         if self.is_built_in_or_external(reference) {
             return (None, None);
         }
@@ -1104,22 +1710,47 @@ impl ReferenceResolver {
         } else {
             &reference.reference_name
         };
+        let call_result_chain = is_call_result_chain(reference);
         if !self.has_any_possible_match_for(existence_name, reference.language)
             && !self.matches_any_import(reference, context)
             && !self
                 .framework_resolver_extensions
                 .iter()
                 .any(|f| f.claims_reference(&reference.reference_name))
+            && !call_result_chain
         {
-            return (None, None);
+            // A store-bound bare call need not share its action's name
+            // (#1862), so it gets one chance past the existence check.
+            return (
+                self.gate_language(
+                    crate::js_store::match_js_store_binding_call(reference, context),
+                    reference,
+                    context,
+                ),
+                None,
+            );
         }
 
         // Function-as-value refs (#756) get a dedicated, strictly-gated path,
         // never reaching framework/fuzzy strategies (index.ts:686-699).
         if reference.is_function_ref {
-            if reference.reference_name.starts_with("this.") {
+            if reference
+                .reference_name
+                .strip_prefix("this.")
+                .is_some_and(|member| !member.contains('.'))
+            {
                 let (resolved, deferred) = self.resolve_this_member_fn_ref_pure(reference, context);
                 return (self.gate_language(resolved, reference, context), deferred);
+            }
+            // Python/Go member values are scoped by their receiver; import
+            // lookups happen inside that scoping (#1820).
+            if matches!(reference.language, Language::Python | Language::Go)
+                && reference.reference_name.contains('.')
+            {
+                return (
+                    self.gate_language(match_function_ref(reference, context), reference, context),
+                    None,
+                );
             }
             if let Some(via_import) =
                 self.gate_language(resolve_via_import(reference, context), reference, context)
@@ -1143,6 +1774,16 @@ impl ReferenceResolver {
             return (Some(jvm_import), None);
         }
 
+        // An explicit PHP class import owns its static calls. If the imported
+        // class or method is absent/ambiguous, keep the reference unresolved
+        // rather than guessing an unrelated same-named target (#1545).
+        match resolve_php_imported_static_call(reference, context) {
+            PhpImportedStaticCallResolution::NotApplicable => {}
+            PhpImportedStaticCallResolution::Claimed(result) => {
+                return (self.gate_language(result, reference, context), None);
+            }
+        }
+
         let mut candidates: Vec<ResolvedRef> = Vec::new();
 
         // Strategy 1: `FrameworkResolver` extension point (index.ts:695-701).
@@ -1158,6 +1799,45 @@ impl ReferenceResolver {
                 }
                 candidates.push(result);
             }
+        }
+
+        // An imported root in `make().run()` does not prove what `make`
+        // returns. Preserve any framework result, but never let import or
+        // unique-name heuristics guess the result type (#1683). A retained
+        // untyped member chain is the same kind of evidence: importing its
+        // root does not make the root its call target (#1862).
+        if call_result_chain {
+            // The one call-result receiver with an identified target is a store
+            // accessor (`useStore.getState().reset`, #1862).
+            if let Some(action) = self.gate_language(
+                crate::js_store::match_store_accessor_chain(reference, context),
+                reference,
+                context,
+            ) {
+                candidates.push(action);
+            }
+            return (candidates.into_iter().reduce(highest_confidence), None);
+        }
+        if is_unresolved_js_member_call(reference) {
+            return (candidates.into_iter().reduce(highest_confidence), None);
+        }
+
+        // KEEP-RUST (P15): a Rust method call whose receiver the extractor
+        // dropped — `root().join(x)`, a chain broken across lines — is still a
+        // method call. It never resolves through a `use` binding or a fuzzy
+        // guess: it binds only a same-named method, and never one that shares a
+        // std method's name.
+        if crate::name_matcher::rust_call_shape(reference, context)
+            == Some(crate::name_matcher::RustCallShape::Method)
+        {
+            if let Some(result) = self.gate_language(
+                crate::name_matcher::match_rust_lost_receiver_call(reference, context),
+                reference,
+                context,
+            ) {
+                candidates.push(result);
+            }
+            return (candidates.into_iter().reduce(highest_confidence), None);
         }
 
         // Strategy 2: import-based resolution (index.ts:704-708).
@@ -1214,6 +1894,116 @@ impl ReferenceResolver {
         }
 
         (candidates.into_iter().reduce(highest_confidence), None)
+    }
+
+    fn resolve_cpp_constructor(
+        &self,
+        reference: &RefView,
+        context: &dyn ResolutionContext,
+    ) -> Option<ResolvedRef> {
+        if reference.language != Language::Cpp || reference.reference_kind != EdgeKind::Calls {
+            return None;
+        }
+        let (spelled_type, call_arity) =
+            parse_cpp_constructor_reference_name(&reference.reference_name)?;
+        let base_name = spelled_type
+            .rsplit("::")
+            .find(|segment| !segment.is_empty())?;
+
+        let owners = context
+            .get_nodes_by_name_shared(base_name)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.language == Language::Cpp
+                    && matches!(
+                        candidate.kind,
+                        NodeKind::Class | NodeKind::Struct | NodeKind::Union
+                    )
+                    && cpp_type_spelling_matches(spelled_type, &candidate.qualified_name)
+            })
+            .collect::<Vec<_>>();
+        let owner = unique_cpp_type_owner(owners, reference, context)?;
+        let constructor_name = format!("{}::{base_name}", owner.qualified_name);
+        let constructors = context
+            .get_nodes_by_name_shared(base_name)
+            .into_iter()
+            .filter(|candidate| {
+                candidate.language == Language::Cpp
+                    && candidate.kind == NodeKind::Method
+                    && candidate.qualified_name == constructor_name
+            })
+            .collect::<Vec<_>>();
+        // Brace-init prefers an initializer_list overload over arity, a choice
+        // that needs the argument types, so decline (upstream #1839). Upstream
+        // declines every form; the port keeps `T x(<literal>, …)`: a literal is
+        // never an initializer_list, so a constructor whose FIRST parameter is
+        // the list cannot take it, and the rest compete by arity (KEEP-RUST).
+        let mut constructors = constructors;
+        if constructors.iter().any(|candidate| {
+            candidate
+                .signature
+                .as_deref()
+                .is_some_and(mentions_initializer_list)
+        }) {
+            let list_first_only = constructors.iter().all(|candidate| {
+                candidate.signature.as_deref().is_none_or(|signature| {
+                    !mentions_initializer_list(signature)
+                        || first_parameter_mentions_initializer_list(signature)
+                })
+            });
+            if !list_first_only || !paren_construction_from_a_literal(reference, context) {
+                return None;
+            }
+            constructors.retain(|candidate| {
+                !candidate
+                    .signature
+                    .as_deref()
+                    .is_some_and(first_parameter_mentions_initializer_list)
+            });
+        }
+        // A prototype and its out-of-line definition describe one overload:
+        // merge their admissible counts, so a default declared on the
+        // prototype reaches the definition, then prefer the executable
+        // definition. A signature that cannot be read declines the whole set.
+        let mut overloads: BTreeMap<String, (Vec<Arc<Node>>, usize, usize)> = BTreeMap::new();
+        for candidate in constructors {
+            let shape = cpp_constructor_shape(candidate.signature.as_deref()?)?;
+            let entry = overloads
+                .entry(shape.key)
+                .or_insert_with(|| (Vec::new(), shape.min, shape.max));
+            entry.1 = entry.1.min(shape.min);
+            entry.0.push(candidate);
+        }
+        let admitting = overloads
+            .into_values()
+            .filter(|(_, minimum, maximum)| *minimum <= call_arity && call_arity <= *maximum)
+            .collect::<Vec<_>>();
+        let [(nodes, _, _)] = admitting.as_slice() else {
+            return None;
+        };
+        let definitions = nodes
+            .iter()
+            .filter(|node| {
+                !node
+                    .signature
+                    .as_deref()
+                    .is_some_and(|signature| signature.trim_end().ends_with(';'))
+            })
+            .collect::<Vec<_>>();
+        let targets = if definitions.is_empty() {
+            nodes.iter().collect()
+        } else {
+            definitions
+        };
+        let [target] = targets.as_slice() else {
+            return None;
+        };
+        Some(ResolvedRef {
+            original: reference.clone(),
+            target_node_id: target.id.clone(),
+            confidence: 0.98,
+            resolved_by: ResolvedBy::QualifiedName,
+        })
     }
 
     /// Resolve a `this.<member>` function_ref against the enclosing class's own
@@ -1363,7 +2153,7 @@ impl ReferenceResolver {
         }
 
         let resolved: Vec<ResolvedRef> = {
-            let context = crate::context::StoreResolutionContext::new(store, &self.project_root);
+            let context = self.store_context(store);
             deferred
                 .iter()
                 .filter_map(|reference| {
@@ -1455,7 +2245,7 @@ impl ReferenceResolver {
     pub fn resolve_and_persist(&mut self, store: &mut Store) -> anyhow::Result<ResolutionResult> {
         let unresolved_refs = store.all_unresolved_refs()?;
         let result = {
-            let context = crate::context::StoreResolutionContext::new(store, &self.project_root);
+            let context = self.store_context(store);
             self.resolve_all(&unresolved_refs, &context)
         };
 
@@ -1467,6 +2257,7 @@ impl ReferenceResolver {
         if !result.resolved.is_empty() {
             delete_resolved_rows(store, &result.resolved)?;
         }
+        delete_internal_constructor_rows(store, &unresolved_refs)?;
 
         // #750 conformance pass for chained calls whose method lives on a
         // supertype, then #808 supertype pass for inherited this.<member> refs —
@@ -1588,7 +2379,7 @@ impl ReferenceResolver {
         store.set_resolution_incomplete()?;
 
         {
-            let context = crate::context::StoreResolutionContext::new(store, &self.project_root);
+            let context = self.store_context(store);
             self.warm_caches(&context);
         }
 
@@ -1651,18 +2442,17 @@ impl ReferenceResolver {
                 // context. Prior batches' inheritance edges are already committed
                 // (persisted at the bottom of this loop), so `get_supertypes`
                 // reads them straight from the store — no snapshot, no adjacency.
-                let context =
-                    crate::context::StoreResolutionContext::new(store, &self.project_root);
+                let context = self.store_context(store);
                 self.resolve_all(&batch, &context)
             } else {
                 let base = match &node_snapshot {
                     Some(snapshot) => snapshot,
                     None => {
                         base_adjacency = (*build_edge_adjacency(store)?).clone();
-                        node_snapshot.insert(SnapshotResolutionContext::from_store(
-                            store,
-                            &self.project_root,
-                        )?)
+                        node_snapshot.insert(
+                            SnapshotResolutionContext::from_store(store, &self.project_root)?
+                                .with_max_file_size(self.max_file_size),
+                        )
                     }
                 };
                 // Install the adjacency from chunks 0..N-1 BEFORE resolving chunk N
@@ -1698,6 +2488,12 @@ impl ReferenceResolver {
                 .resolved
                 .iter()
                 .filter_map(|reference| reference.original.row_id)
+                .chain(batch.iter().filter_map(|reference| {
+                    parse_cpp_constructor_reference_name(&reference.reference_name)
+                        .is_some()
+                        .then_some(reference.id)
+                        .flatten()
+                }))
                 .collect();
             if !batch_row_ids.is_empty() {
                 store.delete_resolved_unresolved_refs(&batch_row_ids)?;
@@ -1788,6 +2584,8 @@ impl ReferenceResolver {
                         .or_insert(0) += 1;
                     resolved.push(result);
                 }
+                None if parse_cpp_constructor_reference_name(&reference.reference_name)
+                    .is_some() => {}
                 None => unresolved.push(reference.clone()),
             }
         }
@@ -1829,7 +2627,7 @@ impl ReferenceResolver {
         let scoped = union_persisted_refs([by_files, by_sites, by_names])?;
 
         let result = {
-            let context = crate::context::StoreResolutionContext::new(store, &self.project_root);
+            let context = self.store_context(store);
             self.resolve_all(&scoped, &context)
         };
 
@@ -1841,6 +2639,7 @@ impl ReferenceResolver {
         if !result.resolved.is_empty() {
             delete_resolved_rows(store, &result.resolved)?;
         }
+        delete_internal_constructor_rows(store, &scoped)?;
 
         // #750 conformance pass then #808 supertype pass, after implements/extends
         // edges exist (index.ts:508-511).
@@ -2052,26 +2851,13 @@ impl ReferenceResolver {
         reference: &RefView,
         context: &dyn ResolutionContext,
     ) -> Option<ResolvedRef> {
-        let result = result?;
-        let Some(target_language) = self.language_of_target(&result.target_node_id, context) else {
-            return Some(result);
-        };
-        if reference.reference_kind == EdgeKind::References
-            && !same_language_family(target_language, reference.language)
-        {
-            return None;
-        }
-        if reference.reference_kind == EdgeKind::Imports
-            && crosses_known_family(target_language, reference.language)
-        {
-            return None;
-        }
-        Some(result)
+        gate_language_match(result, reference, context)
     }
 
-    /// Drop a `FrameworkResolver`-strategy result that crosses two known families
-    /// (`gateFrameworkResolverLanguage`, `index.ts:1182-1188`). Never fires in v1 (the
-    /// `FrameworkResolver` extension-point list is empty).
+    /// Framework calls carry their own bridge evidence (a Tauri IPC command, a
+    /// Godot autoload); every other framework result obeys the code-family
+    /// boundary, while config/markup transitions stay open
+    /// (`gateFrameworkLanguage`, upstream v1.6.1).
     fn gate_framework_resolver_extension_language(
         &self,
         result: Option<ResolvedRef>,
@@ -2079,16 +2865,13 @@ impl ReferenceResolver {
         context: &dyn ResolutionContext,
     ) -> Option<ResolvedRef> {
         let result = result?;
-        if !matches!(
-            reference.reference_kind,
-            EdgeKind::References | EdgeKind::Imports
-        ) {
+        if reference.reference_kind == EdgeKind::Calls {
             return Some(result);
         }
-        if let Some(target_language) = self.language_of_target(&result.target_node_id, context) {
-            if crosses_known_family(target_language, reference.language) {
-                return None;
-            }
+        if let Some(target_language) = self.language_of_target(&result.target_node_id, context)
+            && crosses_code_boundary(target_language, reference.language)
+        {
+            return None;
         }
         Some(result)
     }
@@ -2274,6 +3057,25 @@ fn highest_confidence(best: ResolvedRef, curr: ResolvedRef) -> ResolvedRef {
 fn delete_resolved_rows(store: &mut Store, resolved: &[ResolvedRef]) -> anyhow::Result<()> {
     let row_ids: Vec<i64> = resolved.iter().filter_map(|r| r.original.row_id).collect();
     store.delete_resolved_unresolved_refs(&row_ids)?;
+    Ok(())
+}
+
+fn delete_internal_constructor_rows(
+    store: &mut Store,
+    references: &[UnresolvedRef],
+) -> anyhow::Result<()> {
+    let mut row_ids = references
+        .iter()
+        .filter(|reference| {
+            parse_cpp_constructor_reference_name(&reference.reference_name).is_some()
+        })
+        .filter_map(|reference| reference.id)
+        .collect::<Vec<_>>();
+    row_ids.sort_unstable();
+    row_ids.dedup();
+    if !row_ids.is_empty() {
+        store.delete_resolved_unresolved_refs(&row_ids)?;
+    }
     Ok(())
 }
 
@@ -2497,6 +3299,37 @@ mod tests {
         r.original.reference_subkind = Some(codegraph_core::types::ReferenceSubkind::ScriptAttach);
         let meta = build_edge_metadata(&r);
         assert_eq!(meta["subkind"].as_str(), Some("script_attach"));
+    }
+
+    #[test]
+    fn constructor_argument_scans_see_only_real_syntax() {
+        assert!(first_parameter_mentions_initializer_list(
+            "(std::initializer_list<int> values)"
+        ));
+        assert!(first_parameter_mentions_initializer_list(
+            "(const std::initializer_list<std::pair<int, int>>& values);"
+        ));
+        assert!(!first_parameter_mentions_initializer_list(
+            "(int a, std::initializer_list<int> rest)"
+        ));
+        assert!(!first_parameter_mentions_initializer_list("(int one)"));
+
+        assert_eq!(
+            cpp_paren_arguments("(1, \"a{\", 'b') rest"),
+            Some("1, \"a{\", 'b'")
+        );
+        assert_eq!(cpp_paren_arguments("(1 /* { */ ) x"), Some("1 /* { */ "));
+        assert_eq!(cpp_paren_arguments("(1'000)"), Some("1'000"));
+        assert_eq!(cpp_paren_arguments("(\n    1); }"), Some("\n    1"));
+        // Any brace could be or build a list: a braced argument, a lambda.
+        assert_eq!(cpp_paren_arguments("({1})"), None);
+        assert_eq!(cpp_paren_arguments("(f([] { return 1; }))"), None);
+        assert_eq!(cpp_paren_arguments("(1"), None);
+        assert_eq!(cpp_paren_arguments("x(1)"), None);
+
+        assert_eq!(first_cpp_argument("f(a, b), 2"), "f(a, b)");
+        assert_eq!(first_cpp_argument("'a', 2"), "'a'");
+        assert_eq!(first_cpp_argument("\",\", 2"), "\",\"");
     }
 
     #[test]
@@ -3944,6 +4777,116 @@ mod tests {
         assert!(target.is_none());
     }
 
+    #[test]
+    fn cross_file_visibility_matrix_is_fail_closed() {
+        let mut reference = mk_ref("hidden", EdgeKind::Calls, Language::Kotlin);
+        reference.file_path = "src/use.kt".to_string();
+        for language in [
+            Language::Kotlin,
+            Language::Java,
+            Language::CSharp,
+            Language::Swift,
+            Language::Scala,
+            Language::Dart,
+            Language::Php,
+        ] {
+            reference.language = language;
+            let mut target = mk_node2(
+                "method:hidden",
+                NodeKind::Method,
+                "hidden",
+                "src/owner.file",
+                language,
+            );
+            target.visibility = Some("private".to_string());
+            assert!(!target_is_visible_across_files(
+                &target,
+                &reference,
+                &MinimalCtx {
+                    files: HashMap::new()
+                }
+            ));
+            target.file_path = reference.file_path.clone();
+            assert!(target_is_visible_across_files(
+                &target,
+                &reference,
+                &MinimalCtx {
+                    files: HashMap::new()
+                }
+            ));
+        }
+
+        let mut rust_reference = mk_ref("shared", EdgeKind::Calls, Language::Rust);
+        rust_reference.file_path = "src/net/tcp.rs".to_string();
+        let mut rust_private = mk_node2(
+            "function:shared",
+            NodeKind::Function,
+            "shared",
+            "src/net.rs",
+            Language::Rust,
+        );
+        rust_private.visibility = Some("private".to_string());
+        assert!(target_is_visible_across_files(
+            &rust_private,
+            &rust_reference,
+            &MinimalCtx {
+                files: HashMap::new()
+            }
+        ));
+        rust_reference.file_path = "src/util.rs".to_string();
+        assert!(!target_is_visible_across_files(
+            &rust_private,
+            &rust_reference,
+            &MinimalCtx {
+                files: HashMap::new()
+            }
+        ));
+
+        let mut trait_method = mk_node2(
+            "method:area",
+            NodeKind::Method,
+            "area",
+            "src/shape.rs",
+            Language::Rust,
+        );
+        trait_method.qualified_name = "Circle::area".to_string();
+        trait_method.visibility = Some("private".to_string());
+        trait_method.start_line = 4;
+        rust_reference.file_path = "src/draw.rs".to_string();
+        let ctx = MinimalCtx {
+            files: HashMap::from([(
+                "src/shape.rs".to_string(),
+                "pub trait Area { fn area(&self); }\npub struct Circle;\nimpl Area for Circle {\n fn area(&self) {}\n}\n"
+                    .to_string(),
+            )]),
+        };
+        assert!(target_is_visible_across_files(
+            &trait_method,
+            &rust_reference,
+            &ctx
+        ));
+
+        let mut c_reference = mk_ref("hidden", EdgeKind::Calls, Language::Cpp);
+        c_reference.file_path = "main.cpp".to_string();
+        let target = mk_node2(
+            "function:hidden",
+            NodeKind::Function,
+            "hidden",
+            "other.cpp",
+            Language::Cpp,
+        );
+        let ctx = MinimalCtx {
+            files: HashMap::from([(
+                "other.cpp".to_string(),
+                "static void hidden() {}\n".to_string(),
+            )]),
+        };
+        assert!(!target_is_visible_across_files(&target, &c_reference, &ctx));
+        let mut header = target;
+        header.file_path = "shared.hpp".to_string();
+        assert!(target_is_visible_across_files(&header, &c_reference, &ctx));
+    }
+
     // ---------------------------------------------------------------------
     // helpers
     // ---------------------------------------------------------------------
@@ -4271,5 +5214,20 @@ mod tests {
 
         let _ = std::fs::remove_file(&db);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rust_trait_impl_scan_reads_upward_to_the_nearest_impl_header() {
+        let source = "pub trait Tr { fn t(&self); }\npub struct S;\nimpl Tr for S {\n    fn helper() { simple(); }\n    fn t(&self) {}\n}\nimpl S {\n    fn u(&self) {}\n}\npub(crate) unsafe impl Send for S {}\nfn free() {}\nimpl<T> Tr for Vec<T> // comment for S\n{\n    fn t(&self) {}\n}\n";
+        let facts = crate::source_facts::SourceFacts::new(std::sync::Arc::from(source));
+        // `fn t` in `impl Tr for S`, past a body that spells `simple`.
+        assert!(rust_method_is_in_trait_impl(&facts, 5));
+        assert!(!rust_method_is_in_trait_impl(&facts, 8), "inherent impl");
+        assert!(
+            rust_method_is_in_trait_impl(&facts, 14),
+            "the header's for-clause is read before any comment"
+        );
+        assert!(!rust_method_is_in_trait_impl(&facts, 1));
+        assert!(!rust_method_is_in_trait_impl(&facts, 0));
     }
 }

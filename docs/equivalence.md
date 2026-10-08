@@ -1,16 +1,23 @@
 # CodeGraph Rust Equivalence Oracle
 
-> AS-BUILT 校核（T27）：本文与已提交代码一致。节点 ID 公式
-> （`codegraph_core::node_id::generate_node_id`，
-> `format!("{file_path}:{kind}:{name}:{line}")` → sha256 → `{kind}:{hex[..32]}`）、
-> 文件节点字面量 `file:{file_path}`、内容哈希（`hash_content`）以及
-> `FrameworkResolver` 仅扩展点（`crates/codegraph-resolve/src/framework.rs`，
-> 零具体实现）均按本文实现。
+> AS-BUILT contract: ordinary symbol IDs use
+> `codegraph_core::node_id::generate_node_id`; tree-sitter file nodes use the
+> literal `file:{file_path}`; content hashes use `hash_content`. Framework
+> resolvers are active extensions, not an empty seam: the registry currently
+> contains NestJS, React, Vue, Godot, and Tauri candidates, each gated by project
+> detection. Framework nodes with an explicitly documented compatibility ID are
+> validated by their own corpora and do not change the ordinary symbol-ID formula.
 
 This document defines the byte-level and semantic parity contract between the
 Rust port and the pinned upstream TypeScript reference. The current authoritative
 fixture is `crates/codegraph-bench/fixtures/mini/`; the live reference outputs are
 stored under `reference/golden/mini/`.
+
+The complete committed corpus registry is the set of directories under
+`reference/golden/`. Extraction corpora contain canonical `nodes.json`,
+`edges.json`, `refs.json`, `files.json`, and `schema.sql`; `mcp/` contains
+structural protocol fixtures. Do not maintain an unchecked fixed corpus count in
+this document—tests enumerate the committed directories and recipes below.
 
 ## Node ID Formula
 
@@ -33,6 +40,14 @@ Inputs are part of the compatibility contract:
   example `./math`.
 - `line`: 1-based start line. The tree-sitter call site passes
   `node.startPosition.row + 1`.
+
+Same-kind, same-name declarations on one line (a getter/setter pair) hash to
+the same id. Since extraction version 15 the first one, in extraction order,
+keeps it, and every later declaration at a different column appends
+`:{column}`, its zero-based UTF-16 column — the column unit upstream uses, not
+tree-sitter's byte column (`NodeIdAllocator`, upstream #1349). Revisiting the
+same declaration yields the same id, so a declaration that collides with
+nothing keeps exactly the id above.
 
 ## File Node Special Case
 
@@ -286,11 +301,18 @@ The added alias files pin three import-resolution contracts:
 - `from pkg import module as mod_alias; mod_alias.func()` prefers the existing
   module file `pkg/module.py`;
 - `from imported_types import ImportedClass as ImportedAlias; return
-ImportedAlias` preserves member-import semantics and resolves the aliased
-  class-as-value reference by import.
+ImportedAlias` preserves member-import semantics: both the import statement and
+  the aliased class-as-value reference resolve to the class through the import
+  (named Python imports use the absolute-module and top-level-definition
+  fallback of upstream #1820, because Python symbols are never marked
+  exported).
 
 Missing/duplicate/ambiguous module aliases remain unresolved, and a claimed
 module alias never falls through to global bare-name matching.
+
+Since extraction version 14 the `pkg/__init__.py` file node carries its module
+docstring (upstream #1905): a bare string literal first in a module, class or
+function body is that node's docstring, joined after any preceding comment.
 
 Regenerate the committed database and canonical artifacts from a clean corpus:
 
@@ -352,6 +374,65 @@ set when an older binary changes statement ordering. The tests
 `generated_golden_matches_committed_kotlin_fixture` and
 `kotlin_db_is_self_equivalent_to_kotlin_golden` enforce database/artifact
 self-equivalence.
+
+### Scala fixture
+
+`reference/golden/scala/` guards the Scala 3 inheritance and companion-object
+fixes from upstream #1823 and #1824. Its two-file corpus under
+`crates/codegraph-bench/fixtures/scala/` pins all of these as one contract:
+
+- the `tree-sitter-scala` 0.26.2 grammar accepts a class with multiple
+  constructor parameter lists whose parent constructor also has multiple lists;
+- one `extends A(...) with B with C` clause emits three separate, bare-name
+  `Extends` edges;
+- a Scala `object` is a `module`, while its same-named companion remains a
+  `trait`; the inheritance edge resolves to the trait even when the object
+  appears first in the file.
+
+Regenerate it from the committed source corpus:
+
+```bash
+rm -rf /tmp/cg-fixture-scala
+cp -r crates/codegraph-bench/fixtures/scala /tmp/cg-fixture-scala
+cargo build --release -p codegraph-rs
+CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
+  ./target/release/codegraph init /tmp/cg-fixture-scala
+mkdir -p reference/golden/scala
+cp /tmp/cg-fixture-scala/.codegraph/codegraph.db reference/golden/scala/colby.db
+cargo run -p codegraph-bench --bin bench -- \
+  --gen-golden reference/golden/scala/colby.db reference/golden/scala
+```
+
+`generated_golden_matches_committed_scala_fixture` and
+`scala_db_is_self_equivalent_to_scala_golden` pin the canonical artifacts and
+database-to-artifact agreement.
+
+### Dart fixture
+
+`reference/golden/dart/` guards upstream #1784 / PR #1865. The focused Dart 3
+corpus at `crates/codegraph-bench/fixtures/dart/extension_type.dart` proves an
+`extension type MetersT` is class-like and owns `MetersT::km` and
+`MetersT::report` as methods with their complete spans; `Widget::half` is the
+ordinary-class control. This prevents either the old top-level-function shape
+or the later complete member drop from returning unnoticed.
+
+Regenerate it from the committed source corpus:
+
+```bash
+rm -rf /tmp/cg-fixture-dart
+cp -r crates/codegraph-bench/fixtures/dart /tmp/cg-fixture-dart
+cargo build --release -p codegraph-rs
+CODEGRAPH_NO_DAEMON=1 CODEGRAPH_NO_WATCH=1 \
+  ./target/release/codegraph init /tmp/cg-fixture-dart
+mkdir -p reference/golden/dart
+cp /tmp/cg-fixture-dart/.codegraph/codegraph.db reference/golden/dart/colby.db
+cargo run -p codegraph-bench --bin bench -- \
+  --gen-golden reference/golden/dart/colby.db reference/golden/dart
+```
+
+`generated_golden_matches_committed_dart_fixture` and
+`dart_db_is_self_equivalent_to_dart_golden` enforce the same two-layer
+self-equivalence as the other re-indexable corpora.
 
 ### C++ fixture
 
@@ -494,6 +575,23 @@ Reg` ref, because no union node existed to bind), with `Ctl c = Ctl();` as the
   `function:Value`, the WRONG target; the golden pins the union winning, with
   `Packet p{2};` as the control. Kept in a SEPARATE file from the promotion case on
   purpose: one file mixing both mechanisms would make either revert-proof ambiguous.
+- **C designated-initializer macros** — `designated_macro.c` keeps
+  `RESET_CONFIG(.field = VALUE)` bounded to its argument list so the following
+  `after_reset` / `final_value` declarations remain independent functions.
+- **C++ raw-string opacity** — `raw_string.cpp` proves annotation/macro text
+  inside a raw string is never blanked while a genuine annotation whose argument
+  contains a raw string still balances on its real closer.
+- **C++ pure virtual ownership** — `pure_virtual.cpp` pins `= 0` declarations as
+  abstract methods owned by `AbstractStore`, with overrides, prototypes, data
+  fields, and function-pointer fields as controls. The same rule adds the four
+  previously missing abstract `Ping` members to the existing
+  `com_interface.hpp` controls; no pre-existing node or edge is removed.
+- **C++ constructor owner/arity proof** — `constructor_resolution.cpp` emits a
+  `Calls` edge only when one lexically owned constructor accepts the local
+  initializer's positional arity. It pins default/braced/value positives plus
+  aggregate-only, overload-ambiguous, namespace-ambiguous, and explicit-owner
+  controls. Internal constructor probes are consumed after resolution and never
+  remain as dangling call references.
 
 **Why the union/struct members are named `read_field` and not `get`.** `get` is the
 only duplicated symbol name in this corpus already (`operators.cpp:5` `Vec2::get`
@@ -508,9 +606,10 @@ The minimal source corpus lives at `crates/codegraph-bench/fixtures/cpp/`
 (`attr_macro.c`, `base.hpp`, `com_interface.hpp`, `derived.cpp`,
 `instantiate_agg.cpp`, `instantiate_rank.cpp`, `namespaced.cpp`,
 `namespaced_member.cpp`, `namespaced_member.hpp`, `neg_interface.hpp`,
-`operators.cpp`, `plain_derived.h`, `plain_header_negatives.h`,
+`operators.cpp`, `constructor_resolution.cpp`, `plain_derived.h`, `plain_header_negatives.h`,
+`pure_virtual.cpp`, `raw_string.cpp`, `designated_macro.c`,
 `template_method.cpp`, `templated_call.cpp`, `ue_actor.h`, `union_agg.c`,
-`union_agg.cpp`, `union_agg.mm` — 19 files). The inheritance base
+`union_agg.cpp`, `union_agg.mm` — 23 files). The inheritance base
 classes live in a `.hpp` file (not `.h`,
 which maps to `Language::C` by extension); `ue_actor.h` deliberately uses `.h` to
 guard the content-based C++ reclassification, and `attr_macro.c` uses `.c` so the
@@ -566,12 +665,15 @@ and `self.field.method()` resolution:
   under the implementing type, not the trait; only trait impls emit
   `Implements`. Tuple, `dyn`, raw-pointer, and primitive impls remain ordinary
   functions because there is no single safe owner.
-- **validated self-field calls** — `self_field.rs` pins
+- **validated self/field calls** — `self_field.rs` pins
   `self.inner.run()`/reference/`Box` wrappers to the unique project field type.
   `Option`, `Vec`, `Mutex`, generic, external, and ambiguous field types stay
-  unresolved, and genuine `self.run()` recursion keeps its self-edge. Once the
-  extractor recognizes the single-hop shape it never falls through to a global
-  same-name guess.
+  unresolved. A direct `self.method()` keeps the receiver and resolves only to
+  the enclosing method owner's exact qualified member, including split inherent
+  impls and trait impls. The corpus includes same-named decoys and a missing
+  owner method; the latter stays in `refs.json` and never falls through to a
+  global same-name guess. Genuine `self.run()` recursion keeps its self-edge,
+  now at qualified-name confidence rather than proximity confidence.
 
 **The Rust corpus deliberately makes NO instantiation claim.** An `instantiates` edge
 fires only for the CALL-EXPRESSION construction form: `TupleStruct(2)` yes, a bare
@@ -835,7 +937,12 @@ MyView` with a `build()` method, and a plain `class Model`. The golden must show
 - `MyView` as a `NodeKind::Struct` with its `build` method as a member (via the
   existing `extract_struct` path — no walker change);
 - `helper`/`driver` functions, the `Model` class, and the `../foo` import node;
-- the `driver` → `helper` `Calls` edge (plain `call_expression`).
+- the `driver` → `helper` `Calls` edge (plain `call_expression`);
+- the `MyView::build` → `helper` `Calls` edge from line 12. `tree-sitter-arkts`
+  0.3 parses the call inside the `@Component struct`'s `build()` method; 0.2 did
+  not, so this edge first appeared when #280 moved the grammar from 0.2 to 0.3
+  and the fixture was regenerated with the recipe below. Only `edges.json` and
+  `colby.db` changed.
 
 The ArkUI dynamic-dispatch / callback-synthesizer bridges are DEFERRED — the
 port has no callback synthesizer. So `ARKTS_SPEC` uses `call_types =
@@ -1112,7 +1219,7 @@ The `generated_golden_matches_committed_cfml_fixture` and
 
 The dedicated `reference/golden/typescript/` fixture guards TypeScript export
 aliases, JavaScript-family import resolution, object-literal namespaces, and
-inherited path aliases without changing the shared `mini` corpus. It has 14
+inherited path aliases without changing the shared `mini` corpus. It has 16
 indexed source files plus `tsconfig.json` and
 `config/tsconfig.base.json`; source lines are contractual because node IDs
 include the declaration line.
@@ -1144,6 +1251,8 @@ The expanded corpus also pins:
   direct callable members of one exported object literal;
 - source-range containment prevents the unrelated top-level `run` function
   from becoming the target, while nested `api.nested.run()` remains unresolved;
+  since extraction version 14 it is retained as the qualified call site
+  `api.nested.run` (upstream #1862), which only a framework resolver may bind;
 - `tsconfig.json` extends the JSONC/trailing-comma
   `config/tsconfig.base.json`; the declaring config's `baseUrl` resolves
   `@fixture/aliased` to `src/aliased.ts`;
@@ -1151,6 +1260,21 @@ The expanded corpus also pins:
   `.js`/`.jsx`/`.mjs`/`.cjs` candidates and before index candidates, so
   `legacy_helpers.xsjslib` resolves while `legacy_priority.js` still wins over
   the same-name `.xsjs` file.
+- `callable_semantics.ts` pins extraction version 13: generator declarations,
+  TypeScript interface method/property signatures, direct declarator-bound
+  handlers, React `useCallback`/`useEffectEvent` handlers, and the supported
+  curried-wrapper shape own their body calls. `useMemo` and array callbacks stay
+  anonymous negatives. Its helper name is globally unique so adding the fixture
+  cannot change confidence or target selection in the original 14 files.
+- `commonjs_handlers.js` pins `exports.name = function` and
+  `module.exports.name = function` as exported callables with body ownership;
+  non-callable assignments and a later `handlers.onSave = …` remain ordinary
+  values rather than fabricated CommonJS exports.
+
+The v13 regeneration was accepted only after filtering the two new paths out of
+all four canonical JSON artifacts and proving the original 14-file rows
+byte-for-byte unchanged. This is the required review shape for future corpus
+growth: an additive fixture must not silently perturb old resolution confidence.
 
 Regenerate the committed database and canonical artifacts from a clean corpus:
 
@@ -1179,9 +1303,10 @@ Explicit-path pinning in `codegraph_explore`, camel/segment explore seeding,
 case-insensitive exact-name index seeks, and `[indexing].deprioritize` are
 query/render-time behavior only. They do not modify extraction, resolution,
 node IDs, files, nodes, edges, unresolved references, FTS schema, or any
-committed golden artifact. This wave therefore keeps extraction version `12`
-and has no golden regeneration recipe: a changed file under
-`reference/golden/` is a regression, not expected output.
+committed golden artifact. That earlier wave required no extraction-version
+bump of its own; the current version is `13` because of the later callable
+extraction changes above. A golden change attributed only to retrieval or
+ranking remains a regression, not expected output.
 
 Planner tests lock exact-name hit, miss, and filtered probes to
 `idx_nodes_lower_name`; search/MCP tests cover Variable/Constant seeds,

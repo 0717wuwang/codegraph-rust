@@ -292,6 +292,47 @@ fn gate_no_false_fire_on_ordinary_words() {
     }
 }
 
+/// PT/ES "como" and DE "wie" are everyday words; alone they are not structural
+/// evidence. Another structural keyword still fires (upstream #1654).
+#[test]
+fn everyday_como_and_wie_need_corroboration() {
+    let (_dir, project) = index_mini("como-wie");
+    let hook = |q: &str| {
+        let (out, err, ok) = cli(&[
+            "prompt-hook",
+            "--path",
+            project.to_str().unwrap(),
+            "--query",
+            q,
+        ]);
+        assert!(ok, "failed for {q:?}: stdout={out} stderr={err}");
+        out
+    };
+    for q in [
+        "eu como pizza toda sexta",
+        "faz como a gente combinou ontem",
+        "commita isso como fix, nao como feat",
+        "hazlo como ayer",
+        "mach es wie gestern",
+    ] {
+        let out = hook(q);
+        assert!(
+            out.trim().is_empty(),
+            "everyday {q:?} must stay silent, got:\n{out}"
+        );
+    }
+    for q in [
+        "como funciona a máquina de estados?",
+        "wie funktioniert die Zustandsmaschine?",
+    ] {
+        let out = hook(q);
+        assert!(
+            out.contains("<codegraph_context"),
+            "{q:?} carries another structural keyword, got:\n{out}"
+        );
+    }
+}
+
 // === JSON payload parsing ====================================================
 
 #[test]
@@ -452,5 +493,28 @@ fn prompt_hook_kill_switch_silences() {
     assert!(
         out.trim().is_empty(),
         "kill-switch must silence output, got:\n{out}"
+    );
+}
+
+#[test]
+fn host_task_notification_is_silent_only_when_it_is_the_first_content() {
+    let (_dir, project) = index_mini("task-notification");
+    let wrapped = format!(
+        "{{\"prompt\":\"\\n  <task-notification>what calls Counter()</task-notification>\",\"cwd\":{}}}",
+        serde_json::to_string(project.to_str().unwrap()).unwrap()
+    );
+    let (out, err, ok) = cli_stdin(&["prompt-hook"], &wrapped);
+    assert!(ok, "wrapper run failed: stdout={out} stderr={err}");
+    assert!(out.trim().is_empty(), "host wrapper must be silent: {out}");
+
+    let discussed = format!(
+        "{{\"prompt\":\"Please explain <task-notification> and what calls Counter()\",\"cwd\":{}}}",
+        serde_json::to_string(project.to_str().unwrap()).unwrap()
+    );
+    let (out, err, ok) = cli_stdin(&["prompt-hook"], &discussed);
+    assert!(ok, "discussion run failed: stdout={out} stderr={err}");
+    assert!(
+        out.contains("<codegraph_context") && out.contains("Counter"),
+        "a user discussion mentioning the tag later must not be suppressed: {out}"
     );
 }

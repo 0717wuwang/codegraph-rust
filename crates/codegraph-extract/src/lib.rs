@@ -13,12 +13,18 @@ pub mod engine;
 pub mod ext_config;
 pub mod function_ref;
 pub mod lang;
+mod links;
 pub mod spec;
+pub mod syntax_tokens;
 pub mod walker;
 
+pub use codegraph_core::source_file::{
+    SourceText, is_source_file, oversize_stamp, read_source_file,
+};
 pub use engine::{
-    ExtractOptions, ExtractionStage, detect_language, detect_language_with, extract_file,
-    extract_file_with_options, extract_file_with_options_observer, extract_project, extract_source,
-    extract_source_with, extract_source_with_observer, include_exclude_pattern_matches,
+    ExtractOptions, ExtractionStage, PARSE_COLLAPSE_WARNING, RootGitignore, detect_language,
+    detect_language_with, extract_file, extract_file_with_options,
+    extract_file_with_options_observer, extract_project, extract_source, extract_source_with,
+    extract_source_with_observer, include_exclude_pattern_matches, is_extraction_warning,
 };
 pub use ext_config::ExtensionOverrides;

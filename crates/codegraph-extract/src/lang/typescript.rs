@@ -24,8 +24,10 @@ impl LanguageSpec for TypeScriptSpec {
     fn function_types(&self) -> &'static [&'static str] {
         &[
             "function_declaration",
+            "generator_function_declaration",
             "arrow_function",
             "function_expression",
+            "generator_function",
         ]
     }
 
@@ -34,7 +36,15 @@ impl LanguageSpec for TypeScriptSpec {
     }
 
     fn method_types(&self) -> &'static [&'static str] {
-        &["method_definition", "public_field_definition"]
+        &[
+            "method_definition",
+            "public_field_definition",
+            "method_signature",
+        ]
+    }
+
+    fn property_types(&self) -> &'static [&'static str] {
+        &["property_signature"]
     }
 
     fn class_member_is_method(&self, node: Node<'_>, _source: &str) -> bool {
@@ -96,15 +106,20 @@ impl LanguageSpec for TypeScriptSpec {
 
         for i in 0..node.named_child_count() {
             let child = node.named_child(i as u32)?;
-            if child.kind() == "arrow_function" || child.kind() == "function_expression" {
+            if matches!(
+                child.kind(),
+                "arrow_function" | "function_expression" | "generator_function"
+            ) {
                 return child_by_field(child, body_field);
             }
             if child.kind() == "call_expression" {
                 if let Some(args) = child_by_field(child, "arguments") {
                     for j in 0..args.named_child_count() {
                         if let Some(arg) = args.named_child(j as u32) {
-                            if arg.kind() == "arrow_function" || arg.kind() == "function_expression"
-                            {
+                            if matches!(
+                                arg.kind(),
+                                "arrow_function" | "function_expression" | "generator_function"
+                            ) {
                                 return child_by_field(arg, body_field);
                             }
                         }
@@ -131,10 +146,10 @@ impl LanguageSpec for TypeScriptSpec {
 
     fn get_visibility(&self, node: Node<'_>) -> Option<String> {
         for i in 0..node.child_count() {
-            let child = node.child(i as u32)?;
+            let child = node.child(i)?;
             if child.kind() == "accessibility_modifier" {
                 for j in 0..child.child_count() {
-                    let modifier = child.child(j as u32)?;
+                    let modifier = child.child(j)?;
                     match modifier.kind() {
                         "public" => return Some("public".to_string()),
                         "private" => return Some("private".to_string()),
@@ -185,10 +200,7 @@ impl LanguageSpec for TypeScriptSpec {
 }
 
 fn has_direct_child_kind(node: Node<'_>, kind: &str) -> bool {
-    (0..node.child_count()).any(|i| {
-        node.child(i as u32)
-            .is_some_and(|child| child.kind() == kind)
-    })
+    (0..node.child_count()).any(|i| node.child(i).is_some_and(|child| child.kind() == kind))
 }
 
 pub(crate) fn class_field_is_callable(node: Node<'_>, field_kind: &str) -> bool {
@@ -199,14 +211,20 @@ pub(crate) fn class_field_is_callable(node: Node<'_>, field_kind: &str) -> bool 
         let Some(child) = node.named_child(i as u32) else {
             continue;
         };
-        if child.kind() == "arrow_function" || child.kind() == "function_expression" {
+        if matches!(
+            child.kind(),
+            "arrow_function" | "function_expression" | "generator_function"
+        ) {
             return true;
         }
         if child.kind() == "call_expression" {
             if let Some(args) = child_by_field(child, "arguments") {
                 for j in 0..args.named_child_count() {
                     if let Some(arg) = args.named_child(j as u32) {
-                        if arg.kind() == "arrow_function" || arg.kind() == "function_expression" {
+                        if matches!(
+                            arg.kind(),
+                            "arrow_function" | "function_expression" | "generator_function"
+                        ) {
                             return true;
                         }
                     }

@@ -8,19 +8,28 @@ Protocol handshake: `initialize` returns `serverInfo.name: "codegraph"`.
 `CARGO_PKG_VERSION`), so it tracks releases automatically rather than being
 hardcoded.
 
-`protocolVersion` is negotiated, not fixed. The server (built on `rmcp` 3.0.1)
-echoes back whatever revision the client asks for, as long as it is one it knows:
-**2024-11-05**, **2025-03-26**, **2025-06-18**, **2025-11-25**, or
-**2026-07-28**. An unrecognized request falls back to `2024-11-05`. What the
-negotiated revision changes:
+`protocolVersion` is negotiated, not fixed. The server is built on `rmcp` 3.5.0.
 
-| client requests | negotiated | `resultType` in results | streamable-HTTP session          |
-| --------------- | ---------- | ----------------------- | -------------------------------- |
-| 2024-11-05      | 2024-11-05 | absent                  | no `Mcp-Session-Id` (our config) |
-| 2025-03-26      | 2025-03-26 | absent                  | no `Mcp-Session-Id` (our config) |
-| 2025-06-18      | 2025-06-18 | absent                  | no `Mcp-Session-Id` (our config) |
-| 2025-11-25      | 2025-11-25 | absent                  | no `Mcp-Session-Id` (our config) |
-| 2026-07-28      | 2026-07-28 | `"complete"`            | no `Mcp-Session-Id` (per spec)   |
+- **`initialize`.** It echoes back the revision the client asks for, as long as it
+  is one it knows that has an `initialize` handshake: **2024-11-05**,
+  **2025-03-26**, **2025-06-18** or **2025-11-25**.
+- **2026-07-28.** This revision has no `initialize`. A 2026-07-28 client sends
+  every request statelessly: the protocol version and client capabilities go in
+  the request's `_meta` (`io.modelcontextprotocol/protocolVersion`,
+  `io.modelcontextprotocol/clientCapabilities`), alongside the SEP-2243 headers.
+- **Fallback.** An `initialize` that asks for 2026-07-28 falls back to
+  `2024-11-05`, like any unrecognized request.
+
+What the revision changes:
+
+| client sends                   | served at  | `resultType` in results | streamable-HTTP session          |
+| ------------------------------ | ---------- | ----------------------- | -------------------------------- |
+| `initialize` for 2024-11-05    | 2024-11-05 | absent                  | no `Mcp-Session-Id` (our config) |
+| `initialize` for 2025-03-26    | 2025-03-26 | absent                  | no `Mcp-Session-Id` (our config) |
+| `initialize` for 2025-06-18    | 2025-06-18 | absent                  | no `Mcp-Session-Id` (our config) |
+| `initialize` for 2025-11-25    | 2025-11-25 | absent                  | no `Mcp-Session-Id` (our config) |
+| `initialize` for 2026-07-28    | 2024-11-05 | absent                  | no `Mcp-Session-Id` (our config) |
+| a stateless 2026-07-28 request | 2026-07-28 | `"complete"`            | no `Mcp-Session-Id` (per spec)   |
 
 Results carry the SEP-2322 discriminator `resultType: "complete"` only for a
 2026-07-28 peer; older peers get the key stripped, and per spec a missing
@@ -325,7 +334,13 @@ CODEGRAPH_MCP_TOOLS=explore,node,search,callers,impact,check codegraph serve --m
 Every tool is query-only, so each carries MCP tool **annotations** in
 `tools/list` — `readOnlyHint: true`, `destructiveHint: false`,
 `idempotentHint: true`, `openWorldHint: false`. Hosts that respect these hints
-can call codegraph tools freely without write-confirmation prompts.
+can call codegraph tools freely without write-confirmation prompts. The hint
+describes the caller's environment: a tool never writes a source file or any
+path outside the project's index directory. The first call with an explicit
+`projectPath` may start that project's shared daemon and bring its
+**existing** derived index up to date (see the explicit-project lifecycle
+below); that is cache maintenance inside `.codegraph/`, never the creation of
+an index or a change to user files, so the hint stays `true`.
 
 ---
 
@@ -337,16 +352,43 @@ plus the call/impact graph around them. Prefer it over individual `callers`/
 `callees` chains when surveying an unfamiliar area.
 
 Explicit source paths in the query are resolved before fuzzy search and pinned
-to the front of the result. Quoted/backticked paths, `./`, Windows separators,
-`:123`, and `#L12` are normalized; exact matches precede segment-aligned suffix
+to the front of the result. Quoted/backticked paths, `./`, and Windows
+separators are normalized; exact matches precede segment-aligned suffix
 matches. Extensionless kebab basenames are accepted only when they resolve to at
-most three indexed files, so ordinary hyphenated prose remains prose. The
+most three indexed files, so ordinary hyphenated prose remains prose. When a
+path or basename matches several files and the query also names symbols in a
+code shape (camelCase, PascalCase, snake_case, `$` or qualified), only the
+matches defining one of them are pinned, and the summary names the files set
+aside; a basename shared by more than three files resolves the same way when
+the named symbols narrow it to three or fewer. The
 resolver examines at most eight path spans, drops at most eight leading
 segments, pins at most eight files (also bounded by `maxFiles`), and reports at
 most four unresolved explicit paths. Resolved or clearly missing explicit paths
 are removed from the normal query, preventing route parameters and basenames
 from becoming noisy symbol seeds. Pinned files survive low-score filtering and
 receive a protected source budget.
+
+Line references on a path that resolved to exactly one file are kept as
+anchors: `compiler.py:776`, `foo.ts:12-40`, `foo.ts#L88-L120`, and prose ranges
+bound to the nearest such path (`compiler.py lines 900-1003`,
+`L900-L1003 in compiler.py`, `lines 900 to 1003`). A bare number counts only
+after `line`/`lines` or directly after the path, and numbers above 1,000,000
+are ignored. A single-line anchor selects the innermost method, function, or
+component enclosing it; a range, or a line no callable encloses (with 15 lines
+either side), renders as that span. Those, and a qualified name
+(`SQLCompiler.as_sql`, `Engine::ServeHTTP`) with at most three non-test
+definitions, are **exact targets**: they lead the blast radius, their files rank
+ahead of incidental files, and their clusters render first. An exact body is
+returned whole when it fits the file's budget, and otherwise from its own head
+plus windows on the anchored line and on its calls into the other symbols the
+query names. A named neighbour that no longer fits beside it is listed in the
+file header instead.
+
+Each file's source is held to a per-file ceiling of 1.5 × the tier's per-file
+budget. A file the query names (by path, by an exact target, or by a symbol it
+defines) that this ceiling clipped is rendered again into whatever budget the
+rest of the response left unspent, so a question about one file can use the
+whole response while every other file keeps exactly the section it was given.
 
 Explore also resolves prose and camelCase query segments against indexed symbol
 names, then merges the resulting callable, Variable, and Constant names as
@@ -376,6 +418,25 @@ and `line` can pin an overloaded symbol to one definition. When given a file
 path without a symbol it returns the file's source with line numbers, which is a
 more accurate alternative to a plain `Read` tool call.
 
+File mode also accepts pasted editor/GitHub locations: `src/app.ts:42`,
+`src/app.ts:42-80`, `src/app.ts#L42`, and `src/app.ts#L42-L80` (the final `L` is
+optional). Resolution tries the literal indexed filename first; only a literal
+miss may strip a valid positive selector. A single line supplies the default
+`offset`; a closed range supplies the default inclusive `limit`. Explicit MCP
+`offset` and `limit` fields override the suffix independently, so
+`{"file":"src/app.ts:42-80","offset":5,"limit":2}` reads lines 5–6. Invalid,
+zero, reversed, overflowing, and ambiguous Windows-drive spellings stay literal.
+
+**`codegraph_callers`**, **`codegraph_callees`**, and **`codegraph_impact`** do
+not silently merge unrelated same-named definitions. Results are grouped by
+`(filePath, qualifiedName)`; same-definition overloads stay together, while two
+apps that each define `handle` get separate sections/blast radii. Pass `file`
+with an exact project-relative path or suffix to select one definition. A
+non-matching filter is disclosed and falls back to all definitions instead of
+returning a misleading empty result. Caller/callee limits apply per definition;
+when a cap hides rows, the response reports `Showing N of M` and tells the host
+to widen `limit` (up to 100).
+
 **`codegraph_impact`** returns the transitive incoming dependency set — every
 symbol that would break if the queried symbol changed. Use it before a refactor
 to understand the blast radius instead of walking callers manually.
@@ -383,6 +444,14 @@ to understand the blast radius instead of walking callers manually.
 **`codegraph_check`** returns cycles as ordered lists of file paths. It's
 additive: most projects have zero cycles; run it after a large dependency
 restructuring to confirm no new cycles were introduced.
+
+**`codegraph_status`** appends a `Pending sync` section when the current source
+scope differs from the persisted file inventory. It sees committed-but-unindexed
+work as well as working-tree and non-Git changes, applies the same project scope
+and content-hash gates as whole-tree sync, and lists each added/modified/removed
+path. The check is read-only and holds the engine's existing shared index lease.
+In a git work tree it takes the same git fast path as `codegraph status`, and it
+falls back to the full inventory under the same conditions.
 
 **`codegraph_export`** dumps the complete graph as NetworkX node-link JSON.
 Useful for external visualization tools, custom analysis scripts, or feeding an
@@ -424,6 +493,16 @@ Ranking-only `deprioritize` rules are loaded separately from watcher scope.
 Each request-scoped engine loads the addressed project's JSON rules followed by
 its authoritative TOML rules, so a long-lived stdio or HTTP process observes
 edits on its next search/explore request without changing the graph.
+
+Exactly one process owns background writes for each indexed project. Besides the
+short-lived `index.lock` leases taken by individual mutations, the daemon holds an
+OS kernel exclusive lock on `.codegraph/writer.pid` for its whole watcher/catch-up
+lifetime. The file's JSON is diagnostic; process death releases the kernel lock
+without trusting PID reuse or deleting/recreating the authority path. On a cold
+daemon start, the foreground stdio process answers the first handshake directly
+but starts no second watcher. When `CODEGRAPH_NO_DAEMON=1` is used, the foreground
+process owns this writer lock; a second direct server for the same project exits
+with actionable guidance. Read-only/no-default sessions take no writer lock.
 When the resolved root is exactly `$HOME` or the filesystem root (`/`), the
 server first disables the daemon, the file watcher, AND catch-up sync — not just
 the watcher. This happens when an IDE or agent (e.g. Kiro) launches
@@ -450,8 +529,25 @@ most 64 indexed candidates, skips dot/heavy/build/vendor/venv/cache/temp
 directories, and stops below an indexed child. Exactly one candidate is adopted
 and gets the full daemon/watcher/catch-up lifecycle. Zero or multiple candidates
 are never guessed. This scan is forbidden at `$HOME` and filesystem roots.
-Streamable HTTP global/no-path mode remains request-scoped and does not adopt a
-cwd child.
+
+Multiple indexed children do not need duplicate MCP registrations. On the first
+tool call that supplies an explicit `projectPath`, CodeGraph starts or attaches
+that **existing** project's shared daemon, retains one connection for the MCP
+session, and waits for a whole-project catch-up before executing the tool. Later
+saves are handled by that daemon's single watcher. A second MCP session reuses
+the same daemon; closing either session drops only its retained connection, so
+the other keeps live sync active. Each session retains at most 32 explicit
+projects. A retained service is re-checked on every call: if its daemon has
+exited, or the project's index was removed or re-created since the service
+attached, the stale connection is released and the next call attaches and
+catches up again instead of answering without live synchronization. This never
+creates an index, selects a default, or eagerly watches all discovered
+children. `CODEGRAPH_NO_DAEMON=1` explicitly opts out of this lazy daemon-backed
+lifecycle; `--no-watch` still permits the first catch-up but disables later
+file watching. Streamable HTTP global/no-path mode does not adopt a cwd child;
+because HTTP requests carry no session, one explicit-project service broker is
+shared by the whole server process, so the 32-project bound and the retained
+connections last until the server exits.
 
 ---
 
@@ -503,10 +599,17 @@ probe runs again on relevant requests, while the downward scan is throttled to
 once per five seconds so a project initialized after server startup can be
 adopted without walking the workspace on every call.
 
+For an explicit path that **does** resolve to an existing index, the first call
+is also the live-service boundary: it waits for catch-up and retains that
+project's shared daemon/watcher as described above. Query routing therefore does
+not imply default selection, while synchronization no longer depends on having a
+default project.
+
 > **Note:** the home-directory / filesystem-root guard (see [Daemon & live watch]
-> above) also skips the normal watcher and catch-up sync for those paths. A real
-> project nested under `$HOME` (e.g. `~/projects/myapp`) is unaffected — it is
-> resolved via find-up and gets the full daemon and watcher.
+> above) also skips the normal watcher and catch-up sync **against those broad
+> roots**. A real indexed project nested under `$HOME` (e.g.
+> `~/projects/myapp`) is unaffected: find-up/default adoption or an explicit
+> `projectPath` gives that project its own daemon and watcher.
 
 The daemon exits automatically after all clients disconnect and an idle timeout
 elapses. Logs are appended to `.codegraph/daemon.log`. A stale lock (e.g. after
@@ -521,8 +624,10 @@ for this check because a deliberately daemonized process legitimately reparents
 to `init`.
 
 To disable the daemon entirely and run the MCP server in the foreground, set
-`CODEGRAPH_NO_DAEMON=1`. For the full set of env-var knobs — timeouts, sweep
-intervals, watch settings — see [`docs/cli.md`](cli.md).
+`CODEGRAPH_NO_DAEMON=1`. Run only one such writer per indexed project; additional
+clients should leave daemon mode enabled and proxy to the shared process. For the
+full set of env-var knobs — timeouts, sweep intervals, watch settings — see
+[`docs/cli.md`](cli.md).
 
 ---
 
@@ -543,7 +648,8 @@ inject context but _how much_:
   Latin, Cyrillic, Greek, CJK, Hangul, Arabic, Hebrew, Thai, and Devanagari
   scripts), OR a code-shaped token (`getUserId`, `get_user`, `Counter()`,
   `user.login`) that is verified as a real symbol in the index, runs
-  `codegraph_explore` and injects its full output (capped at 16000 bytes).
+  `codegraph_explore` and injects its full output (capped at 9,000 UTF-8 bytes,
+  leaving wrapper headroom under Claude Code's 10,000-byte inline limit).
 - **Plain words matching indexed symbols → short hint.** When the prompt has no
   structural keyword or verified token but its prose words match indexed
   symbol-name segments (e.g. `checkout state machine` → `CheckoutStateMachine`),
@@ -560,6 +666,9 @@ telemetry or tracking of any kind**. Set `CODEGRAPH_NO_PROMPT_HOOK=1` (or
 `CODEGRAPH_PROMPT_HOOK=0`) to disable the hook without editing the config. Every
 failure path — kill-switch, non-matching prompt, no index, engine error — exits 0
 with no output; the hook is degradable by contract and never breaks the prompt.
+Host-generated task completions are also discarded before classification when
+their first non-whitespace content is `<task-notification>`; the same text later
+inside a real user discussion does not match that anchored gate.
 
 ---
 
@@ -625,3 +734,23 @@ gets **no** banner, which is what makes "trust everything not listed" a real
 guarantee rather than an assumption — the agent instructions had described this
 banner before anything produced it. Run `codegraph sync`, or wait for the watcher,
 if you see it on a hot codebase; ordinary drift does not require a full rebuild.
+
+### Auto-sync health
+
+When the server runs the project's live watcher in-process, every answer also
+reports its health, since edits the index never heard about cannot reach the
+per-file banner above:
+
+- **RECOVERING** — another process held the index past the sync's contention
+  budget (a long foreground `index`). Watching continues and changes are still
+  collected; a full reconcile is retried every 30 s, and until one commits each
+  response starts with `⚠️ CodeGraph auto-sync is RECOVERING …`.
+- **DISABLED** — watching stopped (watch resources exhausted, or syncs failing
+  persistently). Responses start with `⚠️ CodeGraph auto-sync is DISABLED …` and
+  the reason; run `codegraph sync` and restart the server.
+
+In either state `codegraph_search`, `codegraph_callers`, `codegraph_callees`
+and `codegraph_impact` check every indexed file they would name against disk,
+and when one changed or disappeared since its last sync they name those files
+instead of answering from the frozen graph. `codegraph_status` reports the
+state as `Auto-sync:`.

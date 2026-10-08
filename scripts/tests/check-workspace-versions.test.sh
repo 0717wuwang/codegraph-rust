@@ -9,8 +9,7 @@
 # It proves the gate:
 #   * FAILS (nonzero, business assertion) on a manifest/lock version drift,
 #   * FAILS on a workspace package-set mismatch,
-#   * FAILS on a stale version.txt,
-#   * FAILS on a stale .release-please-manifest.json,
+#   * FAILS on a stale .release-please-manifest.json or scaffold version,
 #   * PASSES (zero) on the real repository lock,
 # and on EVERY scenario the fixture's Cargo.lock bytes are byte-for-byte
 # unchanged.
@@ -53,7 +52,7 @@ bad()   { printf 'FAIL: %s\n' "$1" >&2; FAIL=$((FAIL + 1)); }
 # ---------------------------------------------------------------------------
 make_base_workspace() {
     local dir="$1" ver="$2"
-    mkdir -p "$dir/pa/src" "$dir/pb/src"
+    mkdir -p "$dir/pa/src" "$dir/pb/src" "$dir/.github"
 
     cat > "$dir/Cargo.toml" <<EOF
 [workspace]
@@ -94,8 +93,34 @@ name = "fixture-pb"
 version = "$ver"
 EOF
 
-    printf '%s\n' "$ver" > "$dir/version.txt"
     printf '{\n  ".": "%s"\n}\n' "$ver" > "$dir/.release-please-manifest.json"
+    printf '{"placeholders":{"CURRENT_VERSION":"%s"}}\n' "$ver" > "$dir/.github/scaffold.json"
+    cat > "$dir/release-please-config.json" <<'JSON'
+{
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "extra-files": [
+        {
+          "type": "toml",
+          "path": "Cargo.toml",
+          "jsonpath": "$.workspace.package.version"
+        },
+        {
+          "type": "toml",
+          "path": "Cargo.lock",
+          "jsonpath": "$.package[?(!@.source)].version"
+        },
+        {
+          "type": "json",
+          "path": ".github/scaffold.json",
+          "jsonpath": "$.placeholders.CURRENT_VERSION"
+        }
+      ]
+    }
+  }
+}
+JSON
 }
 
 # ---------------------------------------------------------------------------
@@ -200,17 +225,41 @@ version = "$V"
 EOF
 run_scenario "B_package_set_mismatch" "$DIR_B" 1 "package set differs|fixture-vendored"
 
-# Scenario C — stale version.txt (all else valid).
-DIR_C="$WORK/stale_version_txt"
-make_base_workspace "$DIR_C" "$V"
-printf '0.40.3\n' > "$DIR_C/version.txt"
-run_scenario "C_stale_version_txt" "$DIR_C" 1 "version\.txt"
+# Scenario C — Release Please must keep the virtual-workspace-safe update
+# contract. The native Rust/cargo-workspace updaters require literal
+# `[package].version` fields and cannot update this fixture's root/member shape.
+DIR_C1="$WORK/native_rust_strategy"
+make_base_workspace "$DIR_C1" "$V"
+jq '.packages["."]."release-type" = "rust"' "$DIR_C1/release-please-config.json" \
+    > "$DIR_C1/release-please-config.json.next"
+mv "$DIR_C1/release-please-config.json.next" "$DIR_C1/release-please-config.json"
+run_scenario "C1_native_rust_strategy" "$DIR_C1" 1 "simple strategy.*virtual Cargo workspace"
+
+DIR_C2="$WORK/missing_cargo_toml_extra"
+make_base_workspace "$DIR_C2" "$V"
+jq '.packages["."]."extra-files" |= map(select(.path != "Cargo.toml"))' \
+    "$DIR_C2/release-please-config.json" > "$DIR_C2/release-please-config.json.next"
+mv "$DIR_C2/release-please-config.json.next" "$DIR_C2/release-please-config.json"
+run_scenario "C2_missing_cargo_toml_extra" "$DIR_C2" 1 "update Cargo.toml workspace.package.version"
+
+DIR_C3="$WORK/missing_cargo_lock_extra"
+make_base_workspace "$DIR_C3" "$V"
+jq '.packages["."]."extra-files" |= map(select(.path != "Cargo.lock"))' \
+    "$DIR_C3/release-please-config.json" > "$DIR_C3/release-please-config.json.next"
+mv "$DIR_C3/release-please-config.json.next" "$DIR_C3/release-please-config.json"
+run_scenario "C3_missing_cargo_lock_extra" "$DIR_C3" 1 "source-less Cargo.lock package version"
 
 # Scenario D — stale release-please manifest (all else valid).
 DIR_D="$WORK/stale_release_manifest"
 make_base_workspace "$DIR_D" "$V"
 printf '{\n  ".": "0.40.3"\n}\n' > "$DIR_D/.release-please-manifest.json"
 run_scenario "D_stale_release_manifest" "$DIR_D" 1 "release-please-manifest"
+
+# Scenario D2 — stale rendered-scaffold version (all other surfaces valid).
+DIR_D2="$WORK/stale_scaffold_version"
+make_base_workspace "$DIR_D2" "$V"
+printf '{"placeholders":{"CURRENT_VERSION":"0.40.3"}}\n' > "$DIR_D2/.github/scaffold.json"
+run_scenario "D2_stale_scaffold_version" "$DIR_D2" 1 "scaffold.json CURRENT_VERSION"
 
 # Scenario E — the real repository lock (Green and unchanged).
 run_scenario "E_repository_green" "$REPO_ROOT" 0 "check-workspace-versions: OK"
@@ -318,6 +367,36 @@ if ! grep -q 'MISSING-OR-UNREADABLE' "$WORK/H.err"; then
     bad "H_trap_deletion: missing/unreadable lock not reported as changed"; h_ok=0
 fi
 [ "$h_ok" -eq 1 ] && ok "H_trap_deletion (exit=$h_rc, missing lock → 90)"
+
+# ---------------------------------------------------------------------------
+# Scenario I — CRLF tool output. Windows builds of jq end every output line with
+# `\r\n`; the gate must normalise that rather than report every package as a
+# name/version mismatch. A shim first on PATH rewrites the real jq's output to
+# CRLF; the valid fixture must still pass.
+# ---------------------------------------------------------------------------
+REAL_JQ="$(command -v jq)"
+DIR_I="$WORK/crlf_jq"
+make_base_workspace "$DIR_I" "$V"
+SHIM_I="$WORK/shim_i"
+mkdir -p "$SHIM_I"
+cat > "$SHIM_I/jq" <<EOF
+#!/usr/bin/env bash
+set -o pipefail
+"$REAL_JQ" "\$@" | sed 's/\$/\r/'
+EOF
+chmod +x "$SHIM_I/jq"
+i_ok=1
+set +e
+PATH="$SHIM_I:$PATH" "$GATE" "$DIR_I" >"$WORK/I.out" 2>"$WORK/I.err"
+i_rc=$?
+set -e
+if [ "$i_rc" -ne 0 ]; then
+    bad "I_crlf_tool_output: expected exit 0, got $i_rc"; note "stderr: $(tr '\n' '|' < "$WORK/I.err")"; i_ok=0
+fi
+if ! grep -q 'check-workspace-versions: OK' "$WORK/I.out"; then
+    bad "I_crlf_tool_output: missing OK summary"; i_ok=0
+fi
+[ "$i_ok" -eq 1 ] && ok "I_crlf_tool_output (exit=$i_rc, CRLF jq output normalised)"
 
 printf '=== harness result: %d passed, %d failed ===\n' "$PASS" "$FAIL"
 [ "$FAIL" -eq 0 ]

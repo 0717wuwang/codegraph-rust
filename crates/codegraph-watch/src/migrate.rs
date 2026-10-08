@@ -37,7 +37,7 @@ use codegraph_core::IndexPaths;
 use codegraph_core::generated_header::detect_generated_file;
 use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{Edge, FileRecord, Node, UnresolvedRef};
-use codegraph_extract::{detect_language_with, extract_source_with};
+use codegraph_extract::detect_language_with;
 use codegraph_resolve::ReferenceResolver;
 use codegraph_store::StoreWriteAuthorization;
 
@@ -73,7 +73,10 @@ pub(crate) fn migrate_project(
     let options = &scope.options;
     // `scan_project` returns a SORTED list, and every downstream pass keeps that
     // order, so no HashSet iteration order can reach the database or the outcome.
-    let candidates = codegraph_extract::engine::scan_project(project_root, options)?;
+    // Capture git before the scan, so the record this build writes is race-safe.
+    let git_capture = crate::git_pending::GitIndexCapture::begin(project_root, options);
+    let scan = codegraph_extract::engine::scan_project_with_stats(project_root, options)?;
+    let candidates = scan.files;
     let total = candidates.len();
 
     // Publishes `phase=building` BEFORE deleting a database byte, removes only
@@ -93,30 +96,21 @@ pub(crate) fn migrate_project(
 
     for (done, relative) in candidates.iter().enumerate() {
         let full = project_root.join(relative);
-        // One metadata + one source read per file, mirroring the CLI producer so
-        // the oversized-file skip message is byte-identical.
-        let metadata = std::fs::metadata(&full)
-            .with_context(|| format!("reading metadata for {}", full.display()))?;
-        let source = std::fs::read_to_string(&full)
-            .with_context(|| format!("reading source file {}", full.display()))?;
-        let mut result = if metadata.len() > options.max_file_size {
-            codegraph_core::types::ExtractionResult {
-                nodes: Vec::new(),
-                edges: Vec::new(),
-                unresolved_references: Vec::new(),
-                errors: vec![format!(
-                    "File exceeds max size ({} > {}): {relative}",
-                    metadata.len(),
-                    options.max_file_size
-                )],
-                duration_ms: 0,
-            }
-        } else {
-            extract_source_with(relative, &source, None, &options.extensions)
+        // One bounded read per file through the reader the CLI producer uses, so
+        // the oversized-file skip message and the size stamp are byte-identical.
+        let (metadata, source) =
+            codegraph_extract::read_source_file(&full, relative, options.max_file_size)
+                .with_context(|| format!("reading source file {}", full.display()))?;
+        // A video clip named `.ts` is not source, so it gets no record (#1910).
+        let Some(hash_input) = source.hash_input() else {
+            on_progress(done + 1, total);
+            continue;
         };
+        let mut result =
+            codegraph_extract::engine::extraction_of(relative, &source, options, |_| {});
         let file = FileRecord {
             path: relative.clone(),
-            content_hash: hash_content(&source),
+            content_hash: hash_content(&hash_input),
             language: detect_language_with(relative, &options.extensions),
             size: metadata.len() as i64,
             modified_at: modified_millis(&metadata),
@@ -127,7 +121,7 @@ pub(crate) fn migrate_project(
                 .filter(|node| node.file_path == *relative)
                 .count() as i64,
             errors: result.errors.clone(),
-            generated: detect_generated_file(relative, &source),
+            generated: detect_generated_file(relative, &hash_input),
         };
 
         rebuild.store().upsert_file(&file)?;
@@ -164,12 +158,10 @@ pub(crate) fn migrate_project(
     }
     drop(refs);
 
-    let mut resolver = ReferenceResolver::new(project_root.to_string_lossy());
+    let mut resolver = ReferenceResolver::new(project_root.to_string_lossy())
+        .with_max_file_size(options.max_file_size);
     {
-        let context = codegraph_resolve::StoreResolutionContext::new(
-            rebuild.store(),
-            project_root.to_string_lossy(),
-        );
+        let context = resolver.store_context(rebuild.store());
         resolver.initialize(&context);
     }
     if resolver.has_framework_resolvers() {
@@ -191,6 +183,15 @@ pub(crate) fn migrate_project(
     rebuild
         .store()
         .set_project_metadata(INDEXED_WITH_VERSION_KEY, env!("CARGO_PKG_VERSION"))?;
+    crate::link_state::record_followed_links(rebuild.store(), &scan.links)?;
+    if let Some(capture) = git_capture {
+        capture.record(
+            rebuild.store(),
+            project_root,
+            options,
+            !scan.links.is_empty(),
+        )?;
+    }
 
     // Explicit fallible finalization: pragma restore, checkpoint + compaction,
     // extraction stamp, stamp checkpoint, connection close, and only then the

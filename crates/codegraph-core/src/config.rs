@@ -92,11 +92,33 @@ pub struct IndexingConfig {
     pub deprioritize: Vec<String>,
 }
 
+/// The largest source file extraction parses unless a project raises
+/// `indexing.max_file_size`; resolution reads no file extraction would skip.
+// upstream extraction/index.ts:101, src/file-limits.ts (`MAX_SOURCE_FILE_SIZE_BYTES`)
+// Skip files larger than this (bytes). Generated bundles, minified JS, and
+// vendored blobs blow the WASM heap. 1 MB covers essentially all hand-written source.
+pub const DEFAULT_MAX_FILE_SIZE: u64 = 1024 * 1024;
+
 fn default_max_file_size() -> u64 {
-    // upstream extraction/index.ts:101
-    // Skip files larger than this (bytes). Generated bundles, minified JS, and
-    // vendored blobs blow the WASM heap. 1 MB covers essentially all hand-written source.
-    1024 * 1024
+    DEFAULT_MAX_FILE_SIZE
+}
+
+/// Whether `relative_dir` — a project-relative, `/`-separated directory path —
+/// is a `build` directory that names a JVM package under a conventional source
+/// root (`**/src/<sourceSet>/{java,kotlin,scala}/**/build`) rather than build
+/// output. The default `build` prune exempts exactly that directory, not its
+/// subtree: the other defaults still apply inside it (upstream #1642).
+pub fn is_jvm_source_build_dir(relative_dir: &str) -> bool {
+    let segments = relative_dir.split('/').collect::<Vec<_>>();
+    let Some(last) = segments.len().checked_sub(1) else {
+        return false;
+    };
+    segments[last] == "build"
+        && (0..last).any(|index| {
+            segments[index] == "src"
+                && index + 2 < last
+                && matches!(segments[index + 2], "java" | "kotlin" | "scala")
+        })
 }
 
 fn default_ignore_dirs() -> Vec<String> {
@@ -374,6 +396,29 @@ mod tests {
                 Some(value) => unsafe { std::env::set_var("APP_CONFIG", value) },
                 None => unsafe { std::env::remove_var("APP_CONFIG") },
             }
+        }
+    }
+
+    #[test]
+    fn jvm_source_build_dirs_are_package_segments_not_output() {
+        for kept in [
+            "src/main/java/build",
+            "src/main/java/com/acme/build",
+            "module/src/test/kotlin/build",
+            "src/androidTest/scala/x/build",
+        ] {
+            assert!(is_jvm_source_build_dir(kept), "{kept}");
+        }
+        for pruned in [
+            "build",
+            "app/build",
+            "src/build",
+            "src/main/build",
+            "src/main/java",
+            "src/main/resources/build",
+            "lib/src/main/java/build/inner",
+        ] {
+            assert!(!is_jvm_source_build_dir(pruned), "{pruned}");
         }
     }
 

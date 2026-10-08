@@ -14,16 +14,16 @@ use std::sync::mpsc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
 use codegraph_core::config::Config;
 use codegraph_core::deprioritize::DeprioritizeMatcher;
 use codegraph_core::generated_header::detect_generated_file;
 use codegraph_core::logger::{LoggerConfig, init_logger};
 use codegraph_core::node_id::hash_content;
-use codegraph_core::types::{ExtractionResult, FileRecord, Language, Node, NodeKind};
-use codegraph_extract::{ExtractOptions, detect_language_with, extract_source_with_observer};
-use codegraph_graph::graph::{GodotReach, GraphTraverser};
+use codegraph_core::types::{Edge, ExtractionResult, FileRecord, Language, Node, NodeKind};
+use codegraph_extract::{ExtractOptions, detect_language_with};
+use codegraph_graph::graph::{GodotReach, GraphTraverser, group_definitions};
 use codegraph_graph::query::{SearchOptions, search_nodes};
 use codegraph_graph::{segment_match, segments};
 use codegraph_mcp::{McpServer, RunUntilAdoption};
@@ -40,6 +40,14 @@ use time::format_description::well_known::Rfc3339;
 mod diagnostics;
 mod installer;
 mod structural_gate;
+mod viewer_gate;
+
+/// musl's allocator serializes threads, so the static Linux release builds got
+/// slower as threads were added: a full index of this repository took over two
+/// minutes at 32 threads, against 51 s at one. Through mimalloc it takes 8 s.
+#[cfg(target_env = "musl")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 /// Test-only: the ONE process-wide environment lock for this binary.
 ///
@@ -170,7 +178,17 @@ fn main() {
 }
 
 fn cli_main() {
-    let cli = Cli::parse();
+    // The browser viewer is not part of a release yet: refuse `ui` / `web`
+    // (also as `help ui` or `ui --help`) before any startup work unless
+    // CODEGRAPH_UI=1 opts in.
+    let raw_args: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(command) = viewer_gate::requested_viewer_command(&raw_args)
+        && !viewer_gate::viewer_enabled()
+    {
+        eprintln!("{}", viewer_gate::refusal(command));
+        std::process::exit(1);
+    }
+    let cli = parse_cli();
     // Process bootstrap has no addressed project yet, so this config is
     // `APP_CONFIG`-or-defaults ONLY and may configure NOTHING but the logger
     // below. Every project operation (index, sync, watch, an MCP request) loads
@@ -209,8 +227,19 @@ fn cli_main() {
         if let Some(guidance) = index_removal_holder_guidance(&err) {
             eprint!("{guidance}");
         }
+        if let Some(guidance) = codegraph_store::wsl_shared_index_guidance(err.as_ref()) {
+            eprint!("{guidance}");
+        }
         std::process::exit(1);
     }
+}
+
+/// `Cli::parse()`, with the viewer listed in `--help` only when it is enabled.
+fn parse_cli() -> Cli {
+    let enabled = viewer_gate::viewer_enabled();
+    let command = Cli::command().mut_subcommand("ui", |ui| ui.hide(!enabled));
+    let matches = command.get_matches();
+    Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit())
 }
 
 #[derive(Debug, Parser)]
@@ -575,6 +604,21 @@ enum Command {
         #[command(subcommand)]
         action: McpAction,
     },
+    /// Open the CodeGraph viewer in your browser — read your indexed project as a graph.
+    #[command(hide = true, visible_alias = "web", after_help = UI_AFTER_HELP)]
+    Ui {
+        /// The indexed project to read (default: the one you're standing in).
+        path: Option<PathBuf>,
+        /// Port to listen on (default: 4747, or the next free one).
+        #[arg(long, value_name = "NUMBER")]
+        port: Option<String>,
+        /// Print the URL instead of opening a browser.
+        #[arg(long = "no-open")]
+        no_open: bool,
+        /// Refuse every write — saved trails can be opened but not saved or deleted.
+        #[arg(long = "read-only")]
+        read_only: bool,
+    },
     /// Print the codegraph version.
     Version,
     /// Generate shell completion scripts (bash, zsh, fish, powershell, elvish).
@@ -923,6 +967,12 @@ fn run(cli: Cli) -> Result<()> {
         Command::Mcp { action } => match action {
             McpAction::List { json } => cmd_mcp_list(json),
         },
+        Command::Ui {
+            path,
+            port,
+            no_open,
+            read_only,
+        } => cmd_ui(path, port, no_open, read_only),
         Command::Version => {
             println!("codegraph {VERSION}");
             Ok(())
@@ -1244,9 +1294,39 @@ struct PromptHookPayload {
     cwd: Option<String>,
 }
 
-/// Cap on the HIGH-tier explore injection so a large-repo explore can't flood
-/// the prompt (upstream `MAX = 16000`).
-const PROMPT_HOOK_MAX_INJECT: usize = 16000;
+/// Claude Code's documented inline hook-output limit (#1694). Larger output is
+/// persisted to a file and the model sees only a short preview.
+const CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT: usize = 10_000;
+
+/// Maximum UTF-8 bytes of HIGH-tier Explore text placed inside the hook wrapper.
+/// 9,000 leaves headroom for the wrapper and truncation notice while staying
+/// below [`CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT`].
+const PROMPT_HOOK_MAX_INJECT: usize = 9_000;
+const _: () = assert!(PROMPT_HOOK_MAX_INJECT < CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT);
+
+fn cap_prompt_hook_injection(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.len() <= PROMPT_HOOK_MAX_INJECT {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut cut = PROMPT_HOOK_MAX_INJECT;
+    while !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    std::borrow::Cow::Owned(format!(
+        "{}\n\u{2026}(truncated; call codegraph_explore for the rest)",
+        &text[..cut]
+    ))
+}
+
+/// Host-generated task completion messages arrive through the same hook channel
+/// as typed prompts (#1832). The whole prompt must be that envelope — opened at
+/// its first non-whitespace content and closed at its last — so a question
+/// typed after the notification, or one that merely mentions the tag, is still
+/// a prompt (upstream v1.6.1 `isTaskNotification`).
+fn is_task_notification_wrapper(prompt: &str) -> bool {
+    let trimmed = prompt.trim_matches(char::is_whitespace);
+    trimmed.starts_with("<task-notification>") && trimmed.ends_with("</task-notification>")
+}
 
 /// `codegraph prompt-hook` — the Claude `UserPromptSubmit` hook entry point,
 /// now a confidence-tiered gate (upstream #1126 + #1136, telemetry EXCLUDED):
@@ -1286,6 +1366,9 @@ fn cmd_prompt_hook(path: Option<PathBuf>, query: Option<String>) -> Result<()> {
     };
     let query = query.trim();
     if query.is_empty() {
+        return Ok(());
+    }
+    if is_task_notification_wrapper(query) {
         return Ok(());
     }
 
@@ -1341,21 +1424,12 @@ fn cmd_prompt_hook(path: Option<PathBuf>, query: Option<String>) -> Result<()> {
         if text.trim().is_empty() {
             return Ok(());
         }
-        let body = if text.len() > PROMPT_HOOK_MAX_INJECT {
-            let mut cut = PROMPT_HOOK_MAX_INJECT;
-            while !text.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            format!(
-                "{}\n\u{2026}(truncated; call codegraph_explore for the rest)",
-                &text[..cut]
-            )
-        } else {
-            text
-        };
-        println!(
+        let body = cap_prompt_hook_injection(&text);
+        let output = format!(
             "<codegraph_context note=\"Structural context from CodeGraph for this prompt \u{2014} treat returned source as already read; call codegraph_explore for more.\">\n{body}\n</codegraph_context>"
         );
+        debug_assert!(output.len() < CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT);
+        println!("{output}");
         return Ok(());
     }
 
@@ -1441,13 +1515,29 @@ fn cmd_init(
         "init",
     )?;
     println!("Initialized in {}", project.display());
+    // A fresh index on a Windows drive under WSL gets its own directory (#995);
+    // it is not the documented name, so say where it went and why.
+    if std::env::var_os("CODEGRAPH_DIR").is_none()
+        && let Ok(paths) = index_paths(&project)
+        && paths
+            .current_root()
+            .file_name()
+            .is_some_and(|name| name != codegraph_core::index_paths::DEFAULT_CURRENT_DIR)
+    {
+        println!(
+            "The index is in {}/: this project is on a Windows drive, so WSL keeps its own index \
+             rather than share {}/ with CodeGraph on Windows. Set CODEGRAPH_DIR to choose the name yourself.",
+            codegraph_core::index_paths::WSL_CURRENT_DIR,
+            codegraph_core::index_paths::DEFAULT_CURRENT_DIR
+        );
+    }
     print_index_result(&result);
     ensure_index_gitignore(&index_paths(&project)?);
     installer::run_install_local_targets(project, target)
 }
 
 fn cmd_uninit(path: Option<PathBuf>, force: bool) -> Result<()> {
-    let project = resolve_required_rebuild_project(path)?;
+    let project = resolve_required_rebuild_project(path, true)?;
     if !force {
         bail!("refusing to delete .codegraph without --force");
     }
@@ -1621,7 +1711,10 @@ fn cmd_index(
     // interrupted Building rebuild. Resolve state slots as well as a DB artifact
     // so the crash window after deletion but before final writer creation remains
     // reachable; authorization is still decided later under the exclusive lease.
-    let project = resolve_required_rebuild_project(path)?;
+    // An explicit path is the project to rebuild, not a hint to search upward.
+    // A bare `codegraph index` keeps the convenient cwd-to-ancestor discovery.
+    let allow_ancestor = path.is_none();
+    let project = resolve_required_rebuild_project(path, allow_ancestor)?;
     guard_indexable_root(&project)?;
     let paths = index_paths(&project)?;
     recover_dead_owner_sidecars(&paths, &project);
@@ -1655,7 +1748,7 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool, diagnostics: DiagnosticArgs) -> 
     // can migrate it under one retained exclusive lease. Uninitialized remains
     // discoverable only to reach the typed under-lease rejection; it is never
     // authorized to sync or recreate residue.
-    let project = resolve_required_rebuild_project(path)?;
+    let project = resolve_required_rebuild_project(path, true)?;
     let paths = index_paths(&project)?;
     if let Some(reason) = owner_mismatch_only_reason(&paths) {
         bail!("{}", owner_mismatch_recovery_error(&project, &reason));
@@ -1744,6 +1837,19 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool, diagnostics: DiagnosticArgs) -> 
             );
         }
     }
+    let mut sync_warnings = Vec::new();
+    if let Ok(store) = open_store(&project) {
+        for relative in &outcome.changed_paths {
+            if let Some(record) = store.file_by_path(relative)? {
+                sync_warnings.extend(
+                    record
+                        .errors
+                        .into_iter()
+                        .filter(|error| codegraph_extract::is_extraction_warning(error)),
+                );
+            }
+        }
+    }
     diagnostic_run.phase_end(
         "sync",
         sync_started.elapsed(),
@@ -1762,6 +1868,25 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool, diagnostics: DiagnosticArgs) -> 
             format_number(outcome.files_removed as i64),
             format_duration(outcome.duration_ms as i64)
         );
+        // A sync that healed an interrupted index reports the sweep's work, so
+        // recovering references on unchanged files is not a no-op (#1360).
+        if outcome.pending_refs_processed > 0 {
+            let unresolved = if outcome.pending_refs_unresolved > 0 {
+                format!(
+                    " ({} unresolved)",
+                    format_number(outcome.pending_refs_unresolved as i64)
+                )
+            } else {
+                String::new()
+            };
+            println!(
+                "Resolved {} pending references{unresolved}",
+                format_number(outcome.pending_refs_resolved as i64)
+            );
+        }
+        for warning in &sync_warnings {
+            eprintln!("warning: {warning}");
+        }
     }
     diagnostic_run.finish_success(json!({
         "durationMs": outcome.duration_ms,
@@ -1769,6 +1894,10 @@ fn cmd_sync(path: Option<PathBuf>, quiet: bool, diagnostics: DiagnosticArgs) -> 
         "filesReindexed": outcome.files_reindexed,
         "filesSkipped": outcome.files_skipped_unchanged,
         "filesRemoved": outcome.files_removed,
+        "pendingRefsProcessed": outcome.pending_refs_processed,
+        "pendingRefsResolved": outcome.pending_refs_resolved,
+        "pendingRefsUnresolved": outcome.pending_refs_unresolved,
+        "warnings": sync_warnings,
     }));
     Ok(())
 }
@@ -2026,6 +2155,7 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
         && built_with_extraction_version
             .is_none_or(|v| v < codegraph_store::CURRENT_EXTRACTION_VERSION);
     let resolution_incomplete = store.is_resolution_incomplete()?;
+    let pending = codegraph_watch::pending_project_changes(&project, &store)?;
 
     if json_output {
         let mut index_obj = json!({
@@ -2053,7 +2183,14 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
             "journalMode": journal_mode(&store)?,
             "nodesByKind": map_counts(nodes_by_kind.clone()),
             "languages": files_by_language.iter().filter(|(_, c)| *c > 0).map(|(l, _)| l).collect::<Vec<_>>(),
-            "pendingChanges": { "added": 0, "modified": 0, "removed": 0 },
+            "pendingChanges": {
+                "added": pending.added.len(),
+                "modified": pending.modified.len(),
+                "removed": pending.removed.len(),
+                "addedPaths": pending.added,
+                "modifiedPaths": pending.modified,
+                "removedPaths": pending.removed,
+            },
             "worktreeMismatch": null,
             "index": index_obj,
                 "dbPath": db,
@@ -2097,9 +2234,31 @@ fn cmd_status(path: Option<PathBuf>, json_output: bool) -> Result<()> {
     for (language, count) in files_by_language {
         println!("  {language:15} {}", format_number(count));
     }
+    if !pending.is_empty() {
+        println!(
+            "\nPending sync: {} added, {} modified, {} removed",
+            pending.added.len(),
+            pending.modified.len(),
+            pending.removed.len()
+        );
+        for (label, paths) in [
+            ("added", &pending.added),
+            ("modified", &pending.modified),
+            ("removed", &pending.removed),
+        ] {
+            for path in paths {
+                println!("  {label:8} {path}");
+            }
+        }
+    }
     if resolution_incomplete {
         println!(
             "\n⚠ Index is PARTIAL: a resolution pass was interrupted, so some call\n  edges are missing. Run `codegraph sync` to heal it.\n"
+        );
+    } else if !pending.is_empty() {
+        println!(
+            "\nIndex has {} pending source change(s). Run `codegraph sync`.\n",
+            pending.total()
         );
     } else {
         println!("\nIndex is up to date\n");
@@ -2765,7 +2924,12 @@ fn resolve_http_addr(http_addr: &str) -> Result<std::net::SocketAddr> {
 /// Indirection to `codegraph_mcp::serve_http` (streamable-HTTP via rmcp, the
 /// sole HTTP transport).
 fn serve_http_impl(default_project: Option<PathBuf>, addr: std::net::SocketAddr) -> Result<()> {
-    codegraph_mcp::serve_http(default_project, addr).context("serving MCP over streamable-HTTP")
+    codegraph_mcp::serve_http_with_project_services(
+        default_project,
+        addr,
+        explicit_project_services(false),
+    )
+    .context("serving MCP over streamable-HTTP")
 }
 
 /// `codegraph http list`: prune dead entries, then print a table of the live
@@ -3424,17 +3588,17 @@ mod normalize_lexical_tests {
     }
 }
 
-/// Whether `serve --mcp` should start background services (live watcher +
-/// catch-up sync) for `project_root`. They run when the path was EXPLICIT
-/// (`--path X` — the user opted into X) or the cwd is ALREADY indexed. A bare
-/// serve from an UNINDEXED cwd (the Zed case) returns false so catch-up never
-/// self-indexes the cwd — keeping it unindexed and therefore adoptable when the
-/// client reports its real workspace root via `roots/list`.
-fn should_run_serve_services(explicit_path: bool, project_root: &Path) -> bool {
-    explicit_path
-        || codegraph_dir(project_root)
-            .map(|d| d.is_dir())
-            .unwrap_or(false)
+/// Whether `serve --mcp` should start background writer services (live watcher +
+/// catch-up sync) for `project_root`.
+///
+/// An explicit `--path` pins query resolution but is not permission to create an
+/// index namespace. Services therefore start only for an existing index root;
+/// both bare and explicit launches against an unindexed project remain read-only
+/// and leave `codegraph init` as the sole creator of `.codegraph`.
+fn should_run_serve_services(_explicit_path: bool, project_root: &Path) -> bool {
+    codegraph_dir(project_root)
+        .map(|directory| directory.is_dir())
+        .unwrap_or(false)
 }
 
 fn serve_direct(
@@ -3444,6 +3608,19 @@ fn serve_direct(
     explicit_path: bool,
 ) -> Result<()> {
     let run_services = should_run_serve_services(explicit_path, project_root);
+    let _writer_guard = if run_services && should_run_daemon_services(project_root) {
+        match codegraph_daemon::try_acquire_writer_lock(project_root, "direct")? {
+            codegraph_daemon::WriterAcquireResult::Acquired(guard) => Some(guard),
+            codegraph_daemon::WriterAcquireResult::Taken { pid_path, existing } => {
+                bail!(
+                    "{}",
+                    codegraph_daemon::writer_lock_held_message(existing.as_ref(), &pid_path)
+                );
+            }
+        }
+    } else {
+        None
+    };
     // Watcher startup stays here (pre-handshake). Layer A
     // (`watch_disabled_reason`) already refuses to walk HOME / the filesystem
     // root, so a home-rooted launch never exhausts inotify. Restarting the
@@ -3465,7 +3642,7 @@ fn serve_direct(
     // would then be rejected as "already indexed cwd").
     let _catch_up_done = (run_services && should_run_daemon_services(project_root))
         .then(|| spawn_catch_up(project_root));
-    serve_direct_stdio(project)
+    serve_direct_stdio(project, explicit_project_services(no_watch))
 }
 
 /// Serve the direct (pinned) stdio path through the rmcp [`CodeGraphHandler`]
@@ -3473,8 +3650,20 @@ fn serve_direct(
 /// adoption handoff keeps the hand-rolled path (`serve_direct_no_services` →
 /// [`McpServer::run_until_adoption`]), since rmcp owns its read loop and cannot
 /// hand the reader back for the daemon proxy.
-fn serve_direct_stdio(project: Option<PathBuf>) -> Result<()> {
-    codegraph_mcp::serve_stdio_rmcp(project).context("running rmcp MCP stdio server")
+fn serve_direct_stdio(
+    project: Option<PathBuf>,
+    project_services: Option<codegraph_mcp::ProjectServiceBroker>,
+) -> Result<()> {
+    codegraph_mcp::serve_stdio_rmcp_with_project_services(project, project_services)
+        .context("running rmcp MCP stdio server")
+}
+
+/// Lazy services for repositories selected by an explicit per-call
+/// `projectPath`. The shared daemon owns the watcher; the MCP handler retains a
+/// passive connection and waits for catch-up once per project/session. Explicit
+/// `CODEGRAPH_NO_DAEMON=1` remains an opt-out from this daemon-backed behavior.
+fn explicit_project_services(no_watch: bool) -> Option<codegraph_mcp::ProjectServiceBroker> {
+    (!daemon_opt_out()).then(|| codegraph_daemon::project_service_broker(no_watch))
 }
 
 /// Serves MCP tools off any existing index WITHOUT starting the watcher,
@@ -3491,7 +3680,8 @@ fn serve_direct_no_services(
     // borrowed `.lock()` guards (`!Send`) cannot.
     let reader = BufReader::new(io::stdin());
     let stdout = io::stdout();
-    let mut server = McpServer::new(project);
+    let mut server =
+        McpServer::new_with_project_services(project, explicit_project_services(no_watch));
     match server
         .run_until_adoption(reader, &stdout)
         .context("running MCP stdio server until workspace adoption")?
@@ -3515,22 +3705,37 @@ where
     W: Write + Send + 'static + Unpin,
 {
     let Some(socket_path) = start_daemon_for_adopted_root(&project_root, no_watch) else {
-        return codegraph_mcp::rmcp_session::serve_session_rmcp(reader, writer, project_root)
-            .context("running rmcp MCP stdio server for adopted project");
+        return codegraph_mcp::rmcp_session::serve_session_rmcp_with_project_services(
+            reader,
+            writer,
+            project_root,
+            explicit_project_services(no_watch),
+        )
+        .context("running rmcp MCP stdio server for adopted project");
     };
 
     match codegraph_daemon::attach_to_daemon(&socket_path) {
         Ok(client) if codegraph_daemon::verify_daemon_hello(&client.hello).is_none() => {}
         Ok(_) => {
             tracing::debug!("serve_adopted: daemon version mismatch; serving direct");
-            return codegraph_mcp::rmcp_session::serve_session_rmcp(reader, writer, project_root)
-                .context("running rmcp MCP stdio server for adopted project");
+            return codegraph_mcp::rmcp_session::serve_session_rmcp_with_project_services(
+                reader,
+                writer,
+                project_root,
+                explicit_project_services(no_watch),
+            )
+            .context("running rmcp MCP stdio server for adopted project");
         }
         Err(err) => {
             tracing::debug!(error = %err, "serve_adopted: daemon preflight failed; serving direct");
             heal_stale_daemon_if_dead(&project_root);
-            return codegraph_mcp::rmcp_session::serve_session_rmcp(reader, writer, project_root)
-                .context("running rmcp MCP stdio server for adopted project");
+            return codegraph_mcp::rmcp_session::serve_session_rmcp_with_project_services(
+                reader,
+                writer,
+                project_root,
+                explicit_project_services(no_watch),
+            )
+            .context("running rmcp MCP stdio server for adopted project");
         }
     }
 
@@ -3742,7 +3947,10 @@ fn serve_spawn_or_proxy(
             if let Some(result) = proxy_to_running_daemon(project_root) {
                 return result;
             }
-            serve_direct(project, project_root, no_watch, explicit_path)
+            // A failed transport attach does not grant a second watcher. Keep the
+            // request path available as a read-only direct session while the live
+            // daemon retains the sole background-writer capability.
+            serve_direct_stdio(project, explicit_project_services(no_watch))
         }
         ColdStartAction::SpawnDaemonAndServeDirect => {
             // Cold: kick off the shared daemon for FUTURE sessions, then serve
@@ -3752,8 +3960,18 @@ fn serve_spawn_or_proxy(
             // failed/lost race just means this session serves direct (which it
             // does anyway). We deliberately do NOT poll or proxy here: that
             // prelude is exactly what blew past opencode's handshake timeout.
-            spawn_shared_daemon_best_effort(project_root, no_watch);
-            serve_direct(project, project_root, no_watch, explicit_path)
+            if spawn_shared_daemon_best_effort(project_root, no_watch) {
+                // The detached daemon is the sole writer. This foreground process
+                // exists only to answer the first MCP handshake without waiting for
+                // socket readiness; starting another watcher/catch-up here recreated
+                // the exact dual-writer race #1740 guards against.
+                serve_direct_stdio(project, explicit_project_services(no_watch))
+            } else {
+                // If the child could not even be spawned, preserve the established
+                // in-process fallback. It takes writer.pid itself, so two fallback
+                // processes still cannot run competing watchers.
+                serve_direct(project, project_root, no_watch, explicit_path)
+            }
         }
     }
 }
@@ -3800,18 +4018,21 @@ fn proxy_to_running_daemon(project_root: &Path) -> Option<Result<()>> {
 /// session serves direct regardless), and the daemon's own pid lock guarantees
 /// N concurrent cold starts do not produce N daemons. Does NOT block on socket
 /// readiness — that would reintroduce the handshake stall this fix removes.
-fn spawn_shared_daemon_best_effort(project_root: &Path, no_watch: bool) {
+fn spawn_shared_daemon_best_effort(project_root: &Path, no_watch: bool) -> bool {
     match std::env::current_exe() {
         Ok(exe) => match codegraph_daemon::spawn_detached_daemon(&exe, project_root, no_watch) {
             Ok(()) => {
                 tracing::debug!("serve_spawn_or_proxy: spawned shared daemon (fire-and-forget)");
+                true
             }
             Err(err) => {
                 tracing::debug!(error = %err, "serve_spawn_or_proxy: daemon spawn failed; serving direct only");
+                false
             }
         },
         Err(err) => {
             tracing::debug!(error = %err, "serve_spawn_or_proxy: current_exe unavailable; serving direct only");
+            false
         }
     }
 }
@@ -3981,8 +4202,8 @@ mod serve_mode_tests {
         std::fs::create_dir_all(indexed.join(".codegraph")).unwrap();
 
         assert!(
-            should_run_serve_services(true, &unindexed),
-            "explicit --path must run services even on an unindexed root"
+            !should_run_serve_services(true, &unindexed),
+            "explicit --path pins queries but must not create an index or writer namespace"
         );
         assert!(
             !should_run_serve_services(false, &unindexed),
@@ -4067,6 +4288,52 @@ mod serve_mode_tests {
     }
 }
 
+#[cfg(test)]
+mod prompt_hook_output_tests {
+    use super::{
+        CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT, PROMPT_HOOK_MAX_INJECT, cap_prompt_hook_injection,
+        is_task_notification_wrapper,
+    };
+
+    #[test]
+    fn high_tier_body_cap_stays_inline_and_preserves_utf8_boundaries() {
+        assert_eq!(PROMPT_HOOK_MAX_INJECT, 9_000);
+        assert_eq!(cap_prompt_hook_injection("short"), "short");
+
+        let ascii = "a".repeat(PROMPT_HOOK_MAX_INJECT + 500);
+        let capped = cap_prompt_hook_injection(&ascii);
+        assert!(capped.starts_with(&"a".repeat(PROMPT_HOOK_MAX_INJECT)));
+        assert!(capped.contains("truncated; call codegraph_explore"));
+        assert!(capped.len() < CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT);
+
+        let unicode = "界".repeat(4_000);
+        let capped = cap_prompt_hook_injection(&unicode);
+        assert!(capped.is_char_boundary(capped.len()));
+        assert!(capped.starts_with(&"界".repeat(PROMPT_HOOK_MAX_INJECT / 3)));
+        assert!(capped.len() < CLAUDE_CODE_INLINE_HOOK_OUTPUT_LIMIT);
+    }
+
+    #[test]
+    fn task_notification_gate_is_anchored_after_leading_whitespace_only() {
+        assert!(is_task_notification_wrapper(
+            "\n  <task-notification>finished calls Foo()</task-notification>"
+        ));
+        assert!(!is_task_notification_wrapper(
+            "Please explain <task-notification> and its call flow"
+        ));
+        assert!(!is_task_notification_wrapper("<task-notification-extra>"));
+        assert!(!is_task_notification_wrapper(
+            "<task-notification>done</task-notification>\nNow explain how Foo() is called"
+        ));
+        assert!(!is_task_notification_wrapper(
+            "<task-notification>unterminated"
+        ));
+        assert!(is_task_notification_wrapper(
+            "<task-notification>done</task-notification>\n\n"
+        ));
+    }
+}
+
 fn cmd_unlock(path: Option<PathBuf>) -> Result<()> {
     let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
     index_paths(&start)?;
@@ -4127,7 +4394,7 @@ fn cmd_callers(
 ) -> Result<()> {
     let project = resolve_required_project(path)?;
     let store = open_store(&project)?;
-    let nodes = related_nodes_for_symbol(
+    let report = related_report_for_symbol(
         &store,
         &project,
         &symbol,
@@ -4137,21 +4404,32 @@ fn cmd_callers(
     )?;
     let godot = godot_honesty_for_symbol(&store, &project, &symbol)?;
     if json_output {
+        let targets = report
+            .definitions
+            .iter()
+            .flat_map(|definition| definition.roots.iter())
+            .map(|node| definition_json(std::slice::from_ref(node))["definition"].clone())
+            .collect::<Vec<_>>();
         print_json_pretty(&json!({
             "symbol": symbol,
+            "targets": targets,
+            "ambiguous": report.definitions.len() > 1,
+            "aggregation": if report.definitions.len() > 1 { "union" } else { "definition" },
             "file": file,
-            "callers": nodes,
+            "filteredOut": report.filtered_out,
+            "note": report.note,
+            "definitions": related_definitions_json(&report, Related::Callers),
+            "callers": related_union_json(&report, Related::Callers),
+            "total": report.total,
+            "limit": report.limit,
+            "truncated": report.total > report.limit,
             "godotDynamic": godot.as_json(),
         }))?;
     } else {
-        print_related(
-            "Callers",
-            &describe_symbol(&symbol, file.as_deref()),
-            &nodes,
-        );
-        godot.print_cli(nodes.is_empty());
+        print_related_report("Callers", "callers", &symbol, &report, Related::Callers);
+        godot.print_cli(report.union.is_empty());
     }
-    if strict && nodes.is_empty() {
+    if strict && report.union.is_empty() {
         bail!("codegraph callers: no callers found for \"{symbol}\"");
     }
     Ok(())
@@ -4167,7 +4445,7 @@ fn cmd_callees(
 ) -> Result<()> {
     let project = resolve_required_project(path)?;
     let store = open_store(&project)?;
-    let nodes = related_nodes_for_symbol(
+    let report = related_report_for_symbol(
         &store,
         &project,
         &symbol,
@@ -4176,15 +4454,30 @@ fn cmd_callees(
         file.as_deref(),
     )?;
     if json_output {
-        print_json_pretty(&json!({ "symbol": symbol, "file": file, "callees": nodes }))?;
+        let targets = report
+            .definitions
+            .iter()
+            .flat_map(|definition| definition.roots.iter())
+            .map(|node| definition_json(std::slice::from_ref(node))["definition"].clone())
+            .collect::<Vec<_>>();
+        print_json_pretty(&json!({
+            "symbol": symbol,
+            "targets": targets,
+            "ambiguous": report.definitions.len() > 1,
+            "aggregation": if report.definitions.len() > 1 { "union" } else { "definition" },
+            "file": file,
+            "filteredOut": report.filtered_out,
+            "note": report.note,
+            "definitions": related_definitions_json(&report, Related::Callees),
+            "callees": related_union_json(&report, Related::Callees),
+            "total": report.total,
+            "limit": report.limit,
+            "truncated": report.total > report.limit,
+        }))?;
     } else {
-        print_related(
-            "Callees",
-            &describe_symbol(&symbol, file.as_deref()),
-            &nodes,
-        );
+        print_related_report("Callees", "callees", &symbol, &report, Related::Callees);
     }
-    if strict && nodes.is_empty() {
+    if strict && report.union.is_empty() {
         bail!("codegraph callees: no callees found for \"{symbol}\"");
     }
     Ok(())
@@ -4229,66 +4522,146 @@ fn cmd_impact(
     if exact_matches.is_empty() {
         bail!(lookup_symbol_not_found_message(&symbol));
     }
-    let exact_matches = filter_matches_by_file(exact_matches, &symbol, file.as_deref())?;
+    let owned = exact_matches.into_iter().cloned().collect::<Vec<_>>();
+    let grouped = group_definitions(&owned, file.as_deref());
+    let note = grouped.filtered_out.then(|| {
+        format!(
+            "no definition of \"{symbol}\" matches file \"{}\" - showing all definitions instead",
+            file.as_deref().unwrap_or_default()
+        )
+    });
     let traverser = GraphTraverser::new(&store);
-    let mut nodes = HashMap::new();
-    let mut edge_keys = HashSet::new();
-    let mut godot_files: Vec<String> = Vec::new();
-    for node in exact_matches {
-        let impact = traverser.get_impact_radius(&node.id, depth)?;
-        for (id, node) in impact.nodes {
-            nodes.insert(id, node);
+    let definitions = grouped
+        .groups
+        .into_iter()
+        .map(|roots| impact_definition_report(&store, &traverser, roots, depth))
+        .collect::<Result<Vec<_>>>()?;
+
+    let mut affected = Vec::new();
+    let mut affected_seen = HashSet::new();
+    let mut edge_seen = HashSet::new();
+    let mut union_edges = Vec::new();
+    let mut resource_referrers = BTreeSet::new();
+    for definition in &definitions {
+        for node in &definition.affected {
+            let key = format!(
+                "{}\0{}\0{}\0{}",
+                node.kind.as_str(),
+                node.file_path,
+                node.name,
+                node.start_line
+            );
+            if affected_seen.insert(key) {
+                affected.push(node.clone());
+            }
         }
-        for edge in impact.edges {
-            edge_keys.insert((edge.source, edge.target, edge.kind));
+        for edge in &definition.edges {
+            let key = format!("{}\0{}\0{}", edge.source, edge.target, edge.kind.as_str());
+            if edge_seen.insert(key) {
+                union_edges.push(edge.clone());
+            }
         }
-        if is_godot_resource_target_node(node) && !godot_files.contains(&node.file_path) {
-            godot_files.push(node.file_path.clone());
-        }
-    }
-    let mut godot_referrers: Vec<String> = Vec::new();
-    for file in &godot_files {
-        godot_referrers.extend(godot_reverse_referrers(&store, file)?);
-    }
-    godot_referrers.sort();
-    godot_referrers.dedup();
-    // A loader-side referrer may already be represented by a graph edge (for
-    // example, a GDScript `preload`). Keep the path-keyed resource lane
-    // structurally disjoint from traversal nodes before counting or rendering.
-    let traversal_file_paths = nodes
-        .values()
-        .map(|node| node.file_path.as_str())
-        .collect::<HashSet<_>>();
-    godot_referrers.retain(|file| !traversal_file_paths.contains(file.as_str()));
-    let resource_edge_count = godot_referrers.len();
-    let mut affected = nodes.values().map(NodeSummary::from).collect::<Vec<_>>();
-    for from_file in godot_referrers {
-        affected.push(NodeSummary {
-            name: from_file.clone(),
-            kind: NodeKind::File,
-            file_path: from_file,
-            start_line: 0,
-        });
+        resource_referrers.extend(definition.resource_referrers.iter().cloned());
     }
     let godot = godot_honesty_for_symbol(&store, &project, &symbol)?;
     if json_output {
+        let targets = definitions
+            .iter()
+            .flat_map(|definition| definition.roots.iter())
+            .map(|node| definition_json(std::slice::from_ref(node))["definition"].clone())
+            .collect::<Vec<_>>();
+        let definition_json = definitions
+            .iter()
+            .map(|definition| {
+                let mut value = crate::definition_json(&definition.roots);
+                let object = value.as_object_mut().expect("definition JSON is object");
+                object.insert("nodeCount".to_string(), json!(definition.affected.len()));
+                object.insert(
+                    "edgeCount".to_string(),
+                    json!(definition.edges.len() + definition.resource_referrers.len()),
+                );
+                object.insert(
+                    "resourceEdgeCount".to_string(),
+                    json!(definition.resource_referrers.len()),
+                );
+                object.insert(
+                    "affected".to_string(),
+                    serde_json::Value::Array(
+                        definition
+                            .affected
+                            .iter()
+                            .zip(&definition.affected_ids)
+                            .map(|(node, id)| {
+                                let mut value = serde_json::to_value(node)
+                                    .expect("affected node summary serializes");
+                                if let Some(id) = id {
+                                    value
+                                        .as_object_mut()
+                                        .expect("affected node summary is object")
+                                        .insert("id".to_string(), json!(id));
+                                }
+                                value
+                            })
+                            .collect(),
+                    ),
+                );
+                object.insert(
+                    "edges".to_string(),
+                    serde_json::to_value(&definition.edges).expect("impact edges serialize"),
+                );
+                value
+            })
+            .collect::<Vec<_>>();
         print_json_pretty(&json!({
             "symbol": symbol,
-            "file": file,
             "depth": depth,
+            "targets": targets,
+            "ambiguous": definitions.len() > 1,
+            "aggregation": if definitions.len() > 1 { "union" } else { "definition" },
+            "file": file,
+            "filteredOut": grouped.filtered_out,
+            "note": note,
+            "definitions": definition_json,
             "nodeCount": affected.len(),
-            "edgeCount": edge_keys.len() + resource_edge_count,
-            "resourceEdgeCount": resource_edge_count,
+            "edgeCount": union_edges.len() + resource_referrers.len(),
+            "resourceEdgeCount": resource_referrers.len(),
             "affected": affected,
             "godotDynamic": godot.as_json(),
         }))?;
     } else {
-        println!(
-            "\nImpact of changing \"{}\" - {} affected symbols:\n",
-            describe_symbol(&symbol, file.as_deref()),
-            affected.len()
-        );
-        print_by_file(&affected);
+        if let Some(note) = &note {
+            println!("Note: {note}");
+        }
+        if definitions.len() > 1 {
+            println!(
+                "\nImpact of changing \"{symbol}\" - {} distinct definitions (each with its own blast radius; narrow with --file):",
+                definitions.len()
+            );
+        }
+        for definition in &definitions {
+            let head = &definition.roots[0];
+            if definitions.len() > 1 {
+                println!(
+                    "\n{} ({}) - {}:{} - {} affected symbols:\n",
+                    head.qualified_name,
+                    head.kind,
+                    head.file_path,
+                    head.start_line,
+                    definition.affected.len()
+                );
+            } else {
+                println!(
+                    "\nImpact of changing \"{}\" - {} affected symbols:\n",
+                    describe_symbol(&symbol, file.as_deref()),
+                    definition.affected.len()
+                );
+                println!(
+                    "{} ({}) - {}:{}\n",
+                    head.qualified_name, head.kind, head.file_path, head.start_line
+                );
+            }
+            print_by_file(&definition.affected);
+        }
         godot.print_cli(affected.is_empty());
     }
     Ok(())
@@ -4341,14 +4714,7 @@ fn node_target_is_file(engine: &codegraph_mcp::CodeGraphEngine, target: &str) ->
     if target.contains(['/', '\\']) {
         return true;
     }
-    engine
-        .indexed_file_paths()
-        .map(|paths| {
-            paths
-                .iter()
-                .any(|p| p == target || p.rsplit('/').next() == Some(target))
-        })
-        .unwrap_or(false)
+    engine.node_target_is_indexed_file(target).unwrap_or(false)
 }
 
 /// Render an MCP-engine `ToolResult` for a CLI subcommand: the plain rendered
@@ -4806,9 +5172,12 @@ struct IndexSummary {
     files_indexed: i64,
     files_skipped: i64,
     files_errored: i64,
+    files_skipped_unsupported: i64,
+    top_unsupported_extensions: Vec<(String, usize)>,
     nodes_created: i64,
     edges_created: i64,
     duration_ms: i64,
+    warnings: Vec<String>,
 }
 
 // Progress is a pure side effect: it only counts/displays and never gates,
@@ -4978,7 +5347,28 @@ fn index_project_inner(
         eprintln!("Scanning files…");
     }
     let scan_started = std::time::Instant::now();
-    let files = codegraph_extract::engine::scan_project(project, &options)?;
+    // Capture git before the scan, so the pending-status record this build
+    // writes is race-safe (#1878).
+    let git_capture = codegraph_watch::GitIndexCapture::begin(project, &options);
+    let scan = codegraph_extract::engine::scan_project_with_stats(project, &options)?;
+    let files_skipped_unsupported = scan
+        .unsupported_by_extension
+        .values()
+        .copied()
+        .sum::<usize>() as i64;
+    let mut top_unsupported_extensions = scan
+        .unsupported_by_extension
+        .into_iter()
+        .collect::<Vec<_>>();
+    top_unsupported_extensions.sort_by(|(left_ext, left_count), (right_ext, right_count)| {
+        right_count
+            .cmp(left_count)
+            .then_with(|| left_ext.cmp(right_ext))
+    });
+    top_unsupported_extensions.truncate(5);
+    let files = scan.files;
+    // Recorded with the index so a later sync can tell a retargeted link (#935).
+    let followed_links = scan.links;
     let scan_duration = scan_started.elapsed();
     let mut diagnostic_run = DiagnosticRun::start(
         project,
@@ -5029,6 +5419,8 @@ fn index_project_inner(
     let mut files_indexed = 0;
     let mut files_skipped = 0;
     let mut files_errored = 0;
+    let mut files_not_source = 0_u64;
+    let mut warnings = Vec::new();
 
     // Stream the graph to the store in capped batches instead of holding the whole
     // project in memory. Equivalence with the all-at-once path is byte-for-byte and
@@ -5077,7 +5469,8 @@ fn index_project_inner(
     diagnostic_run.phase_start("parse_write");
     let parse_started = std::time::Instant::now();
 
-    type ParsePayload = (String, FileRecord, ExtractionResult);
+    // `None` for an MPEG transport stream named `.ts`: video, not source (#1910).
+    type ParsePayload = Option<(String, FileRecord, ExtractionResult)>;
     let schedule_tracker = tracker.clone();
     let parse_tracker = tracker.clone();
     let buffer_tracker = tracker.clone();
@@ -5090,55 +5483,34 @@ fn index_project_inner(
             let relative = &files[index];
             let full = project.join(relative);
 
-            parse_tracker.stage(index, "metadata");
-            let metadata = match fs::metadata(&full)
-                .with_context(|| format!("reading metadata for {}", full.display()))
-            {
-                Ok(metadata) => metadata,
-                Err(error) => {
-                    parse_tracker.failed(index, &error);
-                    return Err(error);
-                }
-            };
-
             parse_tracker.stage(index, "read");
-            let source = match fs::read_to_string(&full)
-                .with_context(|| format!("reading source file {}", full.display()))
-            {
-                Ok(source) => source,
-                Err(error) => {
-                    parse_tracker.failed(index, &error);
-                    return Err(error);
-                }
+            let (metadata, source) =
+                match codegraph_extract::read_source_file(&full, relative, options.max_file_size)
+                    .with_context(|| format!("reading source file {}", full.display()))
+                {
+                    Ok(read) => read,
+                    Err(error) => {
+                        parse_tracker.failed(index, &error);
+                        return Err(error);
+                    }
+                };
+            // A file over the limit was never read: its size stamp stands in for
+            // its content, in the hash and in the generated-file check. A video
+            // clip named `.ts` is not source at all, so it is not recorded.
+            let Some(hash_input) = source.hash_input() else {
+                return Ok(None);
             };
             parse_tracker.stage(index, "prepare");
             let language = detect_language_with(relative, &options.extensions);
             parse_tracker.file_info(index, metadata.len(), language);
 
-            let result = if metadata.len() > options.max_file_size {
-                ExtractionResult {
-                    nodes: Vec::new(),
-                    edges: Vec::new(),
-                    unresolved_references: Vec::new(),
-                    errors: vec![format!(
-                        "File exceeds max size ({} > {}): {relative}",
-                        metadata.len(),
-                        options.max_file_size
-                    )],
-                    duration_ms: 0,
-                }
-            } else {
-                extract_source_with_observer(
-                    relative,
-                    &source,
-                    None,
-                    &options.extensions,
-                    |stage| parse_tracker.extraction_stage(index, stage),
-                )
-            };
+            let result =
+                codegraph_extract::engine::extraction_of(relative, &source, &options, |stage| {
+                    parse_tracker.extraction_stage(index, stage)
+                });
             let file = FileRecord {
                 path: relative.clone(),
-                content_hash: hash_content(&source),
+                content_hash: hash_content(&hash_input),
                 language,
                 size: metadata.len() as i64,
                 modified_at: modified_millis(&metadata),
@@ -5149,14 +5521,30 @@ fn index_project_inner(
                     .filter(|node| node.file_path == *relative)
                     .count() as i64,
                 errors: result.errors.clone(),
-                generated: detect_generated_file(relative, &source),
+                generated: detect_generated_file(relative, &hash_input),
             };
             parse_tracker.parsed(index, &result);
-            Ok((relative.clone(), file, result))
+            Ok(Some((relative.clone(), file, result)))
         },
         |buffered| buffer_tracker.buffered(buffered),
-        |index, (_relative, file, mut result)| {
-            if file.errors.is_empty() {
+        |index, payload| {
+            let Some((_relative, file, mut result)) = payload else {
+                files_not_source += 1;
+                persist_tracker.persisted(index);
+                return Ok(());
+            };
+            let fatal_errors = file
+                .errors
+                .iter()
+                .filter(|error| !codegraph_extract::is_extraction_warning(error))
+                .count();
+            warnings.extend(
+                file.errors
+                    .iter()
+                    .filter(|error| codegraph_extract::is_extraction_warning(error))
+                    .cloned(),
+            );
+            if fatal_errors == 0 {
                 files_indexed += 1;
             } else if result.nodes.is_empty() {
                 files_skipped += 1;
@@ -5196,7 +5584,7 @@ fn index_project_inner(
         }),
     );
 
-    let scan_files = bar.position();
+    let scan_files = bar.position() - files_not_source;
     finish_phase(
         &bar,
         &format!("Indexed {} files", format_number(scan_files as i64)),
@@ -5252,13 +5640,13 @@ fn index_project_inner(
     diagnostic_run.phase_start("framework_extract");
     let framework_started = std::time::Instant::now();
     let pb = phase_spinner("Detecting frameworks", quiet);
-    let mut resolver = ReferenceResolver::new(project.to_string_lossy());
+    let mut resolver =
+        ReferenceResolver::new(project.to_string_lossy()).with_max_file_size(options.max_file_size);
     // Detect frameworks then run their per-file extract (route/component/handler
     // nodes + refs) BEFORE resolution, mirroring the upstream tree-sitter.ts:4796-4819
     // framework-extraction pass feeding the resolution pipeline.
     {
-        let context =
-            codegraph_resolve::StoreResolutionContext::new(&store, project.to_string_lossy());
+        let context = resolver.store_context(&store);
         resolver.initialize(&context);
     }
     if resolver.has_framework_resolvers() {
@@ -5363,6 +5751,10 @@ fn index_project_inner(
         json!({}),
     );
     store.set_project_metadata("indexed_with_version", VERSION)?;
+    codegraph_watch::record_followed_links(&store, &followed_links)?;
+    if let Some(capture) = git_capture {
+        capture.record(&store, project, &options, !followed_links.is_empty())?;
+    }
     let after = store.counts()?;
     // Explicit fallible finalization: pragma restore -> checkpoint + compaction ->
     // extraction stamp -> stamp checkpoint -> close the final connection ->
@@ -5379,17 +5771,23 @@ fn index_project_inner(
         files_indexed,
         files_skipped,
         files_errored,
+        files_skipped_unsupported,
+        top_unsupported_extensions,
         nodes_created: after.node_count - before.node_count,
         edges_created: after.edge_count - before.edge_count,
         duration_ms: started.elapsed().as_millis() as i64,
+        warnings,
     };
     diagnostic_run.finish_success(json!({
         "durationMs": summary.duration_ms,
         "filesIndexed": summary.files_indexed,
         "filesSkipped": summary.files_skipped,
         "filesErrored": summary.files_errored,
+        "filesSkippedUnsupported": summary.files_skipped_unsupported,
+        "topUnsupportedExtensions": summary.top_unsupported_extensions,
         "nodesCreated": summary.nodes_created,
         "edgesCreated": summary.edges_created,
+        "warnings": summary.warnings,
     }));
     Ok(summary)
 }
@@ -5698,50 +6096,320 @@ fn print_index_result(result: &IndexSummary) {
             "Indexing failed - all {} files had errors",
             result.files_errored
         );
+    } else if result.files_skipped_unsupported > 0 {
+        let extensions = result
+            .top_unsupported_extensions
+            .iter()
+            .map(|(extension, count)| format!("{extension} ({})", format_number(*count as i64)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!(
+            "No supported source files found - {} file(s) present, none in a language CodeGraph indexes{}",
+            format_number(result.files_skipped_unsupported),
+            if extensions.is_empty() {
+                String::new()
+            } else {
+                format!(": {extensions}")
+            }
+        );
+        println!(
+            "CodeGraph is inactive for this workspace - searches will return nothing. Use your own file tools here."
+        );
     } else {
         println!("No files found to index");
     }
     if result.files_skipped > 0 {
         println!("Skipped {} files", format_number(result.files_skipped));
     }
+    for warning in &result.warnings {
+        eprintln!("warning: {warning}");
+    }
 }
 
-fn related_nodes_for_symbol(
+#[derive(Debug)]
+struct RelatedDefinitionReport {
+    roots: Vec<Node>,
+    nodes: Vec<Node>,
+    edges: Vec<Edge>,
+}
+
+#[derive(Debug)]
+struct RelatedReport {
+    definitions: Vec<RelatedDefinitionReport>,
+    union: Vec<Node>,
+    total: usize,
+    limit: usize,
+    filtered_out: bool,
+    note: Option<String>,
+}
+
+struct ImpactDefinitionReport {
+    roots: Vec<Node>,
+    affected: Vec<NodeSummary>,
+    affected_ids: Vec<Option<String>>,
+    edges: Vec<Edge>,
+    resource_referrers: Vec<String>,
+}
+
+fn impact_definition_report(
+    store: &Store,
+    traverser: &GraphTraverser<'_>,
+    roots: Vec<Node>,
+    depth: usize,
+) -> Result<ImpactDefinitionReport> {
+    let mut nodes = Vec::new();
+    let mut node_seen = HashSet::new();
+    let mut edges = Vec::new();
+    let mut edge_seen = HashSet::new();
+    let mut godot_files = Vec::new();
+    for root in &roots {
+        let impact = traverser.get_impact_radius(&root.id, depth)?;
+        for id in impact.node_order {
+            if node_seen.insert(id.clone())
+                && let Some(node) = impact.nodes.get(&id)
+            {
+                nodes.push(node.clone());
+            }
+        }
+        for edge in impact.edges {
+            let key = format!("{}\0{}\0{}", edge.source, edge.target, edge.kind.as_str());
+            if edge_seen.insert(key) {
+                edges.push(edge);
+            }
+        }
+        if is_godot_resource_target_node(root) && !godot_files.contains(&root.file_path) {
+            godot_files.push(root.file_path.clone());
+        }
+    }
+    let mut godot_referrers = Vec::new();
+    for file in &godot_files {
+        godot_referrers.extend(godot_reverse_referrers(store, file)?);
+    }
+    godot_referrers.sort();
+    godot_referrers.dedup();
+    let traversal_file_paths = nodes
+        .iter()
+        .map(|node| node.file_path.as_str())
+        .collect::<HashSet<_>>();
+    godot_referrers.retain(|file| !traversal_file_paths.contains(file.as_str()));
+    let resource_referrers = godot_referrers.clone();
+    let mut affected = nodes.iter().map(NodeSummary::from).collect::<Vec<_>>();
+    let mut affected_ids = nodes
+        .iter()
+        .map(|node| Some(node.id.clone()))
+        .collect::<Vec<_>>();
+    affected.extend(godot_referrers.into_iter().map(|file_path| NodeSummary {
+        name: file_path.clone(),
+        kind: NodeKind::File,
+        file_path,
+        start_line: 0,
+    }));
+    affected_ids.resize(affected.len(), None);
+    Ok(ImpactDefinitionReport {
+        roots,
+        affected,
+        affected_ids,
+        edges,
+        resource_referrers,
+    })
+}
+
+fn related_report_for_symbol(
     store: &Store,
     project: &Path,
     symbol: &str,
     limit: usize,
     related: Related,
     file: Option<&str>,
-) -> Result<Vec<NodeSummary>> {
+) -> Result<RelatedReport> {
     let matches = symbol_matches(store, project, symbol)?;
     let exact_matches = exact_or_top_matches(&matches, symbol);
     if exact_matches.is_empty() {
         bail!(lookup_symbol_not_found_message(symbol));
     }
-    let exact_matches = filter_matches_by_file(exact_matches, symbol, file)?;
+    let owned = exact_matches.into_iter().cloned().collect::<Vec<_>>();
+    let grouped = group_definitions(&owned, file);
+    let note = grouped.filtered_out.then(|| {
+        format!(
+            "no definition of \"{symbol}\" matches file \"{}\" - showing all definitions instead",
+            file.unwrap_or_default()
+        )
+    });
     let traverser = GraphTraverser::new(store);
-    let mut seen = HashSet::new();
-    let mut out = Vec::new();
-    for node in exact_matches {
-        let edges = match related {
-            Related::Callers => traverser.get_callers(&node.id, 1)?,
-            Related::Callees => traverser.get_callees(&node.id, 1)?,
-        };
-        for entry in edges {
-            if seen.insert(entry.node.id.clone()) {
-                out.push(NodeSummary::from(&entry.node));
+    let mut definitions = Vec::new();
+    let mut union = Vec::new();
+    let mut union_seen = HashSet::new();
+    for roots in grouped.groups {
+        let mut nodes = Vec::new();
+        let mut edges = Vec::new();
+        let mut node_seen = HashSet::new();
+        let mut edge_seen = HashSet::new();
+        for root in &roots {
+            let related_edges = match related {
+                Related::Callers => traverser.get_callers(&root.id, 1)?,
+                Related::Callees => traverser.get_callees(&root.id, 1)?,
+            };
+            for entry in related_edges {
+                if node_seen.insert(entry.node.id.clone()) {
+                    if union_seen.insert(entry.node.id.clone()) {
+                        union.push(entry.node.clone());
+                    }
+                    nodes.push(entry.node);
+                }
+                let key = format!(
+                    "{}\0{}\0{}",
+                    entry.edge.source,
+                    entry.edge.target,
+                    entry.edge.kind.as_str()
+                );
+                if edge_seen.insert(key) {
+                    edges.push(entry.edge);
+                }
             }
         }
+        definitions.push(RelatedDefinitionReport {
+            roots,
+            nodes,
+            edges,
+        });
     }
-    out.truncate(limit);
-    Ok(out)
+    let total = union.len();
+    union.truncate(limit);
+    Ok(RelatedReport {
+        definitions,
+        union,
+        total,
+        limit,
+        filtered_out: grouped.filtered_out,
+        note,
+    })
+}
+
+fn definition_json(roots: &[Node]) -> serde_json::Value {
+    let head = &roots[0];
+    json!({
+        "definition": {
+            "id": head.id,
+            "name": head.name,
+            "qualifiedName": head.qualified_name,
+            "kind": head.kind,
+            "language": head.language,
+            "filePath": head.file_path,
+            "startLine": head.start_line,
+        },
+        "roots": roots.iter().map(|node| node.id.as_str()).collect::<Vec<_>>(),
+    })
+}
+
+fn related_definitions_json(report: &RelatedReport, related: Related) -> Vec<serde_json::Value> {
+    report
+        .definitions
+        .iter()
+        .map(|definition| {
+            let shown = definition
+                .nodes
+                .iter()
+                .take(report.limit)
+                .collect::<Vec<_>>();
+            let shown_ids = shown
+                .iter()
+                .map(|node| node.id.as_str())
+                .collect::<HashSet<_>>();
+            let edges = definition
+                .edges
+                .iter()
+                .filter(|edge| match related {
+                    Related::Callers => shown_ids.contains(edge.source.as_str()),
+                    Related::Callees => shown_ids.contains(edge.target.as_str()),
+                })
+                .collect::<Vec<_>>();
+            let mut value = definition_json(&definition.roots);
+            let object = value.as_object_mut().expect("definition JSON is object");
+            let key = match related {
+                Related::Callers => "callers",
+                Related::Callees => "callees",
+            };
+            object.insert(
+                key.to_string(),
+                serde_json::Value::Array(
+                    shown
+                        .into_iter()
+                        .map(|node| {
+                            let mut value = serde_json::to_value(NodeSummary::from(node))
+                                .expect("node summary serializes");
+                            let object = value.as_object_mut().expect("node summary is object");
+                            object.insert("id".to_string(), json!(node.id));
+                            object.insert(
+                                "relationships".to_string(),
+                                json!(relationships(node, &definition.edges, related)),
+                            );
+                            value
+                        })
+                        .collect(),
+                ),
+            );
+            object.insert(
+                "edges".to_string(),
+                serde_json::to_value(edges).expect("edges serialize"),
+            );
+            object.insert("total".to_string(), json!(definition.nodes.len()));
+            object.insert("limit".to_string(), json!(report.limit));
+            object.insert(
+                "truncated".to_string(),
+                json!(definition.nodes.len() > report.limit),
+            );
+            value
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy)]
 enum Related {
     Callers,
     Callees,
+}
+
+/// The distinct edge kinds that link `node` to the queried symbol, in edge
+/// order — `["calls", "instantiates"]` for a caller that both calls and
+/// constructs it (upstream #1839).
+fn relationships(node: &Node, edges: &[Edge], related: Related) -> Vec<&'static str> {
+    let mut kinds = Vec::new();
+    for edge in edges {
+        let end = match related {
+            Related::Callers => &edge.source,
+            Related::Callees => &edge.target,
+        };
+        if end == &node.id && !kinds.contains(&edge.kind.as_str()) {
+            kinds.push(edge.kind.as_str());
+        }
+    }
+    kinds
+}
+
+/// The legacy union list with each node's relationships across every
+/// definition.
+fn related_union_json(report: &RelatedReport, related: Related) -> Vec<serde_json::Value> {
+    let edges = report
+        .definitions
+        .iter()
+        .flat_map(|definition| definition.edges.iter().cloned())
+        .collect::<Vec<_>>();
+    report
+        .union
+        .iter()
+        .map(|node| {
+            let mut value =
+                serde_json::to_value(NodeSummary::from(node)).expect("node summary serializes");
+            value
+                .as_object_mut()
+                .expect("node summary is object")
+                .insert(
+                    "relationships".to_string(),
+                    json!(relationships(node, &edges, related)),
+                );
+            value
+        })
+        .collect()
 }
 
 /// Collected Godot honesty signals for the matched symbols of one query: the
@@ -5936,53 +6604,6 @@ fn exact_or_top_matches<'a>(matches: &'a [Node], symbol: &str) -> Vec<&'a Node> 
         .collect()
 }
 
-/// Narrow same-named definitions to the one declared in `file` (#1512).
-///
-/// `None` passes every match through, so the unfiltered output of `callers` /
-/// `callees` / `impact` is byte-unchanged. A filter is matched against the whole
-/// project-relative path OR any trailing path segment boundary, so both
-/// `src/deep/mod.ts` and `deep/mod.ts` select the same definition.
-///
-/// An unmatched filter is an ERROR listing the files that DO define the symbol.
-/// Returning an empty relative-set instead would render as "no callers", which
-/// reads as "this symbol is dead" — the exact false negative the flag exists to
-/// prevent.
-fn filter_matches_by_file<'a>(
-    matches: Vec<&'a Node>,
-    symbol: &str,
-    file: Option<&str>,
-) -> Result<Vec<&'a Node>> {
-    let Some(want) = file else {
-        return Ok(matches);
-    };
-    let want = want.replace('\\', "/");
-    let want = want.trim_start_matches("./");
-    let kept: Vec<&'a Node> = matches
-        .iter()
-        .copied()
-        .filter(|node| path_matches_file_filter(&node.file_path, want))
-        .collect();
-    if kept.is_empty() {
-        let mut defined_in: Vec<&str> = matches.iter().map(|n| n.file_path.as_str()).collect();
-        defined_in.sort_unstable();
-        defined_in.dedup();
-        bail!(
-            "no definition of \"{symbol}\" in \"{want}\"; it is defined in: {}",
-            defined_in.join(", ")
-        );
-    }
-    Ok(kept)
-}
-
-/// A file filter matches the whole path or a trailing SEGMENT-aligned suffix, so
-/// `other.ts` never selects `my_other.ts`.
-fn path_matches_file_filter(file_path: &str, want: &str) -> bool {
-    let normalized = file_path.replace('\\', "/");
-    normalized == want || normalized.ends_with(&format!("/{want}"))
-}
-
-/// Render the queried symbol for human output, naming the applied `--file`
-/// filter so a narrowed list is never mistaken for the symbol's full set.
 fn describe_symbol(symbol: &str, file: Option<&str>) -> String {
     match file {
         Some(file) => format!("{symbol}\" in \"{file}"),
@@ -6194,7 +6815,10 @@ fn lockless_missing_detail(project: &Path, paths: &codegraph_core::IndexPaths) -
     )
 }
 
-fn resolve_required_rebuild_project(path: Option<PathBuf>) -> Result<PathBuf> {
+fn resolve_required_rebuild_project(
+    path: Option<PathBuf>,
+    allow_ancestor: bool,
+) -> Result<PathBuf> {
     let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
     index_paths(&start)?;
     if has_rebuild_namespace(&start) {
@@ -6206,10 +6830,25 @@ fn resolve_required_rebuild_project(path: Option<PathBuf>) -> Result<PathBuf> {
             break;
         }
         if has_rebuild_namespace(parent) {
+            if !allow_ancestor {
+                bail!(
+                    "CodeGraph not initialized in {}; the nearest initialized project is {}. Pass that path to rebuild it, or run `codegraph init {}` to give the requested directory its own index",
+                    start.display(),
+                    parent.display(),
+                    start.display()
+                );
+            }
             warn_ancestor_index_retarget(&start, parent);
             return Ok(parent.to_path_buf());
         }
         current = parent;
+    }
+    if !allow_ancestor {
+        bail!(
+            "CodeGraph not initialized in {}; run `codegraph init {}` to give the requested directory its own index",
+            start.display(),
+            start.display()
+        );
     }
     bail!("CodeGraph not initialized in {}", start.display())
 }
@@ -6217,12 +6856,12 @@ fn resolve_required_rebuild_project(path: Option<PathBuf>) -> Result<PathBuf> {
 /// Announce that a MUTATING command is about to operate on an ANCESTOR's index
 /// rather than the directory the user named (#1524).
 ///
-/// `index .` inside an unindexed `parent/child` rebuilt the PARENT and printed
-/// only `Indexed N files` — a count including the parent's own files — while
-/// creating no child index. The retarget is intended behaviour (it is how one
-/// index serves a whole tree), but performing it silently is what made the
-/// outcome unreadable, and for `uninit --force` it deletes an index the user
-/// never named.
+/// A bare `index` inside an unindexed `parent/child` rebuilds the PARENT, as do
+/// the other lifecycle commands that intentionally discover upward. An explicit
+/// `index <path>` is stricter and refuses the retarget before reaching here.
+/// The warning makes every still-supported ancestor operation visible; this is
+/// especially important for `uninit --force`, which deletes an index the user
+/// did not name directly.
 ///
 /// STDERR only: these commands' stdout is machine-readable and pinned by
 /// `stdout_purity.rs`. Callers that already resolved the project themselves —
@@ -6242,6 +6881,141 @@ fn warn_ancestor_index_retarget(requested: &Path, resolved: &Path) {
         "         Run `codegraph init {}` first if you meant to give it its own index.",
         requested.display()
     );
+}
+
+const UI_AFTER_HELP: &str = "Examples:
+  $ codegraph ui                    Read the project you're standing in
+  $ codegraph ui ~/code/my-app      Read a specific indexed project
+  $ codegraph ui --port 8080        Use one specific port (fails if it's taken)
+  $ codegraph ui --no-open          Just print the URL (headless boxes, SSH)
+  $ codegraph web                   Same command under its alias
+
+Pick a symbol and you see who calls it on the left, its source in the middle,
+and what it calls on the right at the height of the line that calls it. Search
+with / (or Cmd-K), click a file path for the file's outline and its imports.
+
+Ask \"how does main reach open_store\" (or \"main -> open_store\") in the search
+box for the flow between two symbols: one card per hop, opened at the line that
+makes the next call, with dynamic-dispatch hops drawn dashed and named. The Map
+tab draws the whole project by module, with dependencies pointing down.
+
+Never opened this codebase before? The Entry points tab lists the routes with
+the symbols that serve them, the files that run something when they load, the
+tests, and what the most code depends on — and starts a flow from any of them.
+
+The page keeps up with the project while it is open: save a file and it says so
+within about half a second, and whatever is on screen re-reads the graph when
+something re-indexes it. It watches for that; it never polls.
+
+Save a walk you want to keep: name the trail and it is written under the index
+directory (.codegraph/ui/trails/, already gitignored) as plain JSON, listed on
+the empty screen, and reopened at the symbol you left. Hops are remembered by
+name rather than by position, so a saved trail survives re-indexing and says
+which hop moved when one does. Pass --read-only to refuse every write.
+
+The viewer listens on 127.0.0.1 only, so nothing on your network can reach it.
+It opens an index that already exists, never indexes, and never changes a line
+of your code — the one thing it writes is a trail you asked it to save.
+Requests from any other host are refused, and nothing is sent anywhere: no code,
+no paths, no analytics.
+
+Without --port it takes 4747, or the next free port if that one is busy.
+
+Set CODEGRAPH_BROWSER=<command> to choose which browser opens, or
+CODEGRAPH_BROWSER=none to never open one.";
+
+/// `codegraph ui [path]` (alias `web`): serve the embedded viewer over
+/// loopback and open it. Reads an index that already exists; never indexes.
+fn cmd_ui(
+    path: Option<PathBuf>,
+    port: Option<String>,
+    no_open: bool,
+    read_only: bool,
+) -> Result<()> {
+    // An explicit --port stays explicit: a scripted `--port 8080` that quietly
+    // lands on 8081 is worse than one that says the port is busy.
+    let requested_port = match port {
+        None => None,
+        Some(raw) => match raw.trim().parse::<u16>() {
+            Ok(port) => Some(port),
+            Err(_) => ui_refusal(format!(
+                "--port must be a whole number between 0 and 65535 (got \"{raw}\")."
+            )),
+        },
+    };
+    let start = absolute_path(path.unwrap_or_else(|| PathBuf::from(".")));
+    let indexed = codegraph_ui::find_indexed_root(&start);
+    let project = indexed.clone().unwrap_or_else(|| start.clone());
+    // The same sensitive-directory refusal the MCP entry points use, before
+    // anything opens: `codegraph ui /etc` is turned away here.
+    if let Err(reason) = codegraph_ui::security::validate_project_path(&project) {
+        ui_refusal(reason);
+    }
+    if indexed.is_none() {
+        eprintln!("✗ No CodeGraph index found for {}", project.display());
+        eprintln!();
+        eprintln!("  The viewer reads an index that already exists — it never creates one.");
+        eprintln!("  To index this project:");
+        eprintln!();
+        eprintln!("    codegraph init");
+        eprintln!();
+        eprintln!("  Already indexed somewhere else? Point the viewer at it:");
+        eprintln!();
+        eprintln!("    codegraph ui /path/to/indexed/project");
+        eprintln!();
+        std::process::exit(1);
+    }
+    if !codegraph_ui::has_viewer() {
+        ui_refusal(
+            "The CodeGraph viewer assets are missing from this build.\n\
+             If you installed CodeGraph normally, reinstall it — the release binary embeds the viewer.\n\
+             If you are working from a source checkout, run: npm run build --prefix ui",
+        );
+    }
+    let options = codegraph_ui::UiOptions {
+        project_root: project.clone(),
+        port: requested_port,
+        read_only,
+    };
+    let served = codegraph_ui::serve_until_shutdown(options, |url| {
+        println!();
+        println!("CodeGraph viewer");
+        println!();
+        println!("  Reading  {}", project.display());
+        println!("  URL      {url}");
+        println!(
+            "  Access   this machine only — {}",
+            if read_only {
+                "read-only, nothing leaves your computer"
+            } else {
+                "nothing leaves your computer; saved trails are the only thing written"
+            }
+        );
+        println!();
+        let opened = !no_open && codegraph_ui::browser::open_browser(url);
+        println!(
+            "{}",
+            if opened {
+                "  Opening your browser... press Ctrl+C to stop."
+            } else {
+                "  Open that URL in a browser. Press Ctrl+C to stop."
+            }
+        );
+        println!();
+    });
+    // Both startup failures (no free port, a pinned port taken) carry their own
+    // remediation: print it plainly.
+    if let Err(err) = served {
+        ui_refusal(err);
+    }
+    Ok(())
+}
+
+/// A refusal the way upstream's `codegraph ui` prints one: a cross and the
+/// sentence — never a stack trace, never an `Error:` prefix.
+fn ui_refusal(message: impl std::fmt::Display) -> ! {
+    eprintln!("✗ {message}");
+    std::process::exit(1);
 }
 
 fn resolve_project_path_optional(start: &Path) -> PathBuf {
@@ -6509,6 +7283,7 @@ impl From<&Node> for NodeSummary {
     }
 }
 
+#[cfg(test)]
 fn print_related(label: &str, symbol: &str, nodes: &[NodeSummary]) {
     if nodes.is_empty() {
         println!("No {} found for \"{}\"", label.to_lowercase(), symbol);
@@ -6518,6 +7293,73 @@ fn print_related(label: &str, symbol: &str, nodes: &[NodeSummary]) {
     for node in nodes {
         println!("{:<12}{}", node.kind, node.name);
         println!("  {}:{}\n", node.file_path, node.start_line);
+    }
+}
+
+fn print_related_report(
+    title: &str,
+    label: &str,
+    symbol: &str,
+    report: &RelatedReport,
+    related: Related,
+) {
+    if let Some(note) = &report.note {
+        println!("Note: {note}");
+    }
+    if report.definitions.len() > 1 {
+        println!(
+            "\n{title} of \"{symbol}\" - {} distinct definitions (narrow with --file):",
+            report.definitions.len()
+        );
+    }
+    for definition in &report.definitions {
+        let head = &definition.roots[0];
+        let shown = definition.nodes.len().min(report.limit);
+        let count = if definition.nodes.len() > report.limit {
+            format!("{shown} of {}", definition.nodes.len())
+        } else {
+            definition.nodes.len().to_string()
+        };
+        if report.definitions.len() > 1 {
+            println!(
+                "\n{} ({}) - {}:{} ({count}):\n",
+                head.qualified_name, head.kind, head.file_path, head.start_line
+            );
+        } else {
+            println!("\n{title} of \"{symbol}\" ({count}):\n");
+            println!(
+                "{} ({}) - {}:{}\n",
+                head.qualified_name, head.kind, head.file_path, head.start_line
+            );
+        }
+        if definition.nodes.is_empty() {
+            if report.definitions.len() > 1 {
+                println!("  (no {label})");
+            } else {
+                println!("No {label} found for \"{symbol}\"");
+            }
+            continue;
+        }
+        for node in definition.nodes.iter().take(report.limit) {
+            // Kinds other than a plain call — `[instantiates]`, `[references]`.
+            let kinds = relationships(node, &definition.edges, related)
+                .into_iter()
+                .filter(|kind| *kind != "calls")
+                .collect::<Vec<_>>();
+            let relation = if kinds.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", kinds.join(", "))
+            };
+            println!("{:<12}{}{relation}", node.kind, node.name);
+            println!("  {}:{}\n", node.file_path, node.start_line);
+        }
+        if definition.nodes.len() > report.limit {
+            println!(
+                "Showing {shown} of {} {label}; pass --limit to widen.",
+                definition.nodes.len()
+            );
+        }
     }
 }
 
@@ -7153,76 +7995,6 @@ mod pure_helper_tests {
         assert_eq!(picked.len(), 2);
     }
 
-    fn node_in(name: &str, file: &str) -> Node {
-        let mut n = node(name);
-        n.file_path = file.to_string();
-        n
-    }
-
-    #[test]
-    fn file_filter_matches_whole_path_and_segment_aligned_suffix() {
-        assert!(path_matches_file_filter(
-            "src/deep/mod.ts",
-            "src/deep/mod.ts"
-        ));
-        assert!(path_matches_file_filter("src/deep/mod.ts", "deep/mod.ts"));
-        assert!(path_matches_file_filter("src/deep/mod.ts", "mod.ts"));
-    }
-
-    #[test]
-    fn file_filter_rejects_a_suffix_that_splits_a_segment() {
-        // `other.ts` must not select `my_other.ts` — a plain `ends_with` would.
-        assert!(!path_matches_file_filter("src/my_other.ts", "other.ts"));
-        assert!(!path_matches_file_filter("src/deep/mod.ts", "eep/mod.ts"));
-    }
-
-    #[test]
-    fn filter_matches_by_file_none_passes_everything_through() {
-        let alpha = node_in("target", "alpha.ts");
-        let beta = node_in("target", "beta.ts");
-        let matches = vec![&alpha, &beta];
-        let kept = filter_matches_by_file(matches, "target", None).expect("no filter");
-        assert_eq!(kept.len(), 2, "unfiltered behaviour must be unchanged");
-    }
-
-    #[test]
-    fn filter_matches_by_file_selects_one_definition() {
-        let alpha = node_in("target", "alpha.ts");
-        let beta = node_in("target", "beta.ts");
-        let kept =
-            filter_matches_by_file(vec![&alpha, &beta], "target", Some("beta.ts")).expect("filter");
-        assert_eq!(
-            kept.iter()
-                .map(|n| n.file_path.as_str())
-                .collect::<Vec<_>>(),
-            vec!["beta.ts"]
-        );
-    }
-
-    #[test]
-    fn filter_matches_by_file_unmatched_errors_and_lists_the_real_files() {
-        let alpha = node_in("target", "alpha.ts");
-        let beta = node_in("target", "beta.ts");
-        let err = filter_matches_by_file(vec![&alpha, &beta], "target", Some("nope.ts"))
-            .expect_err("an unmatched filter must error, not return empty");
-        let text = err.to_string();
-        assert!(text.contains("nope.ts"), "must name the filter: {text}");
-        assert!(
-            text.contains("alpha.ts") && text.contains("beta.ts"),
-            "must list the defining files: {text}"
-        );
-    }
-
-    #[test]
-    fn filter_matches_by_file_normalizes_windows_separators_and_dot_slash() {
-        let deep = node_in("target", "src/deep/mod.ts");
-        for want in ["src\\deep\\mod.ts", "./src/deep/mod.ts"] {
-            let kept =
-                filter_matches_by_file(vec![&deep], "target", Some(want)).expect("normalized");
-            assert_eq!(kept.len(), 1, "{want} must select the definition");
-        }
-    }
-
     #[test]
     fn describe_symbol_names_the_applied_filter() {
         assert_eq!(describe_symbol("target", None), "target");
@@ -7433,10 +8205,13 @@ mod pure_helper_tests {
     }
 
     #[test]
-    fn should_run_serve_services_true_when_explicit_false_when_bare_unindexed() {
+    fn should_run_serve_services_requires_an_existing_index_root_in_cli_tests() {
         let dir = tmp("serve-svc");
-        assert!(should_run_serve_services(true, &dir));
+        assert!(!should_run_serve_services(true, &dir));
         assert!(!should_run_serve_services(false, &dir));
+        fs::create_dir(dir.join(".codegraph")).unwrap();
+        assert!(should_run_serve_services(true, &dir));
+        assert!(should_run_serve_services(false, &dir));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -7632,6 +8407,16 @@ mod formatter_and_env_tests {
     }
 
     #[test]
+    fn search_human_result_line_pads_the_kind_to_twelve_columns() {
+        // Upstream prints `kind.padEnd(12) + name`; the kind must not run into the name.
+        let sr = SearchResult {
+            node: query_test_node("myFunc"),
+            score: 1.0,
+        };
+        assert_eq!(format_search_result_line(&sr), "function    myFunc");
+    }
+
+    #[test]
     fn query_json_output_still_carries_raw_score() {
         // #1045: the percentage is dropped from the HUMAN output only. The
         // machine-readable --json output keeps the raw score for
@@ -7676,30 +8461,50 @@ mod formatter_and_env_tests {
     }
 
     #[test]
-    fn print_index_result_covers_all_three_branches() {
+    fn print_index_result_covers_all_four_branches() {
         print_index_result(&IndexSummary {
             files_indexed: 5,
             files_skipped: 2,
             files_errored: 0,
+            files_skipped_unsupported: 0,
+            top_unsupported_extensions: Vec::new(),
             nodes_created: 10,
             edges_created: 3,
             duration_ms: 1200,
+            warnings: vec!["a.cpp: parse produced no symbols (tree has errors)".to_string()],
         });
         print_index_result(&IndexSummary {
             files_indexed: 0,
             files_skipped: 0,
             files_errored: 4,
+            files_skipped_unsupported: 0,
+            top_unsupported_extensions: Vec::new(),
             nodes_created: 0,
             edges_created: 0,
             duration_ms: 5,
+            warnings: Vec::new(),
         });
         print_index_result(&IndexSummary {
             files_indexed: 0,
             files_skipped: 0,
             files_errored: 0,
+            files_skipped_unsupported: 3,
+            top_unsupported_extensions: vec![(".move".to_string(), 3)],
             nodes_created: 0,
             edges_created: 0,
             duration_ms: 5,
+            warnings: Vec::new(),
+        });
+        print_index_result(&IndexSummary {
+            files_indexed: 0,
+            files_skipped: 0,
+            files_errored: 0,
+            files_skipped_unsupported: 0,
+            top_unsupported_extensions: Vec::new(),
+            nodes_created: 0,
+            edges_created: 0,
+            duration_ms: 5,
+            warnings: Vec::new(),
         });
     }
 

@@ -1,6 +1,7 @@
 [package]
 name = "codegraph-rs"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -24,6 +25,7 @@ codegraph-graph = { path = "../codegraph-graph" }
 codegraph-mcp = { path = "../codegraph-mcp" }
 codegraph-resolve = { path = "../codegraph-resolve" }
 codegraph-store = { path = "../codegraph-store" }
+codegraph-ui = { path = "../codegraph-ui" }
 codegraph-watch = { path = "../codegraph-watch" }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -42,7 +44,13 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 time = { workspace = true }
 
+# musl's allocator serializes threads; the static Linux release builds use
+# mimalloc instead. Other targets keep their system allocator.
+[target.'cfg(target_env = "musl")'.dependencies]
+mimalloc = { version = "0.1.52", default-features = false, features = ["v2"] }
+
 [dev-dependencies]
+rusqlite = { workspace = true }
 codegraph-bench = { path = "../codegraph-bench" }
 # Feature-unifies the Store's lease barrier into `CARGO_BIN_EXE_codegraph` only
 # while this package's test targets are built. A normal binary build uses the

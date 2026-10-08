@@ -1,5 +1,153 @@
 # Changelog
 
+## [0.53.3](https://github.com/sunerpy/codegraph-rust/compare/v0.53.2...v0.53.3) (2026-10-03)
+
+
+### Bug Fixes
+
+* **cli:** pad the kind column in search, callers, callees and impact ([#314](https://github.com/sunerpy/codegraph-rust/issues/314)) ([72eefae](https://github.com/sunerpy/codegraph-rust/commit/72eefae04610a326e74f6a2119a30c1e26ad4704))
+
+## [0.53.2](https://github.com/sunerpy/codegraph-rust/compare/v0.53.1...v0.53.2) (2026-10-03)
+
+
+### Performance Improvements
+
+* **cli:** allocate through mimalloc in the musl release builds ([#310](https://github.com/sunerpy/codegraph-rust/issues/310)) ([a52a64c](https://github.com/sunerpy/codegraph-rust/commit/a52a64c6e1efdc34ccc997709ddb02616c69bcf8))
+
+## [0.53.1](https://github.com/sunerpy/codegraph-rust/compare/v0.53.0...v0.53.1) (2026-10-03)
+
+
+### Bug Fixes
+
+* **resolve:** keep Rust method calls that lost their receiver off functions and std names ([#307](https://github.com/sunerpy/codegraph-rust/issues/307)) ([f9f96c3](https://github.com/sunerpy/codegraph-rust/commit/f9f96c33e1b4689a08bc4c0dce2a9ba755283341))
+
+## [0.53.0](https://github.com/sunerpy/codegraph-rust/compare/v0.52.2...v0.53.0) (2026-10-03)
+
+
+### Features
+
+* **ui:** direction D design and a light theme ([#300](https://github.com/sunerpy/codegraph-rust/issues/300)) ([fee9ae7](https://github.com/sunerpy/codegraph-rust/commit/fee9ae78a78993dd677f0c0dfe643ca19e2e0aad))
+* **ui:** serve the upstream browser viewer ([#298](https://github.com/sunerpy/codegraph-rust/issues/298)) ([143752a](https://github.com/sunerpy/codegraph-rust/commit/143752aabea7b3a7e888efea6c61323dbec14101))
+
+
+### Bug Fixes
+
+* **sync:** re-resolve every edge a name's candidate change can move ([#303](https://github.com/sunerpy/codegraph-rust/issues/303)) ([a35e065](https://github.com/sunerpy/codegraph-rust/commit/a35e065e7ab984aa00ef9d4d46d6b5f2334599d7))
+
+## [0.52.2](https://github.com/sunerpy/codegraph-rust/compare/v0.52.1...v0.52.2) (2026-10-01)
+
+
+### Bug Fixes
+
+* **resolve:** bind store actions only inside stores a Zustand factory built ([ff52e5c](https://github.com/sunerpy/codegraph-rust/commit/ff52e5ceb7a73c13ca30c530b0b4447bebf8aea2))
+* **resolve:** construct from a literal past initializer_list overloads ([ff52e5c](https://github.com/sunerpy/codegraph-rust/commit/ff52e5ceb7a73c13ca30c530b0b4447bebf8aea2))
+* **resolve:** evaluate whole #if expressions three-valued ([ff52e5c](https://github.com/sunerpy/codegraph-rust/commit/ff52e5ceb7a73c13ca30c530b0b4447bebf8aea2))
+* **resolve:** leave a method value with an unknowable receiver unresolved ([ff52e5c](https://github.com/sunerpy/codegraph-rust/commit/ff52e5ceb7a73c13ca30c530b0b4447bebf8aea2))
+* **resolve:** treat only a whole-file #ifndef as an include guard ([ff52e5c](https://github.com/sunerpy/codegraph-rust/commit/ff52e5ceb7a73c13ca30c530b0b4447bebf8aea2))
+
+## [0.52.1](https://github.com/sunerpy/codegraph-rust/compare/v0.52.0...v0.52.1) (2026-10-01)
+
+
+### Bug Fixes
+
+* **extract:** give same-line Vue script functions distinct ids ([#1349](https://github.com/sunerpy/codegraph-rust/issues/1349)) ([436791b](https://github.com/sunerpy/codegraph-rust/commit/436791b7f52ddf4e14fac9398f284d162c9cd0b9))
+* **extract:** keep a store initializer's own calls on the store ([436791b](https://github.com/sunerpy/codegraph-rust/commit/436791b7f52ddf4e14fac9398f284d162c9cd0b9))
+* **mcp:** never claim that gap markers name every elided symbol ([436791b](https://github.com/sunerpy/codegraph-rust/commit/436791b7f52ddf4e14fac9398f284d162c9cd0b9))
+* **resolve:** prefer an explicit default binding over an exported component ([436791b](https://github.com/sunerpy/codegraph-rust/commit/436791b7f52ddf4e14fac9398f284d162c9cd0b9))
+
+## [0.52.0](https://github.com/sunerpy/codegraph-rust/compare/v0.51.0...v0.52.0) (2026-10-01)
+
+
+### Features
+
+* **scan:** follow symlinked files and directories ([#935](https://github.com/sunerpy/codegraph-rust/issues/935)) ([a10ede3](https://github.com/sunerpy/codegraph-rust/commit/a10ede33df7e6e7169f2d64a7dc1d97289085264))
+* **status:** answer pending changes from git's candidates when git sees every change ([#1878](https://github.com/sunerpy/codegraph-rust/issues/1878)) ([a572fb5](https://github.com/sunerpy/codegraph-rust/commit/a572fb55b405af98d1dac9d7931797792a8d5def))
+* **watch:** follow the scan's symlinks with live watches ([#770](https://github.com/sunerpy/codegraph-rust/issues/770)) ([a10ede3](https://github.com/sunerpy/codegraph-rust/commit/a10ede33df7e6e7169f2d64a7dc1d97289085264))
+
+
+### Bug Fixes
+
+* **sync:** keep the files a full sync's own scan indexes ([#286](https://github.com/sunerpy/codegraph-rust/issues/286)) ([f23b0bd](https://github.com/sunerpy/codegraph-rust/commit/f23b0bdc74fd652e700f0c09351c142c0c30249e))
+* **sync:** re-read files behind new, retargeted or unrecorded symlinks ([a10ede3](https://github.com/sunerpy/codegraph-rust/commit/a10ede33df7e6e7169f2d64a7dc1d97289085264))
+
+## [0.51.0](https://github.com/sunerpy/codegraph-rust/compare/v0.50.3...v0.51.0) (2026-10-01)
+
+
+### ⚠ BREAKING CHANGES
+
+* **install:** always verify release archive checksums
+
+### Features
+
+* **cli:** accept line-numbered file selectors in node ([f8e6039](https://github.com/sunerpy/codegraph-rust/commit/f8e6039fcfa8cac60582bf76ae50dcae4f4502aa))
+* **cli:** group callers, callees and impact by definition and report truncation ([f8e6039](https://github.com/sunerpy/codegraph-rust/commit/f8e6039fcfa8cac60582bf76ae50dcae4f4502aa))
+* **cli:** report committed but unindexed changes in status and warn on collapsed parses ([f8e6039](https://github.com/sunerpy/codegraph-rust/commit/f8e6039fcfa8cac60582bf76ae50dcae4f4502aa))
+* **cli:** report how each caller or callee relates to the symbol ([227f1d2](https://github.com/sunerpy/codegraph-rust/commit/227f1d2e8c05f5a00a1f27c20bed644cd7788928))
+* **extract:** index generator callables, TypeScript interface members, nested handlers, CommonJS exports and React handler hooks ([f8e6039](https://github.com/sunerpy/codegraph-rust/commit/f8e6039fcfa8cac60582bf76ae50dcae4f4502aa))
+* **extract:** index Python body docstrings ([4231ee5](https://github.com/sunerpy/codegraph-rust/commit/4231ee51bf686df5df6625fed46ea873e00718dd))
+* **extract:** name curried-wrapper object members by their key ([4231ee5](https://github.com/sunerpy/codegraph-rust/commit/4231ee51bf686df5df6625fed46ea873e00718dd))
+* **extract:** resolve C++ constructor calls and index pure virtual methods, Scala companions and Dart extension types ([f8e6039](https://github.com/sunerpy/codegraph-rust/commit/f8e6039fcfa8cac60582bf76ae50dcae4f4502aa))
+* **install:** honor CLAUDE_CONFIG_DIR and CODEX_HOME, write native OpenCode 2 entries and keep Explore loaded ([f8e6039](https://github.com/sunerpy/codegraph-rust/commit/f8e6039fcfa8cac60582bf76ae50dcae4f4502aa))
+* **mcp:** keep explicit projectPath projects live-synced through the shared daemon ([f8e6039](https://github.com/sunerpy/codegraph-rust/commit/f8e6039fcfa8cac60582bf76ae50dcae4f4502aa))
+* **resolve:** bind Zustand store actions through accessors, destructuring and selectors ([4231ee5](https://github.com/sunerpy/codegraph-rust/commit/4231ee51bf686df5df6625fed46ea873e00718dd))
+* **resolve:** record methods passed as callback values as function references ([f8e6039](https://github.com/sunerpy/codegraph-rust/commit/f8e6039fcfa8cac60582bf76ae50dcae4f4502aa))
+* **resolve:** resolve default-exported namespace objects and JSX handler values ([227f1d2](https://github.com/sunerpy/codegraph-rust/commit/227f1d2e8c05f5a00a1f27c20bed644cd7788928))
+
+
+### Bug Fixes
+
+* **c:** judge macro visibility in translation-unit order and merge constructor overloads ([34bc8dc](https://github.com/sunerpy/codegraph-rust/commit/34bc8dcc6b187e074ca700a6a4a2fccaeb8018b9))
+* **cpp:** extract function-like macros and construct objects only where a declaration does ([34bc8dc](https://github.com/sunerpy/codegraph-rust/commit/34bc8dcc6b187e074ca700a6a4a2fccaeb8018b9))
+* **daemon:** allow one long-lived writer per project with a kernel lock ([f8e6039](https://github.com/sunerpy/codegraph-rust/commit/f8e6039fcfa8cac60582bf76ae50dcae4f4502aa))
+* **daemon:** retry a Windows sharing violation when replacing daemon.pid ([bc301b9](https://github.com/sunerpy/codegraph-rust/commit/bc301b9c5ce772136b94d2148fa5bf90c651b881))
+* **deps:** update rustls to 0.23.45 for RUSTSEC-2026-0285 ([79cb21c](https://github.com/sunerpy/codegraph-rust/commit/79cb21c81fe67ff9f49f21ec04915df74fa1f09f))
+* **explore:** claim complete source only for sections that are complete ([678927c](https://github.com/sunerpy/codegraph-rust/commit/678927cd927923cc6703235726b55a898cbe6243))
+* **explore:** explain empty results with bounded lexical diagnostics ([678927c](https://github.com/sunerpy/codegraph-rust/commit/678927cd927923cc6703235726b55a898cbe6243))
+* **explore:** flag dynamic imports built from a template or concatenation ([bc301b9](https://github.com/sunerpy/codegraph-rust/commit/bc301b9c5ce772136b94d2148fa5bf90c651b881))
+* **explore:** give a windowed cluster's head the whole room it can use ([678927c](https://github.com/sunerpy/codegraph-rust/commit/678927cd927923cc6703235726b55a898cbe6243))
+* **explore:** let a named file use the budget the response left unspent ([678927c](https://github.com/sunerpy/codegraph-rust/commit/678927cd927923cc6703235726b55a898cbe6243))
+* **explore:** name symbols elided by a file trim ([678927c](https://github.com/sunerpy/codegraph-rust/commit/678927cd927923cc6703235726b55a898cbe6243))
+* **explore:** pay named members before incidental ones across clusters ([678927c](https://github.com/sunerpy/codegraph-rust/commit/678927cd927923cc6703235726b55a898cbe6243))
+* **explore:** pin only the same-named file that defines the named symbols ([678927c](https://github.com/sunerpy/codegraph-rust/commit/678927cd927923cc6703235726b55a898cbe6243))
+* **explore:** return a qualified or line-anchored method's body ([678927c](https://github.com/sunerpy/codegraph-rust/commit/678927cd927923cc6703235726b55a898cbe6243))
+* **extract:** bound every source read and skip MPEG-TS clips named .ts ([bc301b9](https://github.com/sunerpy/codegraph-rust/commit/bc301b9c5ce772136b94d2148fa5bf90c651b881))
+* **extract:** keep same-line declarations that share a node id ([227f1d2](https://github.com/sunerpy/codegraph-rust/commit/227f1d2e8c05f5a00a1f27c20bed644cd7788928))
+* **extract:** read Liquid tags inside {% liquid %} blocks ([bc301b9](https://github.com/sunerpy/codegraph-rust/commit/bc301b9c5ce772136b94d2148fa5bf90c651b881))
+* **extract:** read MyBatis and iBatis mappers as upstream does ([bc301b9](https://github.com/sunerpy/codegraph-rust/commit/bc301b9c5ce772136b94d2148fa5bf90c651b881))
+* **extract:** recover functions defined through single-argument C/C++ macros ([4231ee5](https://github.com/sunerpy/codegraph-rust/commit/4231ee51bf686df5df6625fed46ea873e00718dd))
+* **graph:** re-expand a node reached nearer than before in depth-limited walks ([227f1d2](https://github.com/sunerpy/codegraph-rust/commit/227f1d2e8c05f5a00a1f27c20bed644cd7788928))
+* **index:** refuse to retarget an initialized ancestor from an explicit child path ([f8e6039](https://github.com/sunerpy/codegraph-rust/commit/f8e6039fcfa8cac60582bf76ae50dcae4f4502aa))
+* **install:** always verify release archive checksums ([79cb21c](https://github.com/sunerpy/codegraph-rust/commit/79cb21c81fe67ff9f49f21ec04915df74fa1f09f))
+* **installer:** keep detection read-only for configs it cannot parse ([bc301b9](https://github.com/sunerpy/codegraph-rust/commit/bc301b9c5ce772136b94d2148fa5bf90c651b881))
+* **install:** point Windows shell users at the PowerShell installer ([bc301b9](https://github.com/sunerpy/codegraph-rust/commit/bc301b9c5ce772136b94d2148fa5bf90c651b881))
+* **mcp:** a database file without a published index is not a root ([bc301b9](https://github.com/sunerpy/codegraph-rust/commit/bc301b9c5ce772136b94d2148fa5bf90c651b881))
+* **prompt-hook:** cap injections at 9,000 bytes and skip task-notification envelopes ([f8e6039](https://github.com/sunerpy/codegraph-rust/commit/f8e6039fcfa8cac60582bf76ae50dcae4f4502aa))
+* **prompt-hook:** require corroboration for everyday como and wie ([bc301b9](https://github.com/sunerpy/codegraph-rust/commit/bc301b9c5ce772136b94d2148fa5bf90c651b881))
+* **resolve:** bind implements to the interface of a value+interface pair ([4231ee5](https://github.com/sunerpy/codegraph-rust/commit/4231ee51bf686df5df6625fed46ea873e00718dd))
+* **resolve:** bind Rust self.method() to its impl owner and keep sealed JS modules off cross-file targets ([f8e6039](https://github.com/sunerpy/codegraph-rust/commit/f8e6039fcfa8cac60582bf76ae50dcae4f4502aa))
+* **resolve:** enforce cross-file visibility for C statics, private JVM/Swift/Scala/Dart/PHP, Go package-local and Rust module-private definitions ([f8e6039](https://github.com/sunerpy/codegraph-rust/commit/f8e6039fcfa8cac60582bf76ae50dcae4f4502aa))
+* **resolve:** follow object-literal member bindings lexically ([4231ee5](https://github.com/sunerpy/codegraph-rust/commit/4231ee51bf686df5df6625fed46ea873e00718dd))
+* **resolve:** keep unknown Python import members unresolved ([4231ee5](https://github.com/sunerpy/codegraph-rust/commit/4231ee51bf686df5df6625fed46ea873e00718dd))
+* **resolve:** read no file extraction would skip ([bc301b9](https://github.com/sunerpy/codegraph-rust/commit/bc301b9c5ce772136b94d2148fa5bf90c651b881))
+* **resolve:** refuse unproven receivers for call results, bare JS and Go calls, this.field and awaited values ([f8e6039](https://github.com/sunerpy/codegraph-rust/commit/f8e6039fcfa8cac60582bf76ae50dcae4f4502aa))
+* **resolve:** reject unrelated cross-language matches ([4231ee5](https://github.com/sunerpy/codegraph-rust/commit/4231ee51bf686df5df6625fed46ea873e00718dd))
+* **resolve:** require receiver evidence for TS/JS member calls ([4231ee5](https://github.com/sunerpy/codegraph-rust/commit/4231ee51bf686df5df6625fed46ea873e00718dd))
+* **resolve:** scope Python and Go method values by their receiver ([227f1d2](https://github.com/sunerpy/codegraph-rust/commit/227f1d2e8c05f5a00a1f27c20bed644cd7788928))
+* **resolve:** stop function-like C/C++ macros and aggregates from fabricating calls ([f8e6039](https://github.com/sunerpy/codegraph-rust/commit/f8e6039fcfa8cac60582bf76ae50dcae4f4502aa))
+* **scan:** keep JVM packages named build under source roots ([bc301b9](https://github.com/sunerpy/codegraph-rust/commit/bc301b9c5ce772136b94d2148fa5bf90c651b881))
+* **scan:** read the root .gitignore with git's rules in scan and watch ([bc301b9](https://github.com/sunerpy/codegraph-rust/commit/bc301b9c5ce772136b94d2148fa5bf90c651b881))
+* **store:** rebind edges atomically during incremental sync ([f8e6039](https://github.com/sunerpy/codegraph-rust/commit/f8e6039fcfa8cac60582bf76ae50dcae4f4502aa))
+* **sync:** report the pending references a healing sync resolved ([bc301b9](https://github.com/sunerpy/codegraph-rust/commit/bc301b9c5ce772136b94d2148fa5bf90c651b881))
+* **watch:** keep a failed sync's batch and owed full reconcile ([bc301b9](https://github.com/sunerpy/codegraph-rust/commit/bc301b9c5ce772136b94d2148fa5bf90c651b881))
+* **watch:** recover auto-sync after lock contention and report its health ([bc301b9](https://github.com/sunerpy/codegraph-rust/commit/bc301b9c5ce772136b94d2148fa5bf90c651b881))
+* **wsl:** keep WSL off Windows' index on /mnt drives and explain the I/O error ([bc301b9](https://github.com/sunerpy/codegraph-rust/commit/bc301b9c5ce772136b94d2148fa5bf90c651b881))
+
+
+### Performance Improvements
+
+* **resolve:** answer each file-existence probe once per pass ([bc301b9](https://github.com/sunerpy/codegraph-rust/commit/bc301b9c5ce772136b94d2148fa5bf90c651b881))
+* **resolve:** build per-file source facts once per pass instead of rescanning files per reference ([f8e6039](https://github.com/sunerpy/codegraph-rust/commit/f8e6039fcfa8cac60582bf76ae50dcae4f4502aa))
+
 ## [0.50.3](https://github.com/sunerpy/codegraph-rust/compare/v0.50.2...v0.50.3) (2026-09-02)
 
 

@@ -10,11 +10,14 @@ pub mod schema;
 #[cfg(feature = "test-hooks")]
 pub mod test_support;
 pub mod uninit;
+pub mod viewer;
+pub mod wsl_shared_index;
 
 pub use connection::{
     ExtractionStampIssue, Store, StoreError, StoreStatusOpen, StoreWriteAuthorization,
     StoreWriteOpen, StoreWritePurpose,
 };
+pub use file_identity::{PathIdentity, path_still_names_file};
 pub use index_lease::{IndexLease, IndexLeaseError, IndexLeaseValidationError};
 pub use index_state::{
     AuthoritativeSlot, CURRENT_EXTRACTION_VERSION, CURRENT_STORAGE_PROTOCOL, CorruptReason,
@@ -32,3 +35,5 @@ pub use rebuild::{
     resume_full_rebuild,
 };
 pub use uninit::{UninitError, UninitOutcome, uninit_index, uninit_index_with_drain};
+pub use viewer::{FilePairEdgeRow, RoutingRow, TopCallingFile};
+pub use wsl_shared_index::wsl_shared_index_guidance;

@@ -1,4 +1,4 @@
-use codegraph_core::node_id::generate_node_id;
+use codegraph_core::node_id::{NodeIdAllocator, generate_node_id, utf16_column};
 use codegraph_core::types::{
     Edge, EdgeKind, ExtractionResult, Language, Node, NodeKind, UnresolvedRef,
 };
@@ -51,6 +51,8 @@ pub struct VueExtractor<'a> {
     edges: Vec<Edge>,
     unresolved_references: Vec<UnresolvedRef>,
     errors: Vec<String>,
+    /// Same-line namesakes keep distinct ids across every script block (#1349).
+    node_ids: NodeIdAllocator,
 }
 
 impl<'a> VueExtractor<'a> {
@@ -62,6 +64,7 @@ impl<'a> VueExtractor<'a> {
             edges: Vec::new(),
             unresolved_references: Vec::new(),
             errors: Vec::new(),
+            node_ids: NodeIdAllocator::default(),
         }
     }
 
@@ -185,13 +188,13 @@ impl<'a> VueExtractor<'a> {
         let mut matches = cursor.matches(&query, tree.root_node(), block.content.as_bytes());
 
         while let Some(m) = matches.next() {
-            for capture in m.captures {
+            for capture in m.captures() {
                 let node = capture.node;
                 let capture_name = query.capture_names()[capture.index as usize];
 
                 if capture_name == "func" {
                     let name_node = m
-                        .captures
+                        .captures()
                         .iter()
                         .find(|c| query.capture_names()[c.index as usize] == "func.name")
                         .unwrap()
@@ -204,11 +207,12 @@ impl<'a> VueExtractor<'a> {
                     let start_pos = node.start_position();
                     let end_pos = node.end_position();
 
-                    let id = generate_node_id(
+                    let id = self.node_ids.generate(
                         self.file_path,
                         NodeKind::Function,
                         &name,
                         start_pos.row as u32 + 1,
+                        utf16_column(&block.content, node.start_byte()),
                     );
                     let qualified_name = format!("{}::{}", self.file_path, name);
 
@@ -248,7 +252,7 @@ impl<'a> VueExtractor<'a> {
                     });
                 } else if capture_name == "import" {
                     let source_node = m
-                        .captures
+                        .captures()
                         .iter()
                         .find(|c| query.capture_names()[c.index as usize] == "import.source")
                         .unwrap()

@@ -70,7 +70,9 @@ impl LanguageSpec for CppSpec {
         "type"
     }
     fn resolve_name(&self, node: Node<'_>, source: &str) -> Option<String> {
-        if let Some(name) = recover_cpp_macro_defined_name(node, source) {
+        if let Some(name) = recover_single_arg_macro_defined_name(node, source)
+            .or_else(|| recover_cpp_macro_defined_name(node, source))
+        {
             return Some(name);
         }
         let qid = declarator_qualified_id(child_by_field(node, "declarator")?)?;
@@ -103,6 +105,9 @@ impl LanguageSpec for CppSpec {
     fn get_return_type(&self, node: Node<'_>, source: &str) -> Option<String> {
         recover_return_type(node, source)
     }
+    fn get_signature(&self, node: Node<'_>, source: &str) -> Option<String> {
+        cpp_constructor_signature(node, source)
+    }
     fn get_visibility(&self, node: Node<'_>) -> Option<String> {
         let parent = node.parent()?;
         for child in parent.children(&mut parent.walk()) {
@@ -111,6 +116,9 @@ impl LanguageSpec for CppSpec {
             }
         }
         None
+    }
+    fn is_abstract(&self, node: Node<'_>, source: &str) -> bool {
+        is_cpp_pure_virtual_method_decl(node, source)
     }
     fn resolve_type_alias_kind(&self, node: Node<'_>, _source: &str) -> Option<NodeKind> {
         for child in node.named_children(&mut node.walk()) {
@@ -139,6 +147,279 @@ impl LanguageSpec for CppSpec {
     fn pre_parse(&self, source: &str, file_path: &str) -> String {
         pre_parse_cpp_source(source, file_path)
     }
+}
+
+/// A C++ pure-virtual declaration is a `field_declaration`, not a
+/// `function_definition`: its declarator unwraps to a function declarator and
+/// the pure specifier is a direct `number_literal` child equal to `0`. A default
+/// argument's zero is nested below the parameter list and therefore cannot
+/// satisfy this test (#1727).
+pub(crate) fn is_cpp_pure_virtual_method_decl(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "field_declaration" {
+        return false;
+    }
+    let Some(mut declarator) = child_by_field(node, "declarator") else {
+        return false;
+    };
+    while matches!(
+        declarator.kind(),
+        "pointer_declarator" | "reference_declarator" | "parenthesized_declarator"
+    ) {
+        let Some(inner) =
+            child_by_field(declarator, "declarator").or_else(|| declarator.named_child(0))
+        else {
+            return false;
+        };
+        declarator = inner;
+    }
+    if declarator.kind() != "function_declarator" {
+        return false;
+    }
+    // `int (*callback)(int) = 0;` is a data member initialized to null. Its
+    // outer declarator is also function-shaped, but the callable declarator is
+    // parenthesized around a pointer; a real method names its member directly.
+    if child_by_field(declarator, "declarator")
+        .is_some_and(|inner| inner.kind() == "parenthesized_declarator")
+    {
+        return false;
+    }
+    node.named_children(&mut node.walk())
+        .any(|child| child.kind() == "number_literal" && node_text(child, source).trim() == "0")
+}
+
+/// Internal reference-name prefix for a C++ local-object constructor call.
+///
+/// The extractor already records the type-level `instantiates` relationship.
+/// This second, synthetic `calls` reference is deliberately namespaced so the
+/// resolver can require an exact owner + accepted-arity constructor match and
+/// can never fall through to an ordinary same-spelled class/function target.
+pub const CPP_CONSTRUCTOR_REFERENCE_PREFIX: &str = "codegraph:cpp-constructor:";
+
+/// Encode a C++ constructor call without losing the call-site arity.
+pub fn cpp_constructor_reference_name(type_name: &str, arity: usize) -> String {
+    format!("{CPP_CONSTRUCTOR_REFERENCE_PREFIX}{type_name}#{arity}")
+}
+
+/// Decode a constructor reference emitted by [`cpp_constructor_reference_name`].
+pub fn parse_cpp_constructor_reference_name(name: &str) -> Option<(&str, usize)> {
+    let encoded = name.strip_prefix(CPP_CONSTRUCTOR_REFERENCE_PREFIX)?;
+    let (type_name, arity) = encoded.rsplit_once('#')?;
+    if type_name.is_empty() || arity.is_empty() || !arity.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    Some((type_name, arity.parse().ok()?))
+}
+
+/// A constructor's overload shape (upstream `constructorShape`, #1839): its
+/// parameter types with names and defaults stripped — the key a prototype and
+/// its out-of-line definition share — and the argument counts it admits
+/// (defaults lower the minimum).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CppConstructorShape {
+    pub key: String,
+    pub min: usize,
+    pub max: usize,
+}
+
+/// The overload shape of a constructor signature (`(int value = 7)`, or a
+/// prototype's `(int value = 7);`), or `None` when it cannot be read: brackets
+/// that do not balance, or a comparison in a default argument, which would be
+/// taken for a default or a template bracket. A parameter pack is unreadable
+/// too: its overload semantics need more type information than the graph
+/// carries. Upstream admits a pack unbounded; this port declines the overload
+/// set instead, so a pack never lets a lone non-pack overload look unique.
+pub fn cpp_constructor_shape(signature: &str) -> Option<CppConstructorShape> {
+    let signature = signature.trim();
+    let signature = signature.strip_suffix(';').unwrap_or(signature).trim_end();
+    let text = signature.strip_prefix('(')?.strip_suffix(')')?.trim();
+    if text.is_empty() || text == "void" {
+        return Some(CppConstructorShape {
+            key: String::new(),
+            min: 0,
+            max: 0,
+        });
+    }
+    // Top-level commas only: `std::map<K, V>`, `int (*cb)(int, int)` and
+    // `T x = f(a, b)` all nest theirs.
+    let bytes = text.as_bytes();
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i64;
+    let mut quote: Option<u8> = None;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let byte = bytes[i];
+        if let Some(open) = quote {
+            if byte == b'\\' {
+                i += 1;
+            } else if byte == open {
+                quote = None;
+            }
+            i += 1;
+            continue;
+        }
+        match byte {
+            b'"' | b'\'' => quote = Some(byte),
+            b'(' | b'<' | b'[' | b'{' => depth += 1,
+            b')' | b'>' | b']' | b'}' => depth -= 1,
+            b',' if depth == 0 => {
+                parts.push(&text[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if depth != 0 || quote.is_some() {
+        return None;
+    }
+    parts.push(&text[start..]);
+    if parts.iter().any(|part| {
+        part.contains(">=") || part.contains("<=") || part.contains("==") || part.contains("!=")
+    }) || parts.iter().any(|part| part.contains("..."))
+    {
+        return None;
+    }
+    let key = parts
+        .iter()
+        .map(|part| {
+            let declared = part.split('=').next().unwrap_or(part).trim();
+            strip_cpp_parameter_name(declared)
+                .chars()
+                .filter(|c| !c.is_whitespace())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(CppConstructorShape {
+        key,
+        min: parts.iter().filter(|part| !part.contains('=')).count(),
+        max: parts.len(),
+    })
+}
+
+/// Strip an optional parameter name, keeping unnamed built-in types
+/// (`unsigned int`, `long long`) and qualified ones (`const T`, `struct S`).
+/// Complex declarators stay distinct unless their spelling matches: an
+/// uncertain merge must not join two overloads.
+fn strip_cpp_parameter_name(declared: &str) -> &str {
+    static NAMED: OnceLock<Regex> = OnceLock::new();
+    let named = NAMED.get_or_init(|| {
+        Regex::new(r"^(.*[\s*&>])([A-Za-z_][A-Za-z0-9_]*)$").expect("parameter name regex is valid")
+    });
+    let Some(captures) = named.captures(declared) else {
+        return declared;
+    };
+    let prefix = captures.get(1).map_or("", |m| m.as_str());
+    let name = captures.get(2).map_or("", |m| m.as_str());
+    let builtin = matches!(
+        name,
+        "void"
+            | "bool"
+            | "char"
+            | "short"
+            | "int"
+            | "long"
+            | "float"
+            | "double"
+            | "signed"
+            | "unsigned"
+            | "const"
+            | "volatile"
+    );
+    let qualifier = matches!(
+        prefix.trim_end(),
+        "const" | "volatile" | "struct" | "class" | "enum"
+    );
+    if builtin || qualifier {
+        declared
+    } else {
+        prefix
+    }
+}
+
+/// Store signatures only for actual constructors. Broadly adding C++ callable
+/// signatures would churn every existing golden node; constructor overload
+/// resolution needs only this narrow subset.
+fn cpp_constructor_signature(node: Node<'_>, source: &str) -> Option<String> {
+    let declarator = child_by_field(node, "declarator")?;
+    let function = find_descendant_of_kind(declarator, "function_declarator")?;
+    let qualified = child_by_field(function, "declarator")?;
+    let qualified_text = node_text(qualified, source);
+    let name = qualified_text.rsplit("::").next()?.trim();
+    if name.is_empty() || name.starts_with('~') {
+        return None;
+    }
+
+    let receiver_matches = qualified_text
+        .rsplit_once("::")
+        .is_some_and(|(receiver, _)| {
+            strip_cpp_template_args(receiver)
+                .rsplit("::")
+                .next()
+                .is_some_and(|owner| owner.trim() == name)
+        });
+    let inline_owner_matches = nearest_cpp_class_name(node, source).as_deref() == Some(name);
+    if !receiver_matches && !inline_owner_matches {
+        return None;
+    }
+    let parameters = child_by_field(function, "parameters")?;
+    // A prototype keeps its terminating `;`, so resolution can tell the
+    // declaration from the definition it merges with (#1839).
+    let terminator = if node.kind() == "declaration" {
+        ";"
+    } else {
+        ""
+    };
+    Some(format!("{}{terminator}", node_text(parameters, source)))
+}
+
+/// An in-class constructor prototype (upstream `isCppConstructorDeclaration`,
+/// #1839): a `declaration` with no return type, directly in a class, struct or
+/// union body, whose declarator is a function declarator named like the type.
+/// It becomes a method node so a default argument declared on it reaches the
+/// out-of-line definition's overload.
+pub fn is_cpp_constructor_declaration(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "declaration" || child_by_field(node, "type").is_some() {
+        return false;
+    }
+    let Some(owner) = node.parent().and_then(|body| body.parent()) else {
+        return false;
+    };
+    if !matches!(
+        owner.kind(),
+        "class_specifier" | "struct_specifier" | "union_specifier"
+    ) {
+        return false;
+    }
+    let Some(declarator) = child_by_field(node, "declarator") else {
+        return false;
+    };
+    declarator.kind() == "function_declarator"
+        && child_by_field(declarator, "declarator").map(|name| node_text(name, source))
+            == child_by_field(owner, "name").map(|name| node_text(name, source))
+}
+
+fn nearest_cpp_class_name(mut node: Node<'_>, source: &str) -> Option<String> {
+    while let Some(parent) = node.parent() {
+        if matches!(
+            parent.kind(),
+            "class_specifier" | "struct_specifier" | "union_specifier"
+        ) {
+            return child_by_field(parent, "name").map(|name| node_text(name, source));
+        }
+        node = parent;
+    }
+    None
+}
+
+fn find_descendant_of_kind<'tree>(node: Node<'tree>, kind: &str) -> Option<Node<'tree>> {
+    if node.kind() == kind {
+        return Some(node);
+    }
+    node.named_children(&mut node.walk())
+        .find_map(|child| find_descendant_of_kind(child, kind))
 }
 
 /// Offset-preserving C++ pre-parse: blank heavily-reflected Unreal-Engine markup
@@ -186,7 +467,12 @@ fn blank_metal_attributes(bytes: Vec<u8>) -> Vec<u8> {
         )
         .expect("metal-attribute regex")
     });
-    let spans: Vec<(usize, usize)> = re.find_iter(source).map(|m| (m.start(), m.end())).collect();
+    let mask = cpp_code_mask(source);
+    let spans: Vec<(usize, usize)> = re
+        .find_iter(source)
+        .filter(|m| (m.start()..m.end()).all(|index| mask[index]))
+        .map(|m| (m.start(), m.end()))
+        .collect();
     let mut bytes = bytes;
     for (start, end) in spans {
         blank_span(&mut bytes, start, end);
@@ -210,6 +496,7 @@ fn blank_cuda_constructs(bytes: Vec<u8>) -> Vec<u8> {
         Ok(source) => source,
         Err(_) => return bytes,
     };
+    let mask = cpp_code_mask(source);
     let mut spans: Vec<(usize, usize)> = Vec::new();
     if source.contains("__") {
         static BOUNDS_RE: OnceLock<Regex> = OnceLock::new();
@@ -223,15 +510,25 @@ fn blank_cuda_constructs(bytes: Vec<u8>) -> Vec<u8> {
             )
             .expect("specifier regex")
         });
-        spans.extend(bounds_re.find_iter(source).map(|m| (m.start(), m.end())));
-        spans.extend(spec_re.find_iter(source).map(|m| (m.start(), m.end())));
+        spans.extend(
+            bounds_re
+                .find_iter(source)
+                .filter(|m| (m.start()..m.end()).all(|index| mask[index]))
+                .map(|m| (m.start(), m.end())),
+        );
+        spans.extend(
+            spec_re
+                .find_iter(source)
+                .filter(|m| (m.start()..m.end()).all(|index| mask[index]))
+                .map(|m| (m.start(), m.end())),
+        );
     }
     if source.contains("<<<") {
         static LAUNCH_RE: OnceLock<Regex> = OnceLock::new();
         let launch_re =
             LAUNCH_RE.get_or_init(|| Regex::new(r"<<<[^;]{0,400}?>>>").expect("launch regex"));
         for m in launch_re.find_iter(source) {
-            if is_brace_balanced(m.as_str()) {
+            if (m.start()..m.end()).all(|index| mask[index]) && is_brace_balanced(m.as_str()) {
                 spans.push((m.start(), m.end()));
             }
         }
@@ -286,25 +583,23 @@ fn blank_span(bytes: &mut [u8], start: usize, end: usize) {
     }
 }
 
-/// Scan a balanced `(...)` from `open` (the index of the `(`), skipping string
-/// and char literals so an embedded `)` cannot mis-close. All delimiters are
-/// ASCII and UTF-8 continuation bytes never match them, so a byte scan is safe.
-/// Returns the index just past the closing `)`, or `None` if unbalanced.
-fn balanced_paren_end(bytes: &[u8], open: usize) -> Option<usize> {
+/// Scan a balanced `(...)` from `open`, counting parentheses only where the
+/// C/C++ lexical mask says the byte is code. Comments, ordinary literals, raw
+/// strings (including custom delimiters), and directives therefore cannot
+/// prematurely close or deepen a real annotation macro argument list (#1505).
+pub(crate) fn balanced_paren_end(bytes: &[u8], mask: &[bool], open: usize) -> Option<usize> {
+    if bytes.len() != mask.len() || bytes.get(open) != Some(&b'(') || !mask[open] {
+        return None;
+    }
     let mut depth = 0i32;
     let mut i = open;
     while i < bytes.len() {
-        let c = bytes[i];
-        if c == b'"' || c == b'\'' {
-            let quote = c;
+        if !mask[i] {
             i += 1;
-            while i < bytes.len() && bytes[i] != quote {
-                if bytes[i] == b'\\' {
-                    i += 1;
-                }
-                i += 1;
-            }
-        } else if c == b'(' {
+            continue;
+        }
+        let c = bytes[i];
+        if c == b'(' {
             depth += 1;
         } else if c == b')' {
             depth -= 1;
@@ -334,9 +629,13 @@ fn blank_cpp_api_prefix_macros(bytes: Vec<u8>) -> Vec<u8> {
     let re = RE.get_or_init(|| {
         Regex::new(r"\b[A-Z][A-Z0-9_]*(?:_API|_EXPORT|_ABI)\b").expect("api-prefix regex")
     });
+    let mask = cpp_code_mask(source);
     let spans: Vec<(usize, usize)> = re
         .find_iter(source)
         .filter(|m| {
+            if !(m.start()..m.end()).all(|index| mask[index]) {
+                return false;
+            }
             let mut saw_space = false;
             for c in source[m.end()..].chars() {
                 if c.is_whitespace() {
@@ -373,10 +672,15 @@ fn blank_cpp_inline_annotation_macros(bytes: Vec<u8>) -> Vec<u8> {
     let re = RE.get_or_init(|| {
         Regex::new(r"\b(?:UMETA|UPARAM|UE_DEPRECATED\w*)\s*\(").expect("inline-annotation regex")
     });
+    let mask = cpp_code_mask(source);
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut search_from = 0usize;
     while let Some(m) = re.find_at(source, search_from) {
-        match balanced_paren_end(&bytes, m.end() - 1) {
+        if !(m.start()..m.end()).all(|index| mask[index]) {
+            search_from = m.end();
+            continue;
+        }
+        match balanced_paren_end(&bytes, &mask, m.end() - 1) {
             Some(end) => {
                 spans.push((m.start(), end));
                 search_from = end;
@@ -413,12 +717,17 @@ fn blank_cpp_annotation_macro_calls(bytes: Vec<u8>) -> Vec<u8> {
     let re = RE.get_or_init(|| {
         Regex::new(r"(?m)^([ \t]*)([A-Z][A-Z0-9_]{2,})(\s*)\(").expect("annotation-call regex")
     });
+    let mask = cpp_code_mask(source);
     let mut spans: Vec<(usize, usize)> = Vec::new();
     let mut search_from = 0usize;
     while let Some(caps) = re.captures_at(source, search_from) {
         let whole = caps.get(0).expect("match 0");
         let indent_len = caps.get(1).map_or(0, |g| g.as_str().len());
-        let end = match balanced_paren_end(&bytes, whole.end() - 1) {
+        if !(whole.start() + indent_len..whole.end()).all(|index| mask[index]) {
+            search_from = whole.end();
+            continue;
+        }
+        let end = match balanced_paren_end(&bytes, &mask, whole.end() - 1) {
             Some(end) => end,
             None => {
                 search_from = whole.end();
@@ -675,6 +984,108 @@ fn mask_quoted_literal(bytes: &[u8], mask: &mut [bool], start: usize, quote: u8)
         }
     }
     i
+}
+
+/// Recover the function a single-argument macro defines —
+/// `#define NATIVE_FN(name) int name(void)` then `NATIVE_FN(get_version) { … }`
+/// (upstream #1373). Without its definition the shape is ambiguous, so a
+/// preceding local `#define` whose replacement uses its sole parameter as the
+/// function declarator is required; registration, token-pasting and `typedef`
+/// replacements, an `#undef` or redefinition in between, and any conditional
+/// block leave the name alone. C parses the macro as the return type with a
+/// `(name)` declarator; C++ as an implicit-return-type function.
+pub(crate) fn recover_single_arg_macro_defined_name(
+    node: Node<'_>,
+    source: &str,
+) -> Option<String> {
+    if node.kind() != "function_definition" {
+        return None;
+    }
+    let declarator = child_by_field(node, "declarator")?;
+    let (macro_node, argument) = match declarator.kind() {
+        "parenthesized_declarator" if declarator.named_child_count() == 1 => {
+            let macro_node = child_by_field(node, "type")?;
+            let argument = declarator.named_child(0)?;
+            if macro_node.kind() != "type_identifier" || argument.kind() != "identifier" {
+                return None;
+            }
+            (macro_node, argument)
+        }
+        "function_declarator" if child_by_field(node, "type").is_none() => {
+            let macro_node = child_by_field(declarator, "declarator")?;
+            let params = child_by_field(declarator, "parameters")?;
+            let param = params.named_child(0)?;
+            if macro_node.kind() != "identifier"
+                || params.named_child_count() != 1
+                || param.kind() != "parameter_declaration"
+                || param.named_child_count() != 1
+            {
+                return None;
+            }
+            let argument = param.named_child(0)?;
+            if argument.kind() != "type_identifier" {
+                return None;
+            }
+            (macro_node, argument)
+        }
+        _ => return None,
+    };
+    let macro_name = node_text(macro_node, source);
+    static REPLACEMENT: OnceLock<Regex> = OnceLock::new();
+    let replacement_pattern = REPLACEMENT.get_or_init(|| {
+        Regex::new(
+            r"^(?:[A-Za-z_][A-Za-z0-9_:]*\s+)+[*&\s]*([A-Za-z_][A-Za-z0-9_]*)\s*\([^(){};#]*\)\s*$",
+        )
+        .expect("single-argument macro replacement pattern")
+    });
+    static TYPEDEF: OnceLock<Regex> = OnceLock::new();
+    let typedef = TYPEDEF.get_or_init(|| Regex::new(r"(?-u:\b)typedef(?-u:\b)").expect("typedef"));
+    let mut scope = Some(node);
+    while let Some(current) = scope {
+        if current.kind() == "preproc_else" || current.kind().starts_with("preproc_elif") {
+            return None;
+        }
+        let mut previous = current.prev_named_sibling();
+        while let Some(prev) = previous {
+            previous = prev.prev_named_sibling();
+            if prev.kind().starts_with("preproc_if") {
+                return None;
+            }
+            if prev.kind() == "preproc_call"
+                && child_by_field(prev, "directive")
+                    .is_some_and(|directive| node_text(directive, source) == "#undef")
+                && child_by_field(prev, "argument")
+                    .is_some_and(|argument| node_text(argument, source).trim() == macro_name)
+            {
+                return None;
+            }
+            if !matches!(prev.kind(), "preproc_function_def" | "preproc_def")
+                || child_by_field(prev, "name").map(|name| node_text(name, source))
+                    != Some(macro_name.clone())
+            {
+                continue;
+            }
+            let params = child_by_field(prev, "parameters")?;
+            let param = params.named_child(0)?;
+            let value = child_by_field(prev, "value")?;
+            if params.named_child_count() != 1 || param.kind() != "identifier" {
+                return None;
+            }
+            let replacement = node_text(value, source)
+                .replace("\\\r\n", " ")
+                .replace("\\\n", " ");
+            let replacement = replacement.trim();
+            let declared = replacement_pattern
+                .captures(replacement)
+                .and_then(|captures| captures.get(1))?;
+            if typedef.is_match(replacement) || declared.as_str() != node_text(param, source) {
+                return None;
+            }
+            return Some(node_text(argument, source));
+        }
+        scope = current.parent();
+    }
+    None
 }
 
 /// Recover the real function name from the macro-definition idiom

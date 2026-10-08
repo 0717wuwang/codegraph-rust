@@ -17,6 +17,7 @@ use serde_json::{Value, json};
 
 use crate::engine::CodeGraphEngine;
 use crate::instructions::server_instructions;
+use crate::project_services::ProjectServiceBroker;
 use crate::protocol::{JsonRpcRequest, JsonRpcResponse, ToolResult, error_codes};
 use crate::roots::{
     ROOTS_LIST_REQUEST_ID, ServerRootDiscovery, WorkspaceRoots, db_exists_for, db_path_for,
@@ -196,17 +197,31 @@ pub struct McpServer {
     workspace_roots: WorkspaceRoots,
     root_discovery: ServerRootDiscovery,
     no_roots: bool,
+    project_services: Option<ProjectServiceBroker>,
 }
 
 impl McpServer {
     pub fn new(default_project: Option<PathBuf>) -> Self {
-        Self::with_cwd(default_project, std::env::current_dir().ok(), false)
+        Self::new_with_project_services(default_project, None)
+    }
+
+    pub fn new_with_project_services(
+        default_project: Option<PathBuf>,
+        project_services: Option<ProjectServiceBroker>,
+    ) -> Self {
+        Self::with_cwd(
+            default_project,
+            std::env::current_dir().ok(),
+            false,
+            project_services,
+        )
     }
 
     fn with_cwd(
         default_project: Option<PathBuf>,
         cwd: Option<PathBuf>,
         use_cwd_for_discovery: bool,
+        project_services: Option<ProjectServiceBroker>,
     ) -> Self {
         let search_from = default_project
             .clone()
@@ -249,6 +264,7 @@ impl McpServer {
             workspace_roots: WorkspaceRoots::new(),
             root_discovery,
             no_roots: false,
+            project_services,
         }
     }
 
@@ -545,14 +561,28 @@ impl McpServer {
                 );
             }
         };
+        if raw_project.is_some()
+            && let Some(project_services) = &self.project_services
+            && let Err(error) = project_services.ensure(&project_path)
+        {
+            return Dispatch::Reply(
+                serde_json::to_value(ToolResult::error(format!(
+                    "Failed to prepare live synchronization for {}: {error:#}",
+                    project_path.display()
+                )))
+                .expect("ToolResult serializes"),
+            );
+        }
 
         let engine = match self.engine_for(&project_path) {
             Ok(e) => e,
             Err(e) => {
                 return Dispatch::Reply(
                     serde_json::to_value(ToolResult::error(format!(
-                        "Failed to open project at {}: {e}",
-                        project_path.display()
+                        "Failed to open project at {}: {e}{}",
+                        project_path.display(),
+                        codegraph_store::wsl_shared_index_guidance(e.as_ref())
+                            .map_or(String::new(), |guidance| format!("\n{guidance}"))
                     )))
                     .expect("ToolResult serializes"),
                 );
@@ -641,7 +671,7 @@ impl McpServer {
     /// mutating the process-global working directory.
     #[doc(hidden)]
     pub fn new_with_cwd(default_project: Option<PathBuf>, cwd: Option<PathBuf>) -> Self {
-        Self::with_cwd(default_project, cwd, true)
+        Self::with_cwd(default_project, cwd, true, None)
     }
 }
 
@@ -720,12 +750,7 @@ mod tests {
         let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let path =
             std::env::temp_dir().join(format!("cg-mcp-init-{tag}-{}-{seq}", std::process::id()));
-        // The project dir must exist before `db_path_for` (which resolves the
-        // physical identity) can succeed.
-        std::fs::create_dir_all(&path).unwrap();
-        let db = db_path_for(&path).expect("default project resolves");
-        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-        std::fs::write(&db, b"placeholder").unwrap();
+        crate::roots::write_index_fixture(&path, b"placeholder");
         TempProject { path }
     }
 
@@ -741,10 +766,7 @@ mod tests {
 
     fn indexed_child(workspace: &TempProject, name: &str) -> PathBuf {
         let child = workspace.path().join(name);
-        std::fs::create_dir_all(&child).unwrap();
-        let db = db_path_for(&child).expect("child project resolves");
-        std::fs::create_dir_all(db.parent().unwrap()).unwrap();
-        std::fs::write(db, b"placeholder").unwrap();
+        crate::roots::write_index_fixture(&child, b"placeholder");
         child
     }
 

@@ -247,7 +247,7 @@ impl SessionRegistry {
                 // triggers). We only issue shutdown(SHUT_RDWR); no ownership is
                 // taken and the fd is not closed here.
                 let borrowed = unsafe { BorrowedFd::borrow_raw(fd) };
-                let _ = rustix::net::shutdown(borrowed, rustix::net::Shutdown::ReadWrite);
+                let _ = rustix::net::shutdown(borrowed, rustix::net::Shutdown::Both);
             }
         }
         #[cfg(not(unix))]
@@ -357,6 +357,7 @@ pub(crate) async fn serve_session_async(
     socket_path: String,
     registry: SessionRegistry,
     run_mcp: bool,
+    project_services: Option<codegraph_mcp::ProjectServiceBroker>,
     control: Option<ControlHandle>,
 ) -> Result<()> {
     let guard = registry.start_session();
@@ -432,7 +433,11 @@ pub(crate) async fn serve_session_async(
     // control frame ACTIVELY ends this session (dropping the transport closes the
     // socket) instead of waiting for the client to disconnect.
     tokio::select! {
-        served = codegraph_mcp::rmcp_session::serve_session_rmcp_async(transport, project_root) => {
+        served = codegraph_mcp::rmcp_session::serve_session_rmcp_async_with_project_services(
+            transport,
+            project_root,
+            project_services,
+        ) => {
             served?;
         }
         _ = closing.changed() => {

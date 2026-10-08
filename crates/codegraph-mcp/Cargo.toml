@@ -1,6 +1,7 @@
 [package]
 name = "codegraph-mcp"
 version.workspace = true
+publish.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -21,6 +22,7 @@ codegraph-core = { path = "../codegraph-core" }
 codegraph-store = { path = "../codegraph-store" }
 codegraph-graph = { path = "../codegraph-graph" }
 codegraph-resolve = { path = "../codegraph-resolve" }
+codegraph-watch = { path = "../codegraph-watch" }
 regex = "1.10"
 # rmcp is now the SOLE MCP transport (Phase E): a regular dependency, no longer
 # feature-gated. The shipped binary links rmcp + tokio + axum unconditionally.
@@ -52,7 +54,7 @@ tokio-util = { version = "0.7" }
 # dependency of an integration test binary, so a Cargo feature (auto-enabled for
 # this crate's own dev/test builds via the dev-dependency self-reference below)
 # is the only reliable gate. NEVER enabled in the shipped binary.
-test-hooks = ["codegraph-store/test-hooks"]
+test-hooks = ["codegraph-store/test-hooks", "codegraph-watch/test-hooks"]
 
 [dev-dependencies]
 # Self-reference with `test-hooks` so the seams above are compiled into the lib
@@ -63,7 +65,7 @@ codegraph-extract = { path = "../codegraph-extract" }
 rmcp = { version = "3.0.1", features = ["server", "client", "transport-io", "transport-streamable-http-server"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "sync", "time"] }
 # reqwest: dev-only HTTP client for the streamable-HTTP integration test.
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.13", default-features = false, features = ["json"] }
 # tower: dev-only, provides `ServiceExt::oneshot` to unit-test the debug
 # middleware's transparent passthrough without spawning a server.
 tower = { version = "0.5", features = ["util"] }

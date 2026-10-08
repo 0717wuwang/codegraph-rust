@@ -16,16 +16,24 @@
 
 #![allow(clippy::collapsible_if, clippy::collapsible_else_if)]
 
+mod alias_binding;
+mod awaited;
+mod c_macro_visibility;
 pub mod context;
 pub mod framework; // the FrameworkResolver extension point
 pub mod frameworks; // concrete react/vue/nestjs FrameworkResolvers
 pub mod import_resolver;
+mod js_store;
 pub mod lru_cache;
+mod member_value;
 pub mod name_matcher;
+mod object_literal;
 pub mod path_aliases;
 pub mod pathutil;
 pub mod resolver;
+mod rust_lexical;
 pub mod snapshot_context;
+pub mod source_facts;
 pub mod strip_comments;
 pub mod types;
 pub mod workspace_packages;

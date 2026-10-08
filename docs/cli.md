@@ -1,6 +1,6 @@
 # CLI Subcommand Reference
 
-`codegraph` ships 26 subcommands. All commands accept `--help` for usage details.
+`codegraph --help` is the authoritative command inventory. Every command accepts `--help` for usage details; the table below documents the current public surface without maintaining a separate unchecked count.
 
 ## Path Convention
 
@@ -14,41 +14,79 @@
 
 ## Full Subcommand Table
 
-| Subcommand        | Purpose                                                                                   | Key flags                                                                                                                                  |
-| ----------------- | ----------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `install`         | Write the codegraph MCP server into each AI agent's config                                | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`, `-i/--init`, `--no-permissions`, `--print-config <id>`, `--prompt-hook` |
-| `uninstall`       | Remove codegraph from agent configs (inverse of `install`)                                | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`                                                                          |
-| `skill`           | Install / update / uninstall / check the embedded agent skill                             | `<action>` (install, update, uninstall, status)                                                                                            |
-| `skill install`   | Write the embedded SKILL.md into each agent's skill directory                             | `-t/--target`, `--global`, `--local`, `-y/--yes`                                                                                           |
-| `skill update`    | Refresh the installed skill and marker-managed agent instructions                         | `-t/--target`, `--global`, `--local`, `--force`, `--diff`, `--dry-run`                                                                     |
-| `skill uninstall` | Remove the skill from agent skill directories                                             | `-t/--target`, `--global`, `--local`, `-y/--yes`                                                                                           |
-| `skill status`    | Report install state per agent (up to date / locally modified / outdated / not installed) | `-t/--target`, `--global`, `--local`                                                                                                       |
-| `init`            | Initialize `.codegraph/` and run the first full index                                     | `[path]`, `-t/--target` (also write project-level MCP config; default `none`), `-y/--yes`                                                  |
-| `uninit`          | Delete the project's `.codegraph/` index                                                  | `[path]`, `-f/--force`                                                                                                                     |
-| `index`           | (Re-)index in full                                                                        | `[path]`, `-f/--force`, `-q/--quiet`, `-v/--verbose`                                                                                       |
-| `sync`            | Incremental sync: re-index only changed files, drop deleted ones, re-resolve              | `[path]`, `-q/--quiet`                                                                                                                     |
-| `status`          | Print index stats (files/nodes/edges/DB size/journal)                                     | `[path]`, `-j/--json`                                                                                                                      |
-| `search`          | FTS5 + multi-signal scored symbol search                                                  | `<search>`, `-p`, `-l/--limit`, `-k/--kind`, `-j/--json`, `--strict`                                                                       |
-| `files`           | List indexed files (tree/flat/grouped)                                                    | `-p`, `--filter <DIR>`, `--language <LANG>`, `--pattern`, `--format`, `--max-depth`, `-j`                                                  |
-| `serve`           | Start the server; `--mcp` enters MCP stdio mode                                           | `-p`, `--mcp`, `--no-watch`                                                                                                                |
-| `unlock`          | Clear a stale daemon lock (keeps live pids)                                               | `[path]`                                                                                                                                   |
-| `callers`         | Who calls a symbol (along calls/references/imports)                                       | `<symbol>`, `-p`, `-l`, `-j`, `--strict`, `--file <FILE>`                                                                                  |
-| `callees`         | What a symbol calls                                                                       | `<symbol>`, `-p`, `-l`, `-j`, `--strict`, `--file <FILE>`                                                                                  |
-| `impact`          | Blast radius of changing a symbol (incoming deps, transitive)                             | `<symbol>`, `-p`, `-d/--depth`, `-j`, `--strict`, `--file <FILE>`                                                                          |
-| `affected`        | Given changed files, the affected symbol set                                              | `[files...]`, `-p`, `-d/--depth`, `--filter`                                                                                               |
-| `check`           | Detect circular dependencies (each cycle as `a.ts -> b.ts -> a.ts`)                       | `-p/--path`, `-j/--json`                                                                                                                   |
-| `audit`           | Read-only Godot resource audit: orphan resources, dangling references, impact             | `-p`, `--orphans`, `--dangling`, `--impact <path>` (≥1 required), `--verify-plan`, `--include <PREFIX>`, `--exclude <PREFIX>`, `-j/--json` |
-| `export`          | Export the whole code graph as NetworkX node-link JSON                                    | `-p/--path`, `-o/--out <file>`, `--no-centrality`                                                                                          |
-| `explore`         | Explore an area with the same deterministic engine/output as `codegraph_explore`          | `<query>`, `-p`, `--max-files <1..20>`, `-j/--json`                                                                                        |
-| `node`            | Read a symbol name, exact node ID, or indexed file with the `codegraph_node` engine       | `<target>`, `-p`, `-f/--file`, `--symbols-only`, `-j/--json`, `--strict`                                                                   |
-| `http`            | Inspect or stop detached HTTP MCP servers                                                 | `<action>` (`list`, `status`, `stop`)                                                                                                      |
-| `mcp`             | Inspect foreground stdio MCP processes                                                    | `list`, optional `--json`                                                                                                                  |
-| `version`         | Print the codegraph version (same as `--version`)                                         | —                                                                                                                                          |
-| `self-update`     | Update the binary in place from the latest GitHub release                                 | `--check`, `--force`, `--tag <vX.Y.Z>`                                                                                                     |
-| `completions`     | Print or install shell completions                                                        | `<shell>` (bash, zsh, fish, powershell, elvish), `--install`                                                                               |
+| Subcommand        | Purpose                                                                                                                       | Key flags                                                                                                                                  |
+| ----------------- | ----------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
+| `install`         | Write the codegraph MCP server into each AI agent's config                                                                    | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`, `-i/--init`, `--no-permissions`, `--print-config <id>`, `--prompt-hook` |
+| `uninstall`       | Remove codegraph from agent configs (inverse of `install`)                                                                    | `-t/--target`, `-l/--location`, `--global`, `--local`, `-y/--yes`                                                                          |
+| `skill`           | Install / update / uninstall / check the embedded agent skill                                                                 | `<action>` (install, update, uninstall, status)                                                                                            |
+| `skill install`   | Write the embedded SKILL.md into each agent's skill directory                                                                 | `-t/--target`, `--global`, `--local`, `-y/--yes`                                                                                           |
+| `skill update`    | Refresh the installed skill and marker-managed agent instructions                                                             | `-t/--target`, `--global`, `--local`, `--force`, `--diff`, `--dry-run`                                                                     |
+| `skill uninstall` | Remove the skill from agent skill directories                                                                                 | `-t/--target`, `--global`, `--local`, `-y/--yes`                                                                                           |
+| `skill status`    | Report install state per agent (up to date / locally modified / outdated / not installed)                                     | `-t/--target`, `--global`, `--local`                                                                                                       |
+| `init`            | Initialize `.codegraph/` and run the first full index                                                                         | `[path]`, `-t/--target` (also write project-level MCP config; default `none`), `-y/--yes`                                                  |
+| `uninit`          | Delete the project's `.codegraph/` index                                                                                      | `[path]`, `-f/--force`                                                                                                                     |
+| `index`           | (Re-)index in full                                                                                                            | `[path]`, `-f/--force`, `-q/--quiet`, `-v/--verbose`                                                                                       |
+| `sync`            | Incremental sync: re-index only changed files, drop deleted ones, re-resolve                                                  | `[path]`, `-q/--quiet`                                                                                                                     |
+| `status`          | Print index stats (files/nodes/edges/DB size/journal)                                                                         | `[path]`, `-j/--json`                                                                                                                      |
+| `search`          | FTS5 + multi-signal scored symbol search                                                                                      | `<search>`, `-p`, `-l/--limit`, `-k/--kind`, `-j/--json`, `--strict`                                                                       |
+| `files`           | List indexed files (tree/flat/grouped)                                                                                        | `-p`, `--filter <DIR>`, `--language <LANG>`, `--pattern`, `--format`, `--max-depth`, `-j`                                                  |
+| `serve`           | Start the server; `--mcp` enters MCP stdio mode                                                                               | `-p`, `--mcp`, `--no-watch`                                                                                                                |
+| `unlock`          | Clear a stale daemon lock (keeps live pids)                                                                                   | `[path]`                                                                                                                                   |
+| `callers`         | Who calls a symbol (along calls/references/imports)                                                                           | `<symbol>`, `-p`, `-l`, `-j`, `--strict`, `--file <FILE>`                                                                                  |
+| `callees`         | What a symbol calls                                                                                                           | `<symbol>`, `-p`, `-l`, `-j`, `--strict`, `--file <FILE>`                                                                                  |
+| `impact`          | Blast radius of changing a symbol (incoming deps, transitive)                                                                 | `<symbol>`, `-p`, `-d/--depth`, `-j`, `--strict`, `--file <FILE>`                                                                          |
+| `affected`        | Given changed files, the affected symbol set                                                                                  | `[files...]`, `-p`, `-d/--depth`, `--filter`                                                                                               |
+| `check`           | Detect circular dependencies (each cycle as `a.ts -> b.ts -> a.ts`)                                                           | `-p/--path`, `-j/--json`                                                                                                                   |
+| `audit`           | Read-only Godot resource audit: orphan resources, dangling references, impact                                                 | `-p`, `--orphans`, `--dangling`, `--impact <path>` (≥1 required), `--verify-plan`, `--include <PREFIX>`, `--exclude <PREFIX>`, `-j/--json` |
+| `export`          | Export the whole code graph as NetworkX node-link JSON                                                                        | `-p/--path`, `-o/--out <file>`, `--no-centrality`                                                                                          |
+| `explore`         | Explore an area with the same deterministic engine/output as `codegraph_explore`                                              | `<query>`, `-p`, `--max-files <1..20>`, `-j/--json`                                                                                        |
+| `node`            | Read a symbol name, exact node ID, or indexed file with the `codegraph_node` engine                                           | `<target>`, `-p`, `-f/--file`, `--symbols-only`, `-j/--json`, `--strict`                                                                   |
+| `http`            | Inspect or stop detached HTTP MCP servers                                                                                     | `<action>` (`list`, `status`, `stop`)                                                                                                      |
+| `mcp`             | Inspect foreground stdio MCP processes                                                                                        | `list`, optional `--json`                                                                                                                  |
+| `ui`              | Open the browser viewer over the existing index (preview: refused unless `CODEGRAPH_UI=1`; see [the viewer reference](ui.md)) | `[path]`, `--port <N>`, `--no-open`, `--read-only`; alias `web`                                                                            |
+| `version`         | Print the codegraph version (same as `--version`)                                                                             | —                                                                                                                                          |
+| `self-update`     | Update the binary in place from the latest GitHub release                                                                     | `--check`, `--force`, `--tag <vX.Y.Z>`                                                                                                     |
+| `completions`     | Print or install shell completions                                                                                            | `<shell>` (bash, zsh, fish, powershell, elvish), `--install`                                                                               |
 
 `query` remains a visible backward-compatible alias for `search`; new scripts,
 documentation, and diagnostics should use `search`.
+
+`status` performs a read-only, scope-aware source inventory against the current
+index. It reports pending added, modified, and removed paths even after those
+changes were committed (a clean `git status` is not treated as an up-to-date
+CodeGraph index), after history rewrites, and in non-Git projects. The detector
+reuses full-sync include/exclude/custom-extension rules and the same
+`(size,mtime) → sha256` decision. JSON always includes counts plus
+`addedPaths`/`modifiedPaths`/`removedPaths`; text lists the same paths only when
+non-empty. Running status acquires only the normal read lease and does not mutate
+the database.
+
+In a git work tree, a full `index` or `sync` also records the commit it started at.
+It records every path that may differ from that commit as well: paths git reported
+dirty during the build, files whose size or mtime moved while it ran, and paths a
+fresh scan and the database disagree on. Incremental syncs add the paths they
+handle. `status` then classifies only git's candidates and those recorded paths,
+by the same rules: what changed between the recorded commit and `HEAD`, plus what
+`git status` reports now. The answer is the same as the full inventory's. The full
+inventory still answers whenever git might not see a change:
+
+- there is no record, the commit no longer exists, or the repository has no commit;
+- the scope changed: config, root `.gitignore`, extension overrides, index root,
+  or binary version;
+- the index was built through symlinks, or the repository has submodules;
+- an untracked nested repository or an `assume-unchanged` or `skip-worktree` entry
+  is present;
+- git ignores a path the scan keeps, such as one under a nested `.gitignore` or an
+  `include` override;
+- git might call changed bytes or names clean: `core.autocrlf`, any gitattributes
+  source (`.gitattributes`, `info/attributes`, and the global and system attributes
+  files git resolves, including `core.attributesFile`), or a
+  case-insensitive or Unicode-precomposing name match (`core.ignorecase`, the
+  macOS and Windows default; `core.precomposeunicode`). On those systems the full
+  inventory answers;
+- git is missing or does not answer within 10 seconds.
+
+Git runs without optional locks, so `status` never rewrites `.git/index`.
 
 ### Project-path argument contract
 
@@ -77,10 +115,33 @@ passed directly to `node`, avoiding name ambiguity:
 codegraph node "function:b8b1c4a981a1841066418516bc8ebf86" -p .
 ```
 
+File mode accepts editor-style line selectors and uses them as an inclusive read
+window:
+
+```bash
+codegraph node "src/main.rs:42" -p .        # start at line 42
+codegraph node "src/main.rs:42-80" -p .     # lines 42 through 80
+codegraph node "src/main.rs#L42-L80" -p .   # GitHub/editor spelling
+```
+
+The literal indexed path is resolved first, so a real filename ending in `:42`
+is never reinterpreted. Only after a literal miss does `node` strip `:<line>`,
+`:<start>-<end>`, `#L<line>`, or `#L<start>-L<end>`. Invalid, zero, reversed, and
+overflowing selectors remain literal. Windows drive-relative `C:42` and `C:#L42`
+also remain literal, while `C:\repo\src\main.rs:42` is unambiguous. CLI file mode
+uses the selector directly; MCP callers can override its offset and limit as
+described in [`mcp.md`](mcp.md).
+
 Case-insensitive exact-name search probes seek through `idx_nodes_lower_name`
 rather than scanning `nodes`. Explore separately supplements its context seeds
 with camelCase/snake-case segments, including Variable and Constant definitions.
 These are query-time changes only; they do not change the stored graph.
+
+Explore treats a slashed, extensionless path that exists as a regular file
+inside the project (for example `scripts/deploy`) as an explicit but unindexed
+path. It removes the path fragments from FTS and reports the path caveat instead
+of returning unrelated matches. Slashed prose such as `input/output` stays in
+the query, and absolute, `..`, or symlink-escaping paths are never followed.
 
 > **Note:** `serve --no-watch` and `CODEGRAPH_NO_WATCH=1` are fully equivalent —
 > both disable the live file watcher. See
@@ -92,6 +153,11 @@ These are query-time changes only; they do not change the stored graph.
 > rejected with an error instead of building a home-wide index — that index
 > would be enormous and would make a home-launched `serve --mcp` peg a CPU. Run
 > these commands inside a specific project directory.
+
+> **Unsupported-only projects are explicit.** If discovery sees files but none
+> use a language CodeGraph indexes, `init`/`index` prints the total and the five
+> most common extensions, then states that CodeGraph is inactive for the
+> workspace. Empty projects keep the ordinary `No files found to index` output.
 
 > **`affected` output fields.** `codegraph affected` always emits JSON on stdout
 > (there is no `--json` flag). Its keys are `changedFiles` (the input files),
@@ -117,16 +183,25 @@ The written MCP command launches the Rust binary: `command: "codegraph"`, `args:
 "--mcp"]` (Cursor injects `--path`; Kiro injects `--path` only on a project-local
 install).
 
-> **Kiro must be installed project-level.** Kiro launches its stdio MCP
-> subprocess from `$HOME` and its `initialize` carries no workspace root and no
-> `roots` capability, so a bare `serve --mcp` would degrade to home safe mode.
-> Run `codegraph install --target=kiro --local` from each project root — that
-> pins the project's absolute `--path`. A **global** Kiro install intentionally
-> writes **no** MCP entry (and removes a stale one left by an older version),
-> because Kiro CLI does not expand `${workspaceFolder}` in `mcp.json` args: a
-> global `--path ${workspaceFolder}` would resolve to a literal, non-existent
-> directory and break the watcher and catch-up sync.
+> **Kiro global versus project-local.** A global Kiro install writes a bare
+> `serve --mcp` entry with no `--path`. It can list tools and query any existing
+> index when the agent supplies `projectPath` per call, but it does not own a
+> project's live watcher. Run `codegraph init --target=kiro <project>` (or a
+> local Kiro install from that project) to write a project-level entry with an
+> absolute `--path` and enable live catch-up/watch. Kiro does not expand
+> `${workspaceFolder}` in global `mcp.json`, so the installer never writes that
+> literal placeholder.
 
+> **Claude tool loading.** Claude entries carry `"alwaysLoad": true`, and the
+> Explore tool also advertises `_meta["anthropic/alwaysLoad"] = true`. Together
+> they keep the primary exploration tool available from the first prompt rather
+> than hiding it behind tool search.
+
+> **OpenCode 2.** The installer writes the native
+> `mcp.servers.codegraph` entry with `disabled: false` and `codemode: false`.
+> Reinstall migrates the older `mcp.codegraph` + `enabled` shape, and uninstall
+> removes either shape while preserving JSONC comments and sibling servers.
+>
 > **The three GitHub Copilot targets.** They share the Copilot MCP surface but
 > disagree on both the wrapper key and the available locations:
 >
@@ -142,7 +217,8 @@ install).
 > `mcp.json`, so in the user-level file it would stay literal and point the server
 > at a nonexistent directory. Run `codegraph init --target=vscode` per project for
 > live watch. The Copilot CLI entry additionally carries `"tools": ["*"]`, without
-> which the CLI registers the server but exposes none of its tools.
+> which the CLI registers the server but exposes none of its tools, plus
+> `"deferTools": "never"` so Explore is not hidden behind tool search.
 
 ```bash
 codegraph install --yes                          # auto-detect installed agents, global
@@ -168,8 +244,17 @@ confirmation prompt, so it is behavior-neutral. Therefore
 `codegraph install --yes --init` is safe for unattended setup while retaining
 all ordinary broad-root and existing-index guards.
 
-**Codex CLI.** Global install remains `~/.codex/config.toml` plus
-`~/.codex/AGENTS.md`. Local install writes `<project>/.codex/config.toml`,
+**Claude and Codex profile roots.** Global Claude install follows a non-blank
+`CLAUDE_CONFIG_DIR`: `.claude.json`, `settings.json`, `CLAUDE.md`, and the skill
+directory all live inside that profile; without it the established
+`~/.claude.json` plus `~/.claude/` layout remains. Global Codex MCP config and
+managed instructions follow a non-blank `CODEX_HOME`, falling back to
+`~/.codex/config.toml` plus `~/.codex/AGENTS.md`. Relative overrides resolve
+against the install command's working directory. Detection, print-config,
+reinstall, skill updates (Claude), and uninstall use the same resolved paths.
+Local installs ignore both overrides.
+
+**Codex CLI.** Local install writes `<project>/.codex/config.toml`,
 the project-root `<project>/AGENTS.md`, and
 `<project>/.agents/skills/codegraph`. Detection, `--print-config`, install, and
 uninstall all honor the selected location. A local uninstall never edits the
@@ -202,9 +287,9 @@ installer pins an explicit `--path`:
 
 - **Cursor** — `install` injects `--path` automatically (local install pins the
   project dir; global uses `${workspaceFolder}`, which Cursor expands).
-- **Kiro** — install **project-level** only: `--path` is the concrete project dir.
-  A global Kiro install writes no entry, because Kiro CLI does not expand
-  `${workspaceFolder}` (see the note above).
+- **Kiro** — global install writes a bare read-only entry; local install and
+  `init --target=kiro` pin the concrete project path for live watch. Kiro does
+  not expand `${workspaceFolder}` in global configuration.
 - **Zed** — Zed's global `context_servers` config cannot inject a per-project
   path (no `${workspaceFolder}` expansion). A global `codegraph install --target=zed`
   writes a bare entry (read-only off any existing index). To pin a specific project,
@@ -347,7 +432,7 @@ versions behind you are.
 codegraph self-update              # update to the latest release
 codegraph self-update --check      # only report whether a newer version exists
 codegraph self-update --force      # reinstall even if already current
-codegraph self-update --tag v0.3.0 # pin a specific release tag
+codegraph self-update --tag vX.Y.Z # pin a specific release tag
 ```
 
 If codegraph lives on a root-owned path (e.g. `/usr/local/bin`), run with
@@ -509,8 +594,10 @@ user never named. Stdout stays machine-readable and unchanged.
 
 ### `--file` — disambiguating same-named definitions
 
-When two files define the same symbol, `callers` / `callees` / `impact` merge
-both definitions' relatives into one list. `--file <FILE>` keeps only the
+When two files define the same symbol, `callers` / `callees` / `impact` render
+one section or blast radius per distinct `(filePath, qualifiedName)` definition;
+same-definition overloads stay together. The backward-compatible top-level JSON
+arrays remain an explicitly labelled union. `--file <FILE>` keeps only the
 definition declared in that file:
 
 ```bash
@@ -523,17 +610,23 @@ The filter matches the whole project-relative path or any **segment-aligned**
 trailing suffix, so `other.ts` never selects `my_other.ts`. Windows separators
 and a leading `./` are normalized.
 
-A filter that matches no definition is an **error** naming the files that do
-define the symbol — reporting an empty relative-set instead would read as "this
-symbol is dead". In `--json`, the applied filter is echoed as `"file"`.
+A filter that matches no definition does not fabricate an empty answer. It
+falls back to all definitions and sets `filteredOut: true` plus a human-readable
+`note`. JSON also exposes `targets`, `ambiguous`, `aggregation`, and
+`definitions[]`; caller/callee definitions carry their own `total`, `limit`,
+`truncated`, relation list, and contributing edges. The legacy top-level union
+has the same three truncation fields. Human output says `Showing N of M` whenever
+`--limit` hides rows.
 
 ---
 
 ## `codegraph impact` — edge counts in `--json`
 
-`impact --json` emits `symbol`, `depth`, `nodeCount`, `edgeCount`,
-`resourceEdgeCount`, `affected`, and `godotDynamic`. The two counts split like
-this:
+`impact --json` emits `symbol`, `depth`, `targets`, `ambiguous`, `aggregation`,
+`file`, `filteredOut`, `note`, `definitions`, `nodeCount`, `edgeCount`,
+`resourceEdgeCount`, `affected`, and `godotDynamic`. Each definition contains
+its own roots, affected set, edges, and counts; the top-level values remain their
+deduplicated union. The two edge counts split like this:
 
 - **`edgeCount`** — **all** impact edges: the graph-traversal edges reached from
   the matched symbols, **plus** the Godot static resource edges (a `.tscn` /
@@ -838,6 +931,20 @@ a server launched elsewhere that a client has since pointed at this project. It 
 observability, not a fix: registries only see servers that register, so an absent
 holder is still not proof there is none.
 
+## `codegraph ui` — browser viewer (preview)
+
+`CODEGRAPH_UI=1 codegraph ui [path]` serves a local, read-only reader of the
+project's existing index on `127.0.0.1` and opens it in the browser. It never
+indexes or syncs; the one thing it writes is a trail a reader saves, under the
+index root's `ui/trails/` (`--read-only` refuses that too). Without `--port` it
+takes 4747 or the next free of the 20 ports after it; an explicit `--port` never
+moves. `CODEGRAPH_BROWSER` picks the browser, `--no-open` prints the URL only.
+
+Until the viewer leaves preview, `ui` and its alias `web` — also as `help ui` or
+`ui --help` — exit 1 unless `CODEGRAPH_UI=1` is set, and the command is hidden
+from `--help`. The boundary, the live channel, the API and the differences from
+upstream are documented in [the viewer reference](ui.md).
+
 ## `codegraph status` — WAL diagnostics
 
 `status` reports the SQLite write-ahead log only when a non-empty `-wal` sidecar
@@ -892,12 +999,25 @@ upward probe runs on each relevant request and the bounded child scan runs at
 most once every five seconds, allowing an index created after startup to be
 adopted.
 
+The first call for an explicit path to an **existing** index lazily starts or
+attaches that project's shared daemon, retains one connection for the MCP
+session, and waits for catch-up before returning the tool result. Subsequent
+edits use the daemon's watcher. Multiple MCP sessions share the same per-project
+daemon, and one session closing does not stop synchronization retained by
+another. The session cap is 32 explicit projects; no index is created and no
+candidate becomes an implicit default. `CODEGRAPH_NO_DAEMON=1` opts out of this
+lazy lifecycle, while `--no-watch` keeps first-access catch-up but disables later
+watch events.
+
 ### How `serve --mcp` chooses a run mode
 
 The launcher selects a mode in this exact order:
 
 1. `CODEGRAPH_NO_DAEMON=1` is set → **Direct** (foreground, no daemon ever spawned)
-2. No `.codegraph/` directory in the project → **Direct** (nothing to share yet)
+2. No `.codegraph/` directory in the project → **Direct read-only/no-services**
+   for that launch root (an explicit `--path` pins queries but never creates
+   index state; a later per-call path to a different existing index may still
+   acquire its own lazy shared-daemon services)
 3. Otherwise → **SpawnOrProxy**: spawn a new shared detached daemon, or proxy to one already running
 
 > `CODEGRAPH_DAEMON_INTERNAL=1` is **internal-only** — it is set automatically on
@@ -909,6 +1029,19 @@ When the daemon starts, it detaches from the parent process group (Unix:
 `process_group(0)`; Windows: `DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP`).
 Its stdout and stderr are appended to `.codegraph/daemon.log`. The Unix socket
 is at `.codegraph/daemon.sock`; the pid/lock file lives alongside it.
+
+The daemon also takes an OS kernel exclusive lock on `.codegraph/writer.pid`
+before it publishes the rendezvous. That stable file is never unlink/recreated as
+part of ordinary ownership: the lock follows the open handle and is released by
+the OS on exit; the JSON payload is only diagnostic. The permanent `index.lock`
+still guards each individual read/write operation. Keeping these capabilities
+separate means many proxy clients can share one watcher while two long-lived
+direct writers cannot alternate syncs.
+
+Cold-start latency remains bounded: after a successful fire-and-forget daemon
+spawn, the first foreground stdio process answers MCP directly but starts no
+watcher/catch-up of its own. If the child cannot be spawned, that foreground
+process falls back to direct writer mode and takes `writer.pid` itself.
 
 On filesystems that reject binding an `AF_UNIX` socket inside the project
 directory (ExFAT/FAT, some network mounts, WSL DrvFs), the daemon falls back
@@ -930,18 +1063,51 @@ To suppress the daemon entirely in CI or scripted contexts:
 CODEGRAPH_NO_DAEMON=1 codegraph serve --mcp --path /path/to/project
 ```
 
+Only one such direct process may run background services for the same indexed
+project. A second exits immediately and names the current holder. Prefer default
+daemon mode when several agents or editor windows need the same live index.
+
 ### Live file watch
 
 The daemon watches the project for file changes and re-indexes automatically.
 Changes are debounced before the re-index triggers. On WSL2, watching files under
 `/mnt/` is automatically disabled because recursive `fs.watch` is too slow on
-those paths; the reason is surfaced in the log.
+those paths; the reason is surfaced in the log. On such a Windows drive WSL also
+keeps its own index: SQLite's locking does not hold across the Windows/WSL
+bridge, so with `CODEGRAPH_DIR` unset an existing `.codegraph-wsl/` is used, then
+an existing `.codegraph/codegraph.db` is kept, and otherwise a fresh index goes
+in `.codegraph-wsl/` (`init` says so). A disk I/O error on a shared
+`.codegraph/` index explains how to give WSL its own.
 
 The watcher registers per-directory watches only on non-ignored directories,
 pruning `node_modules`, `.venv`, `__pycache__`, `target`, `dist`, `.godot`,
-`.cache`, `.git`, `.codegraph`, and everything else in the
-default ignore set, plus any paths matched by the root `.gitignore`. This pruning applies at any
-nesting depth, so an `node_modules` buried several levels deep is never walked.
+`.cache`, `.git`, `.codegraph`, and everything else in the default ignore set at
+any nesting depth, so a `node_modules` buried several levels deep is never walked.
+A `build` directory that is a Java, Kotlin or Scala package under a source root
+(`src/<sourceSet>/{java,kotlin,scala}/…/build`) is source rather than build
+output, so it stays indexed and watched. The root `.gitignore` prunes the index
+and the watcher alike, with git's own rules: a slash-less rule applies at any
+depth, a leading or inner `/` anchors it to the project root, `*` and `**` glob,
+and `!` re-includes a path unless a directory above it is ignored.
+
+Indexing follows symlinked files and directories, including targets outside
+the project, and indexes their files under the link's own path. A directory is
+indexed once, under the path that reaches it through the fewest symlinks; a tie
+goes to the alphabetically first path. So a real directory always wins over a
+link to it, and of two links to one target the first path wins. A link is not
+followed to the project root or a directory above it, into the project's `.git`
+or index root, or to a target that is missing or unreadable. Ignore rules judge
+a link at its own path, so a link named `node_modules` is skipped like the
+directory. Each full index records the links it followed. A later `sync` re-reads
+every file behind a link that is new or now points elsewhere, even when the size
+and modification time look unchanged. An index built before that record
+existed is re-read once below every link. The watcher watches the directories
+indexing reached through a link. Creating, removing or retargeting a link
+schedules one full reconcile. An edit to a file that a file symlink points at
+also re-indexes the symlink. One exception is not watched: a file symlink whose
+target lies outside every indexed directory. Edits to that target are picked
+up by the next full `sync`.
+
 This keeps the total watch count well inside the OS inotify limit on large trees
 and makes daemon startup fast. A newly-created non-ignored directory is picked up
 automatically on its create event — no restart required.
@@ -980,19 +1146,21 @@ Three escape hatches:
 
 ### Environment variable reference
 
-| Variable                           | Default      | Clamp range         | Meaning                                                                                                            |
-| ---------------------------------- | ------------ | ------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| `CODEGRAPH_NO_DAEMON`              | —            | —                   | Force foreground Direct mode; never spawn or proxy a daemon                                                        |
-| `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS` | `300000`     | 1000–3600000        | Exit after this long with no connected clients                                                                     |
-| `CODEGRAPH_DAEMON_MAX_IDLE_MS`     | `1800000`    | 1000–3600000        | Hard cap on total daemon lifetime when idle                                                                        |
-| `CODEGRAPH_DAEMON_CLIENT_SWEEP_MS` | `30000`      | 50–600000           | How often the daemon sweeps for dead clients                                                                       |
-| `CODEGRAPH_WATCH_DEBOUNCE_MS`      | `2000`       | 100–60000           | File-change debounce window before a re-index triggers                                                             |
-| `CODEGRAPH_NO_WATCH`               | —            | —                   | Disable the live file watcher (equivalent to `serve --no-watch`)                                                   |
-| `CODEGRAPH_FORCE_WATCH`            | —            | —                   | Override WSL2 `/mnt/` auto-disable; does not override `NO_WATCH`                                                   |
-| `CODEGRAPH_NO_WAL_DEFER`           | —            | `1` enables opt-out | Keep SQLite's default WAL autocheckpoint interval during bulk indexing                                             |
-| `CODEGRAPH_WAL_VALVE_MB`           | `256`        | >0; invalid→default | Shared MB threshold for the active WAL valve, resetting `journal_size_limit`, and `status` WAL warning             |
-| `CODEGRAPH_MCP_REGISTRY_DIR`       | —            | —                   | Override the stdio MCP registry directory read by `mcp list`                                                       |
-| `CODEGRAPH_DIR`                    | `.codegraph` | —                   | Select one non-empty project-local directory name; absolute paths, separators, `.`, `..`, and aliases are rejected |
+| Variable                           | Default      | Clamp range         | Meaning                                                                                                                                                                                                                                                                                            |
+| ---------------------------------- | ------------ | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CODEGRAPH_NO_DAEMON`              | —            | —                   | Force foreground Direct mode; one indexed-project writer only, enforced by `writer.pid`                                                                                                                                                                                                            |
+| `CODEGRAPH_DAEMON_IDLE_TIMEOUT_MS` | `300000`     | 1000–3600000        | Exit after this long with no connected clients                                                                                                                                                                                                                                                     |
+| `CODEGRAPH_DAEMON_MAX_IDLE_MS`     | `1800000`    | 1000–3600000        | Hard cap on total daemon lifetime when idle                                                                                                                                                                                                                                                        |
+| `CODEGRAPH_DAEMON_CLIENT_SWEEP_MS` | `30000`      | 50–600000           | How often the daemon sweeps for dead clients                                                                                                                                                                                                                                                       |
+| `CODEGRAPH_WATCH_DEBOUNCE_MS`      | `2000`       | 100–60000           | File-change debounce window before a re-index triggers                                                                                                                                                                                                                                             |
+| `CODEGRAPH_NO_WATCH`               | —            | —                   | Disable the live file watcher (equivalent to `serve --no-watch`)                                                                                                                                                                                                                                   |
+| `CODEGRAPH_FORCE_WATCH`            | —            | —                   | Override WSL2 `/mnt/` auto-disable; does not override `NO_WATCH`                                                                                                                                                                                                                                   |
+| `CODEGRAPH_NO_WAL_DEFER`           | —            | `1` enables opt-out | Keep SQLite's default WAL autocheckpoint interval during bulk indexing                                                                                                                                                                                                                             |
+| `CODEGRAPH_WAL_VALVE_MB`           | `256`        | >0; invalid→default | Shared MB threshold for the active WAL valve, resetting `journal_size_limit`, and `status` WAL warning                                                                                                                                                                                             |
+| `CODEGRAPH_MCP_REGISTRY_DIR`       | —            | —                   | Override the stdio MCP registry directory read by `mcp list`                                                                                                                                                                                                                                       |
+| `CODEGRAPH_UI`                     | —            | `1` enables         | Enable the browser viewer commands `ui` / `web` (preview); otherwise they are refused and hidden from `--help`                                                                                                                                                                                     |
+| `CODEGRAPH_BROWSER`                | —            | —                   | The program `codegraph ui` opens its URL with; `none`, `0`, `false`, `off` or empty open nothing                                                                                                                                                                                                   |
+| `CODEGRAPH_DIR`                    | `.codegraph` | —                   | Select one non-empty project-local directory name; absolute paths, separators, `.`, `..`, and aliases are rejected. Unset on a WSL Windows drive (`/mnt/<drive>/`), the default is `.codegraph-wsl` unless `.codegraph/codegraph.db` already exists, so WSL never shares Windows CodeGraph's index |
 
 Timeout/debounce values outside their clamp range are silently clamped to the
 nearest bound. `CODEGRAPH_WAL_VALVE_MB` instead falls back to `256` when it is
@@ -1076,9 +1244,24 @@ codegraph sync /path/to/project          # ordinary changes or a supported upgra
 codegraph index --force /path/to/project # only when the CLI explicitly requires recovery
 ```
 
-Extraction version 11 → 12 is a supported `sync` upgrade: `status` reports the
-old index as outdated, and `sync` rebuilds it into the current namespace. Do not
-run `index --force` solely because the extraction version changed.
+Extraction versions 11 → 12 and 12 → 13 are supported `sync` upgrades: `status`
+reports the old index as outdated, and `sync` rebuilds it into the current
+namespace. Do not run `index --force` solely because the extraction version
+changed.
+
+If a supported grammar reports tree errors and extraction collapses to only the
+synthetic file node, `init`/`index`/`sync` still succeed but print and persist
+`parse produced no symbols (tree has errors)`. Files with useful surviving
+symbols stay quiet even when the grammar tree contains recoverable error nodes.
+
+A file over `indexing.max_file_size` (1 MiB by default) is recorded without
+being read: no symbols, a `File exceeds max size` error, and a size stamp in
+place of its content hash, so a same-size rewrite is not a change while crossing
+the limit in either direction is. A `.ts` file whose head is an MPEG transport
+stream is video rather than TypeScript: it is neither indexed nor counted, and a
+tracked file that turns into one leaves the index. Bytes that are not valid
+UTF-8 are decoded with U+FFFD replacements, so a Latin-1 or binary source file
+is indexed like any other instead of failing the run.
 
 ### Index diagnostics
 
@@ -1093,8 +1276,13 @@ boundary, slow-file watchdog behavior, and the files to attach to a report.
 
 `codegraph prompt-hook` is a hidden subcommand (not shown in `--help`). It accepts
 a query as an argument or reads one from stdin, runs `codegraph_explore` against
-the nearest index, and prints structured context. If no index is found it prints a
-graceful message and exits cleanly; same if no query is provided.
+the nearest index, and prints structured context. HIGH-tier Explore text is
+capped at 9,000 UTF-8 bytes so the complete wrapper stays below Claude Code's
+10,000-byte inline hook-output limit; truncation never splits a multi-byte
+character. If the first non-whitespace content is `<task-notification>`, the
+host-generated message is skipped before index work. A user mentioning that tag
+later in a real prompt is not suppressed. If no index is found or no query is
+provided, the hook exits cleanly and silently.
 
 `codegraph install --prompt-hook` writes a `UserPromptSubmit` hook into Claude
 Code's config that calls `codegraph prompt-hook` before each prompt. This is
@@ -1107,23 +1295,12 @@ entry. No other agent configs are touched.
 
 ## Supported languages
 
-The language set is the fixed `LANGUAGES` constant, in three extraction tiers.
-
-**tree-sitter grammars (regular symbol extraction):** TypeScript, TSX, JavaScript,
-JSX, Python, Go, Rust, Java, C, C++, C#, PHP, Ruby, Swift, Kotlin, Dart, Pascal,
-Scala, Lua, Luau, Objective-C, R.
-
-**embedded / custom extractors:** Vue, Svelte, Astro, Razor, Liquid, MyBatis XML,
-DFM/FMX.
-
-**file-level-only (0 symbols at the extract stage):** YAML, Twig, Properties.
-
-`html` / `css` / `json` / `sql` are not in the extraction model and are not
-extracted. See [`grammar-manifest.md`](grammar-manifest.md) and
-[`embedded-extraction.md`](embedded-extraction.md) for the full grammar manifest
-and embedded-language extraction detail.
-
----
+The complete source-derived taxonomy, extension map, extraction tiers, and
+static-analysis boundaries are maintained in [`languages.md`](languages.md).
+Grammar/custom ownership and ABI smoke coverage are in
+[`grammar-manifest.md`](grammar-manifest.md). Do not duplicate that inventory in
+the CLI reference: `Language::ALL`, `spec_for_language`, embedded detection, and
+`builtin_language_for_ext` are the runtime authorities.
 
 ## Scope and non-goals
 
@@ -1137,6 +1314,6 @@ golden byte-stable output.
   constraint, guardrail-enforced; LLM combination happens in the orchestration
   layer).
 - No semantic search; search is FTS5 + deterministic scoring only.
-- Concrete `FrameworkResolver`s exist for React / Vue / NestJS; other framework
-  resolution is deferred.
+- Concrete `FrameworkResolver`s exist for NestJS, React, Vue, Godot, and Tauri;
+  other framework resolution remains explicitly deferred.
 - No languages beyond the fixed `LANGUAGES` set.

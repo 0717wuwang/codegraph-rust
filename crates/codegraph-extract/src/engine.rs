@@ -6,11 +6,10 @@
 
 use anyhow::{Context, Result};
 use codegraph_core::config::{Config, IndexingConfig};
-use codegraph_core::node_id::hash_content;
 use codegraph_core::types::{ExtractionResult, Language};
 use rayon::prelude::*;
 use regex::Regex;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock};
@@ -19,7 +18,19 @@ use tree_sitter::Parser;
 
 use crate::ext_config::ExtensionOverrides;
 use crate::lang::{cpp_code_mask, spec_for_language};
+use crate::links::LinkWalk;
 use crate::walker::TreeSitterWalker;
+use codegraph_core::source_file::{SourceText, read_source_file};
+
+/// Stable diagnostic fragment used when a supported grammar reports parse
+/// errors and extraction collapses to only the synthetic file node.
+pub const PARSE_COLLAPSE_WARNING: &str = "parse produced no symbols (tree has errors)";
+
+/// Parse-collapse diagnostics are warning-only: the file stays indexed and the
+/// index command succeeds, but callers must surface the message honestly.
+pub fn is_extraction_warning(message: &str) -> bool {
+    message.contains(PARSE_COLLAPSE_WARNING)
+}
 
 #[derive(Debug, Clone)]
 pub struct ExtractOptions {
@@ -350,8 +361,20 @@ pub fn extract_source_with_observer(
         };
     };
     observer(ExtractionStage::Walk);
-    TreeSitterWalker::new(file_path, &parsed_source, spec, tree.root_node())
-        .extract(start.elapsed().as_millis() as i64)
+    let parse_has_error = tree.root_node().has_error();
+    let mut result = TreeSitterWalker::new(file_path, &parsed_source, spec, tree.root_node())
+        .extract(start.elapsed().as_millis() as i64);
+    if parse_has_error
+        && result
+            .nodes
+            .iter()
+            .all(|node| node.kind == codegraph_core::types::NodeKind::File)
+    {
+        result.errors.push(format!(
+            "{file_path}: {PARSE_COLLAPSE_WARNING} - the file is indexed but contributes nothing to the graph"
+        ));
+    }
+    result
 }
 
 /// Extract one file under the DEFAULT options (no project config). Kept for
@@ -387,25 +410,33 @@ pub fn extract_file_with_options_observer(
     let root = root.as_ref();
     let relative_path = normalize_path(relative_path.as_ref());
     let full_path = root.join(&relative_path);
-    let metadata = fs::metadata(&full_path)
-        .with_context(|| format!("stat source file {}", full_path.display()))?;
-    if metadata.len() > options.max_file_size {
-        return Ok(size_skip_result(
-            &relative_path,
-            metadata.len(),
-            options.max_file_size,
-        ));
-    }
-    let source = fs::read_to_string(&full_path)
+    let (_, source) = read_source_file(&full_path, &relative_path, options.max_file_size)
         .with_context(|| format!("read source file {}", full_path.display()))?;
-    let _content_hash = hash_content(&source);
-    Ok(extract_source_with_observer(
-        &relative_path,
-        &source,
-        None,
-        &options.extensions,
-        observer,
-    ))
+    Ok(extraction_of(&relative_path, &source, options, observer))
+}
+
+/// The extraction result for one file as [`read_source_file`] saw it: a parse
+/// of its text, the size-skip result over the limit, and nothing at all for an
+/// MPEG transport stream, which is not source.
+pub fn extraction_of(
+    relative_path: &str,
+    source: &SourceText,
+    options: &ExtractOptions,
+    observer: impl FnMut(ExtractionStage),
+) -> ExtractionResult {
+    match source {
+        SourceText::Text(text) => {
+            extract_source_with_observer(relative_path, text, None, &options.extensions, observer)
+        }
+        SourceText::Oversize(size) => size_skip_result(relative_path, *size, options.max_file_size),
+        SourceText::MpegTransportStream => ExtractionResult {
+            nodes: Vec::new(),
+            edges: Vec::new(),
+            unresolved_references: Vec::new(),
+            errors: Vec::new(),
+            duration_ms: 0,
+        },
+    }
 }
 
 pub fn extract_project(
@@ -416,24 +447,9 @@ pub fn extract_project(
     let files = scan_project(root, options)?;
     let parse = |relative: &String| -> Result<ExtractionResult> {
         let full = root.join(relative);
-        let metadata =
-            fs::metadata(&full).with_context(|| format!("stat source file {}", full.display()))?;
-        if metadata.len() > options.max_file_size {
-            return Ok(size_skip_result(
-                relative,
-                metadata.len(),
-                options.max_file_size,
-            ));
-        }
-        let source = fs::read_to_string(&full)
+        let (_, source) = read_source_file(&full, relative, options.max_file_size)
             .with_context(|| format!("read source file {}", full.display()))?;
-        let _content_hash = hash_content(&source);
-        Ok(extract_source_with(
-            relative,
-            &source,
-            None,
-            &options.extensions,
-        ))
+        Ok(extraction_of(relative, &source, options, |_| {}))
     };
 
     let mut results = if options.parallel {
@@ -444,17 +460,142 @@ pub fn extract_project(
     merge_results(&mut results)
 }
 
-pub fn scan_project(root: &Path, options: &ExtractOptions) -> Result<Vec<String>> {
-    let mut files = Vec::new();
+/// Result of one source discovery walk. Unsupported extensions are collected
+/// during the same traversal so an unsupported-only project can be reported
+/// honestly without a second filesystem scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScanProjectResult {
+    pub files: Vec<String>,
+    pub unsupported_by_extension: BTreeMap<String, usize>,
+    /// Every symlink the scan followed, sorted by logical path (#935).
+    pub links: Vec<FollowedLink>,
+    /// Logical path of every directory scanned through a symlink, the links
+    /// themselves included, sorted. The watcher watches only these below a link.
+    pub linked_dirs: Vec<String>,
+    /// For each file link whose target sits in a scanned directory: the
+    /// target's logical path → the link paths that alias it, sorted.
+    pub file_aliases: BTreeMap<String, Vec<String>>,
+}
+
+/// A symlink the scan followed: its logical path, the canonical path it
+/// resolved to, and whether it named a file or a directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowedLink {
+    pub relative: String,
+    pub canonical: PathBuf,
+    pub kind: LinkKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum LinkKind {
+    File,
+    Dir,
+}
+
+/// How the project scan treats one root-relative path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Membership {
+    /// [`scan_project`] yields the file, or descends into the directory.
+    Admitted,
+    /// The scan never yields it — including a path that does not exist.
+    Rejected,
+    /// The path runs through a symlink, which only a full scan can resolve,
+    /// or a component could not be inspected.
+    Unknown,
+}
+
+/// Whether [`scan_project`] would yield `relative` as a source file or, with
+/// `dir`, descend into it as a directory, judged component by component by the
+/// same per-entry rules the walk applies.
+pub fn scan_membership(
+    root: &Path,
+    options: &ExtractOptions,
+    relative: &str,
+    dir: bool,
+) -> Membership {
+    let components = relative
+        .split('/')
+        .filter(|component| !component.is_empty())
+        .collect::<Vec<_>>();
+    if components.is_empty() || components.iter().any(|c| *c == "." || *c == "..") {
+        return Membership::Rejected;
+    }
     let ignored_dirs = options
         .ignore_dirs
         .iter()
         .map(String::as_str)
         .collect::<HashSet<_>>();
-    let gitignore = read_root_gitignore(root);
+    let gitignore = RootGitignore::load(root);
+    let pattern_sets: Vec<&[String]> = vec![&options.ignore_paths, &options.exclude];
+    let include = IncludeSet::new(&options.include, &options.exclude);
+    let reserved_roots = codegraph_core::IndexPaths::reserved_index_roots(
+        root,
+        std::env::var("CODEGRAPH_DIR").ok().as_deref(),
+    );
+    let rules = ScanRules {
+        root,
+        ignored_dirs: &ignored_dirs,
+        reserved_roots: &reserved_roots,
+        pattern_sets: &pattern_sets,
+        gitignore: &gitignore,
+        include: &include,
+        overrides: &options.extensions,
+    };
+    let mut parent = root.to_path_buf();
+    let mut above = GitignoreAncestry::default();
+    for (index, name) in components.iter().enumerate() {
+        let path = parent.join(name);
+        let partial = components[..=index].join("/");
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Membership::Rejected;
+            }
+            Err(_) => return Membership::Unknown,
+        };
+        if metadata.file_type().is_symlink() {
+            return Membership::Unknown;
+        }
+        let is_dir = metadata.is_dir();
+        if rules.prunes_by_name(&parent, &path, name, &partial, || is_dir) {
+            return Membership::Rejected;
+        }
+        let last = index + 1 == components.len();
+        if last && !dir {
+            if !metadata.is_file() {
+                return Membership::Rejected;
+            }
+            return match rules.decide(&partial, false, above) {
+                EntryDecision::File { extractable: true } => Membership::Admitted,
+                _ => Membership::Rejected,
+            };
+        }
+        if !is_dir {
+            return Membership::Rejected;
+        }
+        match rules.decide(&partial, true, above) {
+            EntryDecision::Descend(next) => above = next,
+            _ => return Membership::Rejected,
+        }
+        parent = path;
+    }
+    Membership::Admitted
+}
+
+pub fn scan_project(root: &Path, options: &ExtractOptions) -> Result<Vec<String>> {
+    Ok(scan_project_with_stats(root, options)?.files)
+}
+
+pub fn scan_project_with_stats(root: &Path, options: &ExtractOptions) -> Result<ScanProjectResult> {
+    let ignored_dirs = options
+        .ignore_dirs
+        .iter()
+        .map(String::as_str)
+        .collect::<HashSet<_>>();
+    let gitignore = RootGitignore::load(root);
     // Evaluated in order (default paths → config exclude → .gitignore), so a
     // later `!pattern` negation re-includes a path an earlier set excluded.
-    let pattern_sets: Vec<&[String]> = vec![&options.ignore_paths, &options.exclude, &gitignore];
+    let pattern_sets: Vec<&[String]> = vec![&options.ignore_paths, &options.exclude];
     let include = IncludeSet::new(&options.include, &options.exclude);
     // The EXACT resolved reserved index-root PATH for THIS project, resolved
     // once. scan_dir prunes a directory iff its FULL path equals this root,
@@ -464,79 +605,265 @@ pub fn scan_project(root: &Path, options: &ExtractOptions) -> Result<Vec<String>
         root,
         std::env::var("CODEGRAPH_DIR").ok().as_deref(),
     );
-    scan_dir(
-        root,
-        root,
-        &ignored_dirs,
-        &reserved_roots,
-        &pattern_sets,
-        &include,
-        &options.extensions,
-        &mut files,
-    )?;
-    files.sort();
-    Ok(files)
+    // No symlink may lead into the project's `.git` or a reserved index root.
+    let blocked = std::iter::once(root.join(".git")).chain(reserved_roots.iter().cloned());
+    let mut walk = ScanWalk {
+        rules: ScanRules {
+            root,
+            ignored_dirs: &ignored_dirs,
+            reserved_roots: &reserved_roots,
+            pattern_sets: &pattern_sets,
+            gitignore: &gitignore,
+            include: &include,
+            overrides: &options.extensions,
+        },
+        links: LinkWalk::new(root, blocked),
+        files: Vec::new(),
+        unsupported_by_extension: BTreeMap::new(),
+        followed: Vec::new(),
+        linked_dirs: Vec::new(),
+        file_links: Vec::new(),
+    };
+    let canonical_root = walk
+        .links
+        .canonical_root()
+        .map_or_else(|| root.to_path_buf(), Path::to_path_buf);
+    walk.links.enter(canonical_root.clone(), "");
+    walk.scan_dir(root, &canonical_root, GitignoreAncestry::default(), 0)?;
+    // Symlinked directories, fewest hops first, then by logical path (#935).
+    while let Some(linked) = walk.links.next() {
+        walk.followed.push(FollowedLink {
+            relative: linked.relative.clone(),
+            canonical: linked.canonical.clone(),
+            kind: LinkKind::Dir,
+        });
+        walk.linked_dirs.push(linked.relative);
+        walk.scan_dir(&linked.path, &linked.canonical, linked.state, linked.hops)?;
+    }
+    Ok(walk.finish())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn scan_dir(
-    root: &Path,
-    dir: &Path,
-    ignored_dirs: &HashSet<&str>,
-    reserved_roots: &std::collections::BTreeSet<PathBuf>,
-    pattern_sets: &[&[String]],
-    include: &IncludeSet,
-    overrides: &ExtensionOverrides,
-    files: &mut Vec<String>,
-) -> Result<()> {
-    let entries = fs::read_dir(dir).with_context(|| format!("read dir {}", dir.display()))?;
-    for entry in entries {
-        let entry = entry?;
-        let path = entry.path();
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
+/// The scan's per-entry rules, shared by the walk and [`scan_membership`] so
+/// that single-path membership cannot drift from what the walk yields.
+struct ScanRules<'a> {
+    root: &'a Path,
+    ignored_dirs: &'a HashSet<&'a str>,
+    reserved_roots: &'a std::collections::BTreeSet<PathBuf>,
+    pattern_sets: &'a [&'a [String]],
+    gitignore: &'a RootGitignore,
+    include: &'a IncludeSet<'a>,
+    overrides: &'a ExtensionOverrides,
+}
+
+/// The scan's verdict on one entry whose kind is known.
+enum EntryDecision {
+    Skip,
+    /// Descend into the directory with this ancestry.
+    Descend(GitignoreAncestry),
+    /// A file the ignore model admits; it is indexed iff `extractable`, and
+    /// otherwise counted as an unsupported extension.
+    File {
+        extractable: bool,
+    },
+}
+
+impl ScanRules<'_> {
+    /// Whether the entry `name` at `path` inside `dir` is pruned before its
+    /// kind is read: `.git` directly under the root, an exact reserved index
+    /// root at any depth, or an `ignore_dirs` name — except a `build` that is a
+    /// JVM package segment under a conventional source root (#1642).
+    fn prunes_by_name(
+        &self,
+        dir: &Path,
+        path: &Path,
+        name: &str,
+        relative: &str,
+        resolves_to_dir: impl FnOnce() -> bool,
+    ) -> bool {
         // Skip `.git` (a direct child of the scan root) and any directory whose
         // FULL path is a resolved reserved index root — matched at any depth, so
         // a nested configured root like `<root>/cache/index` is pruned exactly,
         // while a same-basename user directory elsewhere is not.
         let is_reserved_root_here =
-            (dir == root && name == ".git") || reserved_roots.contains(&path);
-        if is_reserved_root_here || ignored_dirs.contains(name.as_ref()) {
-            continue;
-        }
-        let relative = normalize_path(path.strip_prefix(root).unwrap_or(&path));
-        let ignored = is_path_ignored(&relative, pattern_sets);
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
+            (dir == self.root && name == ".git") || self.reserved_roots.contains(path);
+        // `build` is also a legal JVM package segment: keep it under a
+        // conventional source root while still pruning build output (#1642).
+        let jvm_package = name == "build"
+            && codegraph_core::config::is_jvm_source_build_dir(relative)
+            && resolves_to_dir();
+        is_reserved_root_here || (self.ignored_dirs.contains(name) && !jvm_package)
+    }
+
+    fn decide(&self, relative: &str, is_dir: bool, above: GitignoreAncestry) -> EntryDecision {
+        let own = self.gitignore.matched(relative, is_dir);
+        let ignored = is_path_ignored(relative, self.pattern_sets, above.decide(own));
+        if is_dir {
             // A model-ignored dir is normally pruned before descent, so a FILE
             // include under a gitignored ancestor would never be reached.
             // Descend anyway when this dir is an ancestor of (or matches) an
             // include pattern; files inside are still pruned unless force-included.
-            if ignored && !include.wants_descend(&relative) {
-                continue;
+            if ignored && !self.include.wants_descend(relative) {
+                EntryDecision::Skip
+            } else {
+                EntryDecision::Descend(above.child(own))
             }
-            scan_dir(
-                root,
-                &path,
-                ignored_dirs,
-                reserved_roots,
-                pattern_sets,
-                include,
-                overrides,
-                files,
-            )?;
-        } else if file_type.is_file() && is_extractable_source_path(&relative, overrides) {
+        } else if !ignored || self.include.forces(relative) {
             // Post-model include decision: a model-ignored file is force-included
             // iff it matches `include` and is NOT overridden by an explicit
             // `exclude` (checked inside `IncludeSet::forces`). Built-in dir skips
             // are already handled structurally above, so include can never
             // resurface node_modules/dist/.git/etc.
-            if !ignored || include.forces(&relative) {
-                files.push(relative);
+            EntryDecision::File {
+                extractable: is_extractable_source_path(relative, self.overrides),
             }
+        } else {
+            EntryDecision::Skip
         }
     }
-    Ok(())
+}
+
+/// One scan's fixed inputs and accumulated output.
+struct ScanWalk<'a> {
+    rules: ScanRules<'a>,
+    links: LinkWalk<GitignoreAncestry>,
+    files: Vec<String>,
+    unsupported_by_extension: BTreeMap<String, usize>,
+    followed: Vec<FollowedLink>,
+    linked_dirs: Vec<String>,
+    /// Indexed file links: logical path → canonical target.
+    file_links: Vec<(String, PathBuf)>,
+}
+
+impl ScanWalk<'_> {
+    /// Scan `dir`, whose canonical path is `canonical_dir`, reached through
+    /// `hops` symlinks. Real subdirectories are scanned at once; a symlinked
+    /// one is queued for the next hop level.
+    fn scan_dir(
+        &mut self,
+        dir: &Path,
+        canonical_dir: &Path,
+        above: GitignoreAncestry,
+        hops: usize,
+    ) -> Result<()> {
+        let entries = fs::read_dir(dir).with_context(|| format!("read dir {}", dir.display()))?;
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let file_name = entry.file_name();
+            let name = file_name.to_string_lossy();
+            let relative = normalize_path(path.strip_prefix(self.rules.root).unwrap_or(&path));
+            if self.rules.prunes_by_name(dir, &path, &name, &relative, || {
+                resolves_to_dir(&entry, &path)
+            }) {
+                continue;
+            }
+            let file_type = entry.file_type()?;
+            // A symlink is judged at its logical path by what it resolves to
+            // (#935). A broken one, or one to anything but a file or a
+            // directory, is skipped.
+            let (is_dir, is_link) = if file_type.is_symlink() {
+                match fs::metadata(&path) {
+                    Ok(target) if target.is_dir() => (true, true),
+                    Ok(target) if target.is_file() => (false, true),
+                    _ => continue,
+                }
+            } else if file_type.is_dir() {
+                (true, false)
+            } else if file_type.is_file() {
+                (false, false)
+            } else {
+                continue;
+            };
+            match self.rules.decide(&relative, is_dir, above) {
+                EntryDecision::Skip => {}
+                EntryDecision::Descend(next) => {
+                    if is_link {
+                        self.links.queue(hops + 1, relative, path, next);
+                        continue;
+                    }
+                    let canonical = canonical_dir.join(&file_name);
+                    if !self.links.enter(canonical.clone(), &relative) {
+                        continue;
+                    }
+                    if hops > 0 {
+                        self.linked_dirs.push(relative);
+                    }
+                    self.scan_dir(&path, &canonical, next, hops)?;
+                }
+                EntryDecision::File { extractable } => {
+                    let target = if is_link {
+                        match self.links.file_target(&path) {
+                            Some(target) => Some(target),
+                            None => continue,
+                        }
+                    } else {
+                        None
+                    };
+                    if extractable {
+                        if let Some(target) = target {
+                            self.followed.push(FollowedLink {
+                                relative: relative.clone(),
+                                canonical: target.clone(),
+                                kind: LinkKind::File,
+                            });
+                            self.file_links.push((relative.clone(), target));
+                        }
+                        self.files.push(relative);
+                    } else if let Some(extension) = unsupported_extension(&relative) {
+                        *self.unsupported_by_extension.entry(extension).or_default() += 1;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> ScanProjectResult {
+        self.files.sort();
+        self.followed
+            .sort_by(|left, right| left.relative.cmp(&right.relative));
+        self.linked_dirs.sort();
+        // A file link aliases its target's logical path when the target sits
+        // in a scanned directory, so an edit there can re-index the link too.
+        let mut file_aliases = BTreeMap::<String, Vec<String>>::new();
+        for (alias, target) in self.file_links {
+            let (Some(parent), Some(name)) = (target.parent(), target.file_name()) else {
+                continue;
+            };
+            let Some(dir) = self.links.logical_dir(parent) else {
+                continue;
+            };
+            let name = name.to_string_lossy();
+            let primary = if dir.is_empty() {
+                name.into_owned()
+            } else {
+                format!("{dir}/{name}")
+            };
+            file_aliases.entry(primary).or_default().push(alias);
+        }
+        for aliases in file_aliases.values_mut() {
+            aliases.sort();
+        }
+        ScanProjectResult {
+            files: self.files,
+            unsupported_by_extension: self.unsupported_by_extension,
+            links: self.followed,
+            linked_dirs: self.linked_dirs,
+            file_aliases,
+        }
+    }
+}
+
+/// Whether a directory entry is a directory, or a symlink to one.
+fn resolves_to_dir(entry: &fs::DirEntry, path: &Path) -> bool {
+    entry.file_type().is_ok_and(|kind| {
+        kind.is_dir() || (kind.is_symlink() && fs::metadata(path).is_ok_and(|meta| meta.is_dir()))
+    })
+}
+
+fn unsupported_extension(relative: &str) -> Option<String> {
+    let extension = Path::new(relative).extension()?.to_str()?;
+    (!extension.is_empty()).then(|| format!(".{}", extension.to_ascii_lowercase()))
 }
 
 fn merge_results(results: &mut [ExtractionResult]) -> Result<ExtractionResult> {
@@ -559,7 +886,9 @@ fn merge_results(results: &mut [ExtractionResult]) -> Result<ExtractionResult> {
     Ok(merged)
 }
 
-fn size_skip_result(file_path: &str, size: u64, max: u64) -> ExtractionResult {
+/// The result recorded for a file over the size limit: no symbols, and the
+/// error every indexing path reports for it.
+pub fn size_skip_result(file_path: &str, size: u64, max: u64) -> ExtractionResult {
     ExtractionResult {
         nodes: Vec::new(),
         edges: Vec::new(),
@@ -571,22 +900,96 @@ fn size_skip_result(file_path: &str, size: u64, max: u64) -> ExtractionResult {
     }
 }
 
-fn read_root_gitignore(root: &Path) -> Vec<String> {
-    fs::read_to_string(root.join(".gitignore"))
-        .unwrap_or_default()
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'))
-        .map(ToOwned::to_owned)
-        .collect()
+/// The project-root `.gitignore`, read with git's own rules through the
+/// `ignore` crate, as upstream reads it with the `ignore` package: a leading or
+/// inner `/` anchors a rule to the root, a slash-less rule applies at any
+/// depth, `*` and `**` glob, a trailing `/` matches directories only, and `!`
+/// re-includes. Shared with `codegraph-watch`, so the watcher's `.gitignore`
+/// verdict is the scan's by construction. An unreadable, non-UTF-8 or NUL-laden
+/// file is treated as absent and an unparseable line is skipped, never fatal.
+#[derive(Debug, Clone, Default)]
+pub struct RootGitignore {
+    matcher: Option<ignore::gitignore::Gitignore>,
 }
 
-/// Evaluate ordered `.gitignore`-style pattern sets with last-match-wins
-/// negation: a `!pattern` line un-ignores a path an earlier pattern excluded.
-/// Sets are scanned in order, patterns within a set in order, and the final
-/// matching pattern decides — so a later `!res/values/` re-includes what a
-/// default `res/values*` excluded.
-fn is_path_ignored(relative: &str, pattern_sets: &[&[String]]) -> bool {
+impl RootGitignore {
+    pub fn load(root: &Path) -> Self {
+        let Ok(text) = fs::read_to_string(root.join(".gitignore")) else {
+            return Self::default();
+        };
+        if text.contains('\0') {
+            return Self::default();
+        }
+        // Rooted at `.` so a root-relative candidate is never prefix-stripped.
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(".");
+        for line in text.lines() {
+            // An invalid glob drops only its own line; the rest still apply.
+            let _ = builder.add_line(None, line);
+        }
+        let matcher = builder.build().ok().filter(|matcher| !matcher.is_empty());
+        Self { matcher }
+    }
+
+    /// The root `.gitignore` verdict for `relative` (root-relative,
+    /// `/`-separated): `Some(true)` ignored, `Some(false)` re-included, `None`
+    /// undecided. Walks the directories above it; the scan instead carries
+    /// that state down its walk in a [`GitignoreAncestry`].
+    pub fn verdict(&self, relative: &str, is_dir: bool) -> Option<bool> {
+        self.matcher.as_ref()?;
+        let above = relative
+            .match_indices('/')
+            .fold(GitignoreAncestry::default(), |above, (end, _)| {
+                above.child(self.matched(&relative[..end], true))
+            });
+        above.decide(self.matched(relative, is_dir))
+    }
+
+    /// The last rule matching `relative` itself, ignoring its ancestors.
+    fn matched(&self, relative: &str, is_dir: bool) -> Option<bool> {
+        match self.matcher.as_ref()?.matched(relative, is_dir) {
+            ignore::Match::None => None,
+            ignore::Match::Ignore(_) => Some(true),
+            ignore::Match::Whitelist(_) => Some(false),
+        }
+    }
+}
+
+/// What the root `.gitignore` decided for the directories above a path.
+#[derive(Debug, Clone, Copy, Default)]
+struct GitignoreAncestry {
+    ignored: bool,
+    reincluded: bool,
+}
+
+impl GitignoreAncestry {
+    /// The ancestry of an entry below a directory whose own verdict was `own`.
+    fn child(self, own: Option<bool>) -> Self {
+        Self {
+            ignored: self.ignored || own == Some(true),
+            reincluded: self.reincluded || own == Some(false),
+        }
+    }
+
+    /// An ignored ancestor hides the path, since git never re-includes below an
+    /// excluded directory; otherwise the path's own last matching rule decides,
+    /// and failing that a re-included ancestor re-includes it, so `!res/values/`
+    /// still overrides a default path set that matched the files inside.
+    fn decide(self, own: Option<bool>) -> Option<bool> {
+        if self.ignored {
+            Some(true)
+        } else {
+            own.or(self.reincluded.then_some(false))
+        }
+    }
+}
+
+/// Evaluate the ordered `.gitignore`-style config pattern sets with last-match
+/// wins negation, then let the root `.gitignore` verdict, when it has one,
+/// decide last: a `!pattern` line un-ignores a path an earlier pattern
+/// excluded. Sets are scanned in order, patterns within a set in order, and the
+/// final matching pattern decides — so a later `!res/values/` re-includes what
+/// a default `res/values*` excluded.
+fn is_path_ignored(relative: &str, pattern_sets: &[&[String]], gitignore: Option<bool>) -> bool {
     let mut ignored = false;
     for set in pattern_sets {
         for pattern in set.iter() {
@@ -599,7 +1002,7 @@ fn is_path_ignored(relative: &str, pattern_sets: &[&[String]]) -> bool {
             }
         }
     }
-    ignored
+    gitignore.unwrap_or(ignored)
 }
 
 fn pattern_matches(relative: &str, pattern: &str) -> bool {
@@ -870,6 +1273,50 @@ mod tests {
         assert!(
             !files.iter().any(|f| f.starts_with("addons/")),
             "addons/ vendored plugins must be skipped: {files:?}"
+        );
+
+        fs::remove_dir_all(&project).ok();
+    }
+
+    /// `build` is a legal JVM package segment: a Java/Kotlin/Scala package
+    /// directory named `build` under a conventional source root stays indexed,
+    /// while module build output and the other defaults inside it stay pruned
+    /// (upstream #1642).
+    #[test]
+    fn scan_keeps_jvm_packages_named_build_but_prunes_build_output() {
+        let project = unique_project("jvm_build_package");
+        touch(
+            &project,
+            "src/main/java/com/acme/build/Builder.java",
+            "class Builder {}",
+        );
+        touch(
+            &project,
+            "app/src/test/kotlin/build/BuildTest.kt",
+            "class BuildTest",
+        );
+        touch(&project, "src/main/scala/build/Tool.scala", "object Tool");
+        touch(&project, "build/generated/Gen.java", "class Gen {}");
+        touch(&project, "app/build/classes/Out.java", "class Out {}");
+        touch(
+            &project,
+            "src/main/resources/build/Res.java",
+            "class Res {}",
+        );
+        touch(
+            &project,
+            "src/main/java/build/node_modules/dep.js",
+            "export {}",
+        );
+
+        let files = scan_project(&project, &ExtractOptions::default()).expect("scan project");
+        assert_eq!(
+            files,
+            vec![
+                "app/src/test/kotlin/build/BuildTest.kt".to_string(),
+                "src/main/java/com/acme/build/Builder.java".to_string(),
+                "src/main/scala/build/Tool.scala".to_string(),
+            ]
         );
 
         fs::remove_dir_all(&project).ok();
@@ -1306,14 +1753,20 @@ mod tests {
     fn is_path_ignored_negation_is_last_match_wins() {
         let defaults = vec!["res/values*".to_string()];
         let user = vec!["!res/values/".to_string()];
-        assert!(is_path_ignored("res/values/strings.xml", &[&defaults]));
+        assert!(is_path_ignored(
+            "res/values/strings.xml",
+            &[&defaults],
+            None
+        ));
         assert!(!is_path_ignored(
             "res/values/strings.xml",
-            &[&defaults, &user]
+            &[&defaults, &user],
+            None
         ));
         assert!(is_path_ignored(
             "res/values-es/strings.xml",
-            &[&defaults, &user]
+            &[&defaults, &user],
+            None
         ));
     }
 
@@ -1328,6 +1781,90 @@ mod tests {
         assert!(
             !files.iter().any(|f| f.starts_with("vendor/")),
             ".gitignore vendor/ must be skipped: {files:?}"
+        );
+        fs::remove_dir_all(&project).ok();
+    }
+
+    /// The root `.gitignore` is read with git's own rules, as upstream's `ignore`
+    /// matcher reads it: a leading or inner `/` anchors a rule to the root, a
+    /// slash-less rule applies at any depth, `*` and `**` glob, and nothing below
+    /// an ignored directory can be re-included.
+    #[test]
+    fn scan_project_reads_the_root_gitignore_with_git_rules() {
+        let project = unique_project("gitignore_git_rules");
+        touch(
+            &project,
+            ".gitignore",
+            "/artifacts/\n*.gen.ts\ndocs/**/draft/\nscratch/\nlogs/\n!logs/keep.ts\n",
+        );
+        for file in [
+            "src/app.ts",
+            "artifacts/a.ts",
+            "src/artifacts/b.ts",
+            "src/types.gen.ts",
+            "docs/guide/draft/c.ts",
+            "docs/guide/final/d.ts",
+            "src/scratch/e.ts",
+            "logs/keep.ts",
+        ] {
+            touch(&project, file, "export const x = 1;\n");
+        }
+        let files = scan_project(&project, &ExtractOptions::default()).expect("scan");
+        assert_eq!(
+            files,
+            vec!["docs/guide/final/d.ts", "src/app.ts", "src/artifacts/b.ts"]
+        );
+        fs::remove_dir_all(&project).ok();
+    }
+
+    /// An explicit root `.gitignore` still decides a JVM package named `build`
+    /// (upstream #1642): a bare `build/` hides it as git does, while Android's
+    /// anchored `/build` and Spring Initializr's `build/` plus
+    /// `!**/src/main/**/build/` keep it. Module build output stays pruned.
+    #[test]
+    fn root_gitignore_still_decides_jvm_packages_named_build() {
+        for (gitignore, kept) in [
+            ("build/\n", false),
+            ("/build\n", true),
+            (
+                "build/\n!**/src/main/**/build/\n!**/src/test/**/build/\n",
+                true,
+            ),
+        ] {
+            let project = unique_project("jvm_build_gitignore");
+            touch(&project, ".gitignore", gitignore);
+            touch(&project, "src/main/java/App.java", "class App {}");
+            touch(
+                &project,
+                "src/main/java/com/acme/build/Hidden.java",
+                "class Hidden {}",
+            );
+            touch(&project, "app/build/generated/Out.java", "class Out {}");
+            let files = scan_project(&project, &ExtractOptions::default()).expect("scan");
+            let mut expected = vec!["src/main/java/App.java".to_string()];
+            if kept {
+                expected.push("src/main/java/com/acme/build/Hidden.java".to_string());
+            }
+            assert_eq!(files, expected, "{gitignore:?}");
+            fs::remove_dir_all(&project).ok();
+        }
+    }
+
+    #[test]
+    fn scan_project_reports_visible_unsupported_extensions_in_the_same_walk() {
+        let project = unique_project("unsupported-extensions");
+        touch(&project, ".gitignore", "ignored.move\n");
+        touch(&project, "a.move", "module a {}\n");
+        touch(&project, "nested/b.MOVE", "module b {}\n");
+        touch(&project, "tool.pl", "print 1;\n");
+        touch(&project, "ignored.move", "module ignored {}\n");
+        touch(&project, "README", "no extension\n");
+
+        let report = scan_project_with_stats(&project, &ExtractOptions::default()).expect("scan");
+        assert!(report.files.is_empty());
+        assert_eq!(
+            report.unsupported_by_extension,
+            BTreeMap::from([(".move".to_string(), 2), (".pl".to_string(), 1)])
         );
         fs::remove_dir_all(&project).ok();
     }
@@ -1449,6 +1986,53 @@ mod tests {
     fn dot_h_plain_c_stays_c() {
         let result = extract_source("plain.h", "int add(int a, int b);\n", None);
         assert!(result.errors.is_empty(), "errors: {:?}", result.errors);
+    }
+
+    fn cpp_raw_string(delimiter: &str) -> String {
+        format!(
+            "const char* kTemplate = R\"{delimiter}(\nstruct Ignored {{ int v; }};\n){delimiter}\";\n\nint after_the_raw_string(int x) {{\n  return x + 1;\n}}\n"
+        )
+    }
+
+    #[test]
+    fn parse_collapse_warning_is_honest_and_narrow() {
+        let collapsed = extract_source("min.cpp", &cpp_raw_string("FILE_TEMPLATE_V1"), None);
+        assert_eq!(
+            collapsed
+                .nodes
+                .iter()
+                .filter(|node| node.kind != codegraph_core::types::NodeKind::File)
+                .count(),
+            0
+        );
+        assert_eq!(collapsed.errors.len(), 1);
+        assert!(is_extraction_warning(&collapsed.errors[0]));
+        assert!(collapsed.errors[0].contains(PARSE_COLLAPSE_WARNING));
+
+        let healthy = extract_source("min.cpp", &cpp_raw_string("FILE_TEMPLATE_V"), None);
+        assert!(
+            healthy
+                .nodes
+                .iter()
+                .any(|node| node.name == "after_the_raw_string")
+        );
+        assert!(healthy.errors.is_empty(), "errors={:?}", healthy.errors);
+
+        for (path, source) in [
+            ("empty.cpp", ""),
+            ("includes.cpp", "#include <stdio.h>\n#include <stdlib.h>\n"),
+            (
+                "survivor.cpp",
+                "int before() { return 0; }\nconst char* x = R\"FILE_TEMPLATE_V1(\nstruct Ignored {};\n)FILE_TEMPLATE_V1\";\n",
+            ),
+        ] {
+            let result = extract_source(path, source, None);
+            assert!(
+                result.errors.is_empty(),
+                "a healthy/partially surviving file must not be called a collapse: {path}: {:?}",
+                result.errors
+            );
+        }
     }
 
     #[test]

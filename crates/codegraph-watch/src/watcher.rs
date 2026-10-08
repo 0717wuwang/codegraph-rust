@@ -1,24 +1,26 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use notify::event::{EventKind, RemoveKind};
+use notify::event::{AccessKind, AccessMode, EventKind, RemoveKind};
 use notify::{Event, RecommendedWatcher, RecursiveMode, Watcher};
 
 use codegraph_core::IndexPaths;
 use codegraph_core::config::Config;
 use codegraph_extract::ExtensionOverrides;
+use codegraph_extract::engine::{LinkKind, ScanProjectResult};
 
 use crate::policy::{WatchPolicy, watch_disabled_reason};
 use crate::sync::{
-    SyncCancellation, SyncOutcome, sync_changed_paths_cancellable, sync_project_once_cancellable,
+    ProjectScope, SyncCancellation, SyncOutcome, sync_changed_paths_cancellable,
+    sync_project_once_cancellable,
 };
 
 type SyncCallback = Arc<dyn Fn(SyncOutcome) + Send + Sync>;
@@ -322,7 +324,16 @@ fn watch_registration(backend: WatchBackend) -> WatchRegistration {
 /// and `read_dir`/metadata errors on any subdir are tolerated (that subdir is
 /// skipped, the walk continues) so a transient FS error never panics startup.
 fn collect_watch_dirs(root: &Path, policy: &WatchPolicy) -> Vec<PathBuf> {
+    collect_watch_tree(root, policy).0
+}
+
+/// [`collect_watch_dirs`], also reporting whether a walked directory holds a
+/// symlink. Symlinks are never followed here: which ones the index follows,
+/// and under which logical path, is the scan's decision (#935), which
+/// [`LinkState::load`] reads.
+fn collect_watch_tree(root: &Path, policy: &WatchPolicy) -> (Vec<PathBuf>, bool) {
     let mut dirs = Vec::new();
+    let mut saw_link = false;
     // Explicit stack DFS (no recursion) so a deep tree can't blow the stack.
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
@@ -335,9 +346,13 @@ fn collect_watch_dirs(root: &Path, policy: &WatchPolicy) -> Vec<PathBuf> {
         for entry in entries.flatten() {
             let path = entry.path();
             // Only directories add inotify watches. Use `file_type()` (no extra
-            // stat syscall via DirEntry) and skip symlinks to avoid cycles.
+            // stat syscall via DirEntry); a symlink is only noted.
             let is_dir = match entry.file_type() {
-                Ok(ft) => ft.is_dir() && !ft.is_symlink(),
+                Ok(ft) if ft.is_symlink() => {
+                    saw_link = true;
+                    continue;
+                }
+                Ok(ft) => ft.is_dir(),
                 Err(_) => continue,
             };
             if !is_dir {
@@ -354,7 +369,153 @@ fn collect_watch_dirs(root: &Path, policy: &WatchPolicy) -> Vec<PathBuf> {
         }
     }
     dirs.sort();
-    dirs
+    (dirs, saw_link)
+}
+
+/// The symlinks the index follows (upstream #770), exactly as the scan chose
+/// them, narrowed to what the stricter watch policy watches. The watcher never
+/// watches a directory the scan did not walk through that very logical path,
+/// so an incremental sync can only ever be handed a path `index --force` keeps.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+struct LinkState {
+    /// Logical paths of every followed link, files and directories.
+    link_paths: BTreeSet<String>,
+    /// Directories scanned through a link whose whole logical chain is watched.
+    watched_dirs: BTreeSet<String>,
+    /// Watched directory links: logical path → canonical target.
+    dir_links: Vec<(String, PathBuf)>,
+    /// A file link's indexed target → the links aliasing it.
+    aliases: BTreeMap<String, Vec<String>>,
+}
+
+impl LinkState {
+    fn load(project_root: &Path, paths: &IndexPaths, policy: &WatchPolicy) -> Self {
+        let Ok(scope) = ProjectScope::load(project_root, paths) else {
+            return Self::default();
+        };
+        match codegraph_extract::engine::scan_project_with_stats(project_root, &scope.options) {
+            Ok(scan) => Self::from_scan(&scan, policy),
+            Err(_) => Self::default(),
+        }
+    }
+
+    fn from_scan(scan: &ScanProjectResult, policy: &WatchPolicy) -> Self {
+        let watched = |relative: &str| {
+            let mut prefix = String::new();
+            relative.split('/').all(|segment| {
+                if !prefix.is_empty() {
+                    prefix.push('/');
+                }
+                prefix.push_str(segment);
+                policy.should_watch_dir(&prefix)
+            })
+        };
+        Self {
+            link_paths: scan
+                .links
+                .iter()
+                .map(|link| link.relative.clone())
+                .collect(),
+            watched_dirs: scan
+                .linked_dirs
+                .iter()
+                .filter(|dir| watched(dir))
+                .cloned()
+                .collect(),
+            dir_links: scan
+                .links
+                .iter()
+                .filter(|link| link.kind == LinkKind::Dir && watched(&link.relative))
+                .map(|link| (link.relative.clone(), link.canonical.clone()))
+                .collect(),
+            aliases: scan.file_aliases.clone(),
+        }
+    }
+
+    /// Whether an event at `relative` changes which links the index follows: a
+    /// path that is a symlink now, was a followed link, or was a watched
+    /// linked directory and no longer is one.
+    fn is_topology_event(&self, path: &Path, relative: &str) -> bool {
+        fs::symlink_metadata(path).is_ok_and(|meta| meta.file_type().is_symlink())
+            || self.link_paths.contains(relative)
+            || (self.watched_dirs.contains(relative) && !path.is_dir())
+            // A file link's target turned into a directory: the link now
+            // reaches a tree the scan must follow.
+            || (self.aliases.contains_key(relative) && path.is_dir())
+    }
+}
+
+/// Native-recursive backends' root watch does not traverse a symlinked
+/// directory, so each watched directory link gets its own recursive watch, up
+/// to this many.
+const MAX_SUPPLEMENTAL_WATCHES: usize = 256;
+
+/// The single warning a watcher gives when its supplemental watches were
+/// capped, however often its link set is re-read.
+fn supplemental_cap_warning(truncated: bool, warned: &mut bool) -> Option<String> {
+    if !truncated || *warned {
+        return None;
+    }
+    *warned = true;
+    Some(format!(
+        "watching only the first {MAX_SUPPLEMENTAL_WATCHES} symlinked directories; \
+         changes below the rest are picked up by the next full sync"
+    ))
+}
+
+/// The supplemental recursive watches for `dir_links`: the first
+/// [`MAX_SUPPLEMENTAL_WATCHES`] in logical order, and whether the cap cut any.
+fn supplemental_watches(dir_links: &[(String, PathBuf)]) -> (Vec<(String, PathBuf)>, bool) {
+    let mut links = dir_links.to_vec();
+    links.sort();
+    let truncated = links.len() > MAX_SUPPLEMENTAL_WATCHES;
+    links.truncate(MAX_SUPPLEMENTAL_WATCHES);
+    (links, truncated)
+}
+
+/// Map an event a supplemental watch reported under its canonical target
+/// (FSEvents reports real paths) back to the logical path the index uses; the
+/// longest matching target wins, and any other path is returned unchanged.
+fn logical_event_path(
+    path: &Path,
+    project_root: &Path,
+    supplemental: &[(String, PathBuf)],
+) -> PathBuf {
+    supplemental
+        .iter()
+        .filter_map(|(relative, canonical)| {
+            path.strip_prefix(canonical)
+                .ok()
+                .map(|rest| (canonical.components().count(), relative, rest))
+        })
+        .max_by_key(|(depth, _, _)| *depth)
+        .map_or_else(
+            || path.to_path_buf(),
+            |(_, relative, rest)| project_root.join(relative).join(rest),
+        )
+}
+
+/// What to unwatch and watch when the followed links change. Everything is
+/// re-registered: a retarget keeps a logical path but changes what it resolves
+/// to, and a watch keeps the inode it resolved when it was added.
+fn relink_plan(old: &BTreeSet<String>, new: &BTreeSet<String>) -> (Vec<String>, Vec<String>) {
+    (old.iter().cloned().collect(), new.iter().cloned().collect())
+}
+
+/// The removal hint an event really carries. inotify reports a deleted symlink
+/// as a file removal and a directory moved away as a rename, so a known
+/// directory that no longer is one is a removed directory whatever the hint.
+fn effective_removal(
+    hint: RemovalHint,
+    relative: &str,
+    known_dirs: &BTreeSet<String>,
+    is_dir_now: bool,
+) -> RemovalHint {
+    if hint == RemovalHint::None && !is_dir_now && known_dirs.contains(relative) {
+        RemovalHint::Directory
+    } else {
+        hint
+    }
 }
 
 fn known_directory_paths(root: &Path, policy: &WatchPolicy) -> BTreeSet<String> {
@@ -459,6 +620,64 @@ fn reconcile_watch_dirs(
     true
 }
 
+/// Apply a link topology change to the OS watcher: unwatch every previously
+/// link-reached watch and watch the new set (see [`relink_plan`]). Returns the
+/// new supplemental watches and whether their cap truncated them, or `None`
+/// when a watch failure degraded the watcher.
+fn relink(
+    watcher: &SharedWatcher,
+    project_root: &Path,
+    (old, old_supplemental): (&LinkState, &[(String, PathBuf)]),
+    new: &LinkState,
+    degraded: &Arc<DegradedState>,
+    on_degraded: &Option<NoticeCallback>,
+    on_sync_error: &Option<NoticeCallback>,
+) -> Option<(Vec<(String, PathBuf)>, bool)> {
+    let registration = watch_registration(platform_watch_backend());
+    let (new_supplemental, truncated) = match registration {
+        WatchRegistration::SingleRootRecursive => supplemental_watches(&new.dir_links),
+        WatchRegistration::PerDirNonRecursive => (Vec::new(), false),
+    };
+    let (old_set, new_set, mode) = match registration {
+        WatchRegistration::PerDirNonRecursive => (
+            old.watched_dirs.clone(),
+            new.watched_dirs.clone(),
+            RecursiveMode::NonRecursive,
+        ),
+        WatchRegistration::SingleRootRecursive => (
+            old_supplemental
+                .iter()
+                .map(|(dir, _)| dir.clone())
+                .collect(),
+            new_supplemental
+                .iter()
+                .map(|(dir, _)| dir.clone())
+                .collect(),
+            RecursiveMode::Recursive,
+        ),
+    };
+    let Ok(mut guard) = watcher.lock() else {
+        return Some((new_supplemental, truncated));
+    };
+    let Some(watcher) = guard.as_mut() else {
+        return Some((new_supplemental, truncated));
+    };
+    let (unwatch, watch) = relink_plan(&old_set, &new_set);
+    for dir in unwatch {
+        // Best effort: a removed link's watch is often already gone.
+        let _ = watcher.unwatch(&project_root.join(dir));
+    }
+    for dir in watch {
+        if let Err(err) = watcher.watch(&project_root.join(dir), mode) {
+            match handle_watch_error(&err, degraded, on_degraded, on_sync_error) {
+                WatchErrorClass::Degrade => return None,
+                WatchErrorClass::Warn | WatchErrorClass::Other => {}
+            }
+        }
+    }
+    Some((new_supplemental, truncated))
+}
+
 /// Double `prev` for the next backoff step, saturating at [`MAX_BACKOFF`].
 ///
 /// A zero/sub-ms `prev` seeds the schedule at 1ms so the doubling progresses; the
@@ -477,23 +696,147 @@ pub fn next_backoff(prev: Duration) -> Duration {
 #[derive(Default)]
 struct DegradedState {
     degraded: AtomicBool,
+    /// Set while lock contention paused auto-sync: the watcher still collects
+    /// changes and retries a full reconcile, which clears the whole state.
+    recovering: AtomicBool,
     reason: Mutex<Option<String>>,
 }
 
 impl DegradedState {
+    /// Auto-sync stopped for good (until a restart).
     fn mark(&self, reason: String) {
         if let Ok(mut guard) = self.reason.lock() {
             *guard = Some(reason);
         }
+        self.recovering.store(false, Ordering::SeqCst);
         self.degraded.store(true, Ordering::SeqCst);
+    }
+
+    /// Auto-sync paused by lock contention, recovering on its own.
+    fn mark_recovering(&self, reason: String) {
+        if let Ok(mut guard) = self.reason.lock() {
+            *guard = Some(reason);
+        }
+        self.recovering.store(true, Ordering::SeqCst);
+        self.degraded.store(true, Ordering::SeqCst);
+    }
+
+    /// A committed full reconcile ends a recovery; a stopped watcher stays stopped.
+    fn recover(&self) {
+        if self.recovering.swap(false, Ordering::SeqCst) {
+            if let Ok(mut guard) = self.reason.lock() {
+                *guard = None;
+            }
+            self.degraded.store(false, Ordering::SeqCst);
+        }
     }
 
     fn is_degraded(&self) -> bool {
         self.degraded.load(Ordering::SeqCst)
     }
 
+    fn is_recovering(&self) -> bool {
+        self.recovering.load(Ordering::SeqCst)
+    }
+
     fn reason(&self) -> Option<String> {
         self.reason.lock().ok().and_then(|guard| guard.clone())
+    }
+
+    fn health(&self) -> WatchHealth {
+        let reason = self.reason().unwrap_or_default();
+        if !self.is_degraded() {
+            WatchHealth::Healthy
+        } else if self.is_recovering() {
+            WatchHealth::Recovering { reason }
+        } else {
+            WatchHealth::Disabled { reason }
+        }
+    }
+}
+
+/// Auto-sync health of a project's live watcher in this process, for the hosts
+/// that answer from its index (upstream #876, #1959).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WatchHealth {
+    /// Watching, and every change is synced or queued for a retry.
+    Healthy,
+    /// Another writer held the index past the contention budget. Changes are
+    /// still collected and a full reconcile is retried, but until one commits
+    /// the index may be stale.
+    Recovering { reason: String },
+    /// Watching stopped (watch resources exhausted, or sync failing
+    /// persistently): the index is frozen until `codegraph sync` and a restart.
+    Disabled { reason: String },
+}
+
+type HealthRegistry = Mutex<HashMap<PathBuf, std::sync::Weak<DegradedState>>>;
+
+fn health_registry() -> &'static HealthRegistry {
+    static REGISTRY: OnceLock<HealthRegistry> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The auto-sync health of the live watcher this process runs for
+/// `project_root`, or `None` when it runs none.
+pub fn watch_health(project_root: &Path) -> Option<WatchHealth> {
+    let key = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let registry = health_registry().lock().ok()?;
+    registry
+        .get(&key)
+        .and_then(std::sync::Weak::upgrade)
+        .map(|state| state.health())
+}
+
+/// Test seam: publish `health` for `project_root` as a watcher there would,
+/// for as long as the returned guard lives.
+#[cfg(feature = "test-hooks")]
+pub fn register_watch_health_for_tests(
+    project_root: &Path,
+    health: WatchHealth,
+) -> WatchHealthGuard {
+    let key = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.to_path_buf());
+    let state = Arc::new(DegradedState::default());
+    match health {
+        WatchHealth::Healthy => {}
+        WatchHealth::Recovering { reason } => state.mark_recovering(reason),
+        WatchHealth::Disabled { reason } => state.mark(reason),
+    }
+    register_health(&key, &state);
+    WatchHealthGuard { key, state }
+}
+
+/// Keeps a [`register_watch_health_for_tests`] registration alive.
+#[cfg(feature = "test-hooks")]
+pub struct WatchHealthGuard {
+    key: PathBuf,
+    state: Arc<DegradedState>,
+}
+
+#[cfg(feature = "test-hooks")]
+impl Drop for WatchHealthGuard {
+    fn drop(&mut self) {
+        unregister_health(&self.key, &self.state);
+    }
+}
+
+fn register_health(project_root: &Path, state: &Arc<DegradedState>) {
+    if let Ok(mut registry) = health_registry().lock() {
+        registry.insert(project_root.to_path_buf(), Arc::downgrade(state));
+    }
+}
+
+fn unregister_health(project_root: &Path, state: &Arc<DegradedState>) {
+    if let Ok(mut registry) = health_registry().lock()
+        && registry
+            .get(project_root)
+            .is_some_and(|registered| std::ptr::eq(registered.as_ptr(), Arc::as_ptr(state)))
+    {
+        registry.remove(project_root);
     }
 }
 
@@ -528,7 +871,18 @@ pub struct WatchOptions {
     /// shutdown can refuse queued lease loops and interrupt a running one
     /// (frozen plan lines 598-601).
     cancel: SyncCancellation,
+    /// Cumulative backoff a sync spends waiting out another writer before
+    /// auto-sync pauses as RECOVERING. Defaults to [`MAX_BACKOFF`].
+    pub lock_contention_budget: Duration,
+    /// How often a RECOVERING watcher retries its full reconcile. Defaults to
+    /// [`LOCK_RECOVERY_INTERVAL`].
+    pub lock_recovery_interval: Duration,
 }
+
+/// How often a watcher paused by lock contention retries its full reconcile,
+/// so a long-lived writer is not polled in a loop (upstream #1959's re-arm
+/// cooldown).
+pub const LOCK_RECOVERY_INTERVAL: Duration = Duration::from_secs(30);
 
 impl Default for WatchOptions {
     fn default() -> Self {
@@ -551,6 +905,8 @@ impl Default for WatchOptions {
             sync_fn: None,
             full_sync_fn: None,
             cancel: SyncCancellation::new(),
+            lock_contention_budget: MAX_BACKOFF,
+            lock_recovery_interval: LOCK_RECOVERY_INTERVAL,
         }
     }
 }
@@ -567,6 +923,34 @@ impl WatchOptions {
     #[must_use]
     pub fn with_cancellation(mut self, cancel: SyncCancellation) -> Self {
         self.cancel = cancel;
+        self
+    }
+
+    /// A watcher that OBSERVES and never syncs.
+    ///
+    /// `on_paths` receives each settled batch of root-relative logical paths —
+    /// exactly the set a syncing watcher would hand its incremental sync — and
+    /// `on_scan` is called when the change cannot be described path by path (a
+    /// removed or renamed directory, a link topology or control-file change):
+    /// the case a syncing watcher escalates to a full sync. Both replace the
+    /// two sync closures and report an empty [`SyncOutcome`], so the default
+    /// closures, which open the index for writing, are never constructed.
+    /// Registration, scope, symlink mapping, debounce and the degrade latch are
+    /// the watcher's own. Used by the browser viewer's live channel.
+    #[must_use]
+    pub fn observe_only(
+        mut self,
+        on_paths: impl Fn(Vec<String>) + Send + Sync + 'static,
+        on_scan: impl Fn() + Send + Sync + 'static,
+    ) -> Self {
+        self.sync_fn = Some(Arc::new(move |paths| {
+            on_paths(paths);
+            Ok(SyncOutcome::default())
+        }));
+        self.full_sync_fn = Some(Arc::new(move || {
+            on_scan();
+            Ok(SyncOutcome::default())
+        }));
         self
     }
 
@@ -597,6 +981,8 @@ pub struct ProjectWatcher {
     thread: Option<JoinHandle<()>>,
     watcher: SharedWatcher,
     degraded: Arc<DegradedState>,
+    /// The canonical project root its health is registered under.
+    health_key: PathBuf,
     cancel: SyncCancellation,
     /// Set by the event-loop thread as its LAST action. Lets a caller observe
     /// completion without joining, so a bounded shutdown never blocks on a
@@ -669,11 +1055,40 @@ impl ProjectWatcher {
         });
         let (tx, rx) = mpsc::channel();
         let degraded = Arc::new(DegradedState::default());
+        let health_key = project_root.clone();
+        let lock_contention_budget = options.lock_contention_budget;
+        let lock_recovery_interval = options.lock_recovery_interval;
         // Capture directory identity before registering the backend. Windows emits
         // `RemoveKind::Any` after deletion, so this pre-event snapshot is the only
         // deterministic way to distinguish a known directory from an extensionless
         // file without inspecting a path that no longer exists.
-        let known_dirs = known_directory_paths(&project_root, &policy);
+        let (real_dirs, saw_link) = collect_watch_tree(&project_root, &policy);
+        // The links the index follows, as the scan chose them (#770). A tree
+        // without a single symlink never pays for that second walk.
+        let link_state = if saw_link {
+            LinkState::load(&project_root, &index_paths, &policy)
+        } else {
+            LinkState::default()
+        };
+        let mut known_dirs = real_dirs
+            .iter()
+            .filter_map(|dir| policy.normalize_relative(dir))
+            .collect::<BTreeSet<_>>();
+        known_dirs.extend(link_state.watched_dirs.iter().cloned());
+        let (supplemental, supplemental_truncated) = if watch_registration(platform_watch_backend())
+            == WatchRegistration::SingleRootRecursive
+        {
+            supplemental_watches(&link_state.dir_links)
+        } else {
+            (Vec::new(), false)
+        };
+        let mut supplemental_cap_warned = false;
+        if let Some(warning) =
+            supplemental_cap_warning(supplemental_truncated, &mut supplemental_cap_warned)
+            && let Some(callback) = &options.on_sync_error
+        {
+            callback(warning);
+        }
 
         // Build the OS watcher and register the pruned watch set BEFORE spawning
         // the loop, so its create-event handler can share the same watcher to add
@@ -684,6 +1099,7 @@ impl ProjectWatcher {
             let callback_tx = tx.clone();
             let mut watcher =
                 notify::recommended_watcher(move |event: notify::Result<Event>| match event {
+                    Ok(event) if !changes_content(&event.kind) => {}
                     Ok(event) => {
                         let _ = callback_tx.send(LoopMessage::Event(WatchEventBatch::from_event(
                             &event.kind,
@@ -702,6 +1118,22 @@ impl ProjectWatcher {
             // inotify exhaustion.
             let backend = platform_watch_backend();
             let mut targets = initial_watch_targets(backend, &project_root, &policy);
+            // Directories reached through a followed link: one NonRecursive
+            // watch per logical directory, or one Recursive supplemental watch
+            // per directory link where the root watch is recursive.
+            match watch_registration(backend) {
+                WatchRegistration::PerDirNonRecursive => targets.extend(
+                    link_state
+                        .watched_dirs
+                        .iter()
+                        .map(|dir| (project_root.join(dir), RecursiveMode::NonRecursive)),
+                ),
+                WatchRegistration::SingleRootRecursive => targets.extend(
+                    supplemental
+                        .iter()
+                        .map(|(dir, _)| (project_root.join(dir), RecursiveMode::Recursive)),
+                ),
+            }
             // The index root is structurally ignored source, but its two
             // project-control files must still be observed. Per-directory
             // backends therefore add one explicit non-recursive control watch.
@@ -781,15 +1213,22 @@ impl ProjectWatcher {
                 degraded: loop_degraded,
                 watcher: loop_watcher,
                 known_dirs,
+                link_state,
+                supplemental,
+                supplemental_cap_warned,
+                lock_contention_budget,
+                lock_recovery_interval,
             });
             loop_finished.store(true, Ordering::SeqCst);
         });
 
+        register_health(&health_key, &degraded);
         Ok(Some(Self {
             tx,
             thread: Some(thread),
             watcher,
             degraded,
+            health_key,
             cancel,
             finished,
         }))
@@ -847,6 +1286,12 @@ impl ProjectWatcher {
         self.degraded.reason()
     }
 
+    /// Auto-sync health; [`WatchHealth::Recovering`] while lock contention
+    /// paused it and a full reconcile has not committed yet.
+    pub fn health(&self) -> WatchHealth {
+        self.degraded.health()
+    }
+
     pub fn ingest_event_for_tests(&self, relative: impl Into<PathBuf>) {
         let _ = self.tx.send(LoopMessage::Event(WatchEventBatch::paths(vec![
             relative.into(),
@@ -893,6 +1338,7 @@ impl ProjectWatcher {
         // Signal first (never join without cancelling: the event-loop thread may be
         // inside a bounded lease acquisition), then join.
         self.begin_shutdown();
+        unregister_health(&self.health_key, &self.degraded);
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();
         }
@@ -954,6 +1400,18 @@ impl WatchEventBatch {
     }
 }
 
+/// Whether an event can mean a file or directory changed. notify 8's inotify
+/// backend also reports every open (`IN_OPEN`) as an access event, which notify
+/// 6 never did. An open changes nothing, and the loop's own directory scans and
+/// the sync's own reads would feed it back as pending changes forever. Only a
+/// close after writing is an access worth a sync.
+fn changes_content(kind: &EventKind) -> bool {
+    match kind {
+        EventKind::Access(access) => *access == AccessKind::Close(AccessMode::Write),
+        _ => true,
+    }
+}
+
 fn classify_removed_directory(
     hint: RemovalHint,
     relative: &str,
@@ -991,6 +1449,11 @@ struct EventLoopCtx {
     degraded: Arc<DegradedState>,
     watcher: SharedWatcher,
     known_dirs: BTreeSet<String>,
+    link_state: LinkState,
+    supplemental: Vec<(String, PathBuf)>,
+    supplemental_cap_warned: bool,
+    lock_contention_budget: Duration,
+    lock_recovery_interval: Duration,
 }
 
 fn event_loop(ctx: EventLoopCtx) {
@@ -1008,6 +1471,11 @@ fn event_loop(ctx: EventLoopCtx) {
         degraded,
         watcher,
         mut known_dirs,
+        mut link_state,
+        mut supplemental,
+        mut supplemental_cap_warned,
+        lock_contention_budget,
+        lock_recovery_interval,
     } = ctx;
     let mut pending = BTreeMap::<String, PendingInfo>::new();
     let mut deadline = None::<Instant>;
@@ -1034,7 +1502,10 @@ fn event_loop(ctx: EventLoopCtx) {
                 let WatchEventBatch { paths, removal } = batch;
                 let mut control_changes = ControlChanges::default();
                 let mut normalized = Vec::new();
+                // Set when this batch changes which links the index follows.
+                let mut link_topology_changed = false;
                 for path in paths {
+                    let path = logical_event_path(&path, &project_root, &supplemental);
                     if let Some(relative) = runtime_scope.policy.normalize_relative(&path) {
                         let is_control = control_files.classify(&relative, &mut control_changes);
                         normalized.push((path, relative, is_control));
@@ -1071,6 +1542,9 @@ fn event_loop(ctx: EventLoopCtx) {
                         }
                         runtime_scope = next;
                         full_sync_pending = true;
+                        // The reconcile above dropped every link-reached watch;
+                        // re-read the links under the new scope.
+                        link_topology_changed = true;
                         let now = epoch_millis();
                         for (_, relative, is_control) in &normalized {
                             if *is_control {
@@ -1097,6 +1571,18 @@ fn event_loop(ctx: EventLoopCtx) {
                     // forever. The watch policy still applies (an ignored dir is
                     // still ignored), and the removal escalates the burst to one
                     // full sync — the only pass that can find those descendants.
+                    if link_state.is_topology_event(&path, &relative) {
+                        link_topology_changed = true;
+                        let now = epoch_millis();
+                        pending
+                            .entry(relative.clone())
+                            .and_modify(|info| info.last_seen_ms = now)
+                            .or_insert(PendingInfo {
+                                first_seen_ms: now,
+                                last_seen_ms: now,
+                            });
+                    }
+                    let removal = effective_removal(removal, &relative, &known_dirs, path.is_dir());
                     if classify_removed_directory(removal, &relative, &mut known_dirs) {
                         if runtime_scope.policy.should_watch_dir(&relative) {
                             full_sync_pending = true;
@@ -1117,24 +1603,91 @@ fn event_loop(ctx: EventLoopCtx) {
                     // descendants created in the same burst, e.g. `mkdir -p`) so
                     // edits inside it are seen without a server restart.
                     if path.is_dir() && runtime_scope.policy.should_watch_dir(&relative) {
-                        register_new_dirs(&watcher, &runtime_scope.policy, &path);
-                        known_dirs.extend(known_directory_paths(&path, &runtime_scope.policy));
+                        // A new link is the scan's to follow (above); a new real
+                        // directory holding a link is a topology change too.
+                        let is_link = fs::symlink_metadata(&path)
+                            .is_ok_and(|meta| meta.file_type().is_symlink());
+                        if !is_link {
+                            register_new_dirs(&watcher, &runtime_scope.policy, &path);
+                            let (new_dirs, saw_link) =
+                                collect_watch_tree(&path, &runtime_scope.policy);
+                            known_dirs.extend(
+                                new_dirs
+                                    .iter()
+                                    .filter_map(|dir| runtime_scope.policy.normalize_relative(dir)),
+                            );
+                            if saw_link {
+                                // The directory may add no pending file, yet the
+                                // full sync it owes must still run on the deadline.
+                                link_topology_changed = true;
+                                let now = epoch_millis();
+                                pending
+                                    .entry(relative.clone())
+                                    .and_modify(|info| info.last_seen_ms = now)
+                                    .or_insert(PendingInfo {
+                                        first_seen_ms: now,
+                                        last_seen_ms: now,
+                                    });
+                            }
+                        }
                     }
                     if runtime_scope.policy.should_handle_file(&relative)
                         || (runtime_scope.policy.allows_file_path(&relative)
                             && maybe_deleted_source(&relative))
                     {
                         let now = epoch_millis();
-                        pending
-                            .entry(relative)
-                            .and_modify(|info| info.last_seen_ms = now)
-                            .or_insert(PendingInfo {
-                                first_seen_ms: now,
-                                last_seen_ms: now,
-                            });
+                        // A file link aliasing this path is the same content
+                        // under another indexed path, so it is re-indexed too.
+                        let aliases = link_state
+                            .aliases
+                            .get(&relative)
+                            .into_iter()
+                            .flatten()
+                            .filter(|alias| runtime_scope.policy.should_handle_file(alias))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        for path in std::iter::once(relative).chain(aliases) {
+                            pending
+                                .entry(path)
+                                .and_modify(|info| info.last_seen_ms = now)
+                                .or_insert(PendingInfo {
+                                    first_seen_ms: now,
+                                    last_seen_ms: now,
+                                });
+                        }
                     }
                 }
-                if !pending.is_empty() {
+                if link_topology_changed && runtime_scope.enabled {
+                    // Re-read the links from the scan, re-register every
+                    // link-reached watch, and let one full sync apply them.
+                    let next_links =
+                        LinkState::load(&project_root, &index_paths, &runtime_scope.policy);
+                    let Some((next_supplemental, truncated)) = relink(
+                        &watcher,
+                        &project_root,
+                        (&link_state, &supplemental),
+                        &next_links,
+                        &degraded,
+                        &on_degraded,
+                        &on_sync_error,
+                    ) else {
+                        break;
+                    };
+                    if let Some(warning) =
+                        supplemental_cap_warning(truncated, &mut supplemental_cap_warned)
+                        && let Some(callback) = &on_sync_error
+                    {
+                        callback(warning);
+                    }
+                    known_dirs.retain(|dir| !link_state.watched_dirs.contains(dir));
+                    known_dirs.extend(next_links.watched_dirs.iter().cloned());
+                    link_state = next_links;
+                    supplemental = next_supplemental;
+                    full_sync_pending = true;
+                }
+                // While lock contention paused auto-sync, the recovery retry keeps
+                // its own cadence; a burst of edits must not poll the other writer.
+                if !pending.is_empty() && !degraded.is_recovering() {
                     // Resetting the timer on every event ports the upstream exactly-once
                     // burst semantics (`upstream sync/watcher.ts:529-540`).
                     deadline = Some(Instant::now() + runtime_scope.debounce);
@@ -1158,18 +1711,27 @@ fn event_loop(ctx: EventLoopCtx) {
             }
             Some(LoopMessage::Stop) => break,
             None => {
-                let paths = pending.keys().cloned().collect::<Vec<_>>();
-                pending.clear();
+                // Taken for the attempt; a failed or paused sync puts it back.
+                let mut batch = Some(std::mem::take(&mut pending));
+                let paths = batch
+                    .as_ref()
+                    .map(|batch| batch.keys().cloned().collect::<Vec<_>>())
+                    .unwrap_or_default();
                 deadline = None;
                 let full_sync = std::mem::take(&mut full_sync_pending);
                 let attempt = if full_sync {
-                    run_full_sync_with_backoff(&full_sync_fn)
+                    run_full_sync_with_backoff(&full_sync_fn, lock_contention_budget)
                 } else {
-                    run_sync_with_backoff(&sync_fn, paths.clone())
+                    run_sync_with_backoff(&sync_fn, paths.clone(), lock_contention_budget)
                 };
                 let decision = classify_persistent_failure(&attempt, &mut consecutive_sync_errors);
                 match attempt {
                     SyncAttempt::Done(outcome) => {
+                        // A committed full reconcile is what ends a recovery: the
+                        // edits missed while another writer held the index are in.
+                        if full_sync {
+                            degraded.recover();
+                        }
                         // Preserve the event batch independently of actual DB
                         // mutations. Startup catch-up can win the writer lease and
                         // index the same file first; the watcher still handled this
@@ -1183,13 +1745,41 @@ fn event_loop(ctx: EventLoopCtx) {
                         if let Some(cb) = &on_sync_error {
                             cb(reason);
                         }
+                        // The failed batch is still unindexed: keep its paths
+                        // and any full reconcile it owed (a directory removal
+                        // adds no pending file), and retry after a backoff
+                        // rather than drop them (upstream #1964).
+                        pending = batch.take().unwrap_or_default();
+                        full_sync_pending |= full_sync;
+                        deadline = Some(
+                            Instant::now()
+                                + sync_retry_delay(runtime_scope.debounce, consecutive_sync_errors),
+                        );
                     }
                     SyncAttempt::Degraded(_) => {}
                 }
-                if let PersistentFailure::Degrade(reason) | PersistentFailure::Disable(reason) =
-                    decision
-                {
-                    if !degraded.is_degraded() {
+                if let PersistentFailure::Degrade(reason) = decision {
+                    // Another writer held the index past the contention budget.
+                    // Keep watching and collecting changes, report RECOVERING, and
+                    // retry a FULL reconcile on a slow cadence until one commits
+                    // (upstream #1959).
+                    if !degraded.is_recovering()
+                        && let Some(cb) = &on_sync_error
+                    {
+                        cb(format!(
+                            "auto-sync paused: {reason}; retrying a full reconcile every {}s",
+                            lock_recovery_interval.as_secs()
+                        ));
+                    }
+                    degraded.mark_recovering(reason);
+                    pending = batch.take().unwrap_or_default();
+                    full_sync_pending = true;
+                    deadline = Some(Instant::now() + lock_recovery_interval);
+                    continue;
+                }
+                if let PersistentFailure::Disable(reason) = decision {
+                    // A recovery that keeps failing is a stop like any other.
+                    if !degraded.is_degraded() || degraded.is_recovering() {
                         degraded.mark(reason.clone());
                         if let Some(cb) = &on_degraded {
                             cb(reason);
@@ -1287,14 +1877,14 @@ fn classify_persistent_failure(
 /// Run `sync_fn`, retrying on write-lock contention with bounded exponential
 /// backoff capped at [`MAX_BACKOFF`]. Once the cumulative sleep budget is spent
 /// the watcher degrades; any non-contention error is surfaced as a sync error.
-fn run_sync_with_backoff(sync_fn: &SyncFn, paths: Vec<String>) -> SyncAttempt {
-    run_sync_with_backoff_inner(sync_fn, paths, MAX_BACKOFF, thread::sleep)
+fn run_sync_with_backoff(sync_fn: &SyncFn, paths: Vec<String>, budget: Duration) -> SyncAttempt {
+    run_sync_with_backoff_inner(sync_fn, paths, budget, thread::sleep)
 }
 
 /// Same bounded-backoff contract as [`run_sync_with_backoff`], for the
 /// whole-project sync a removed directory escalates to.
-fn run_full_sync_with_backoff(full_sync_fn: &FullSyncFn) -> SyncAttempt {
-    run_with_backoff(MAX_BACKOFF, thread::sleep, || full_sync_fn())
+fn run_full_sync_with_backoff(full_sync_fn: &FullSyncFn, budget: Duration) -> SyncAttempt {
+    run_with_backoff(budget, thread::sleep, || full_sync_fn())
 }
 
 /// Inner retry loop with an injectable budget and sleeper so the cap can be
@@ -1339,11 +1929,32 @@ fn run_with_backoff(
     }
 }
 
-/// A sync error is "lock contention" iff its chain mentions a busy/locked DB,
-/// which is the only error worth retrying with backoff.
+/// A sync error is "lock contention" iff another writer holds the index: its
+/// chain mentions a busy/locked DB, or the bounded permanent-index-lock
+/// acquisition timed out behind a long foreground `index`. Only contention is
+/// retried in place with backoff; a timed-out lease counted as a sync failure
+/// would drop the batch and push auto-sync toward being disabled.
 fn is_lock_contention(err: &anyhow::Error) -> bool {
+    use codegraph_store::{IndexLeaseError, StoreError};
+    let lease_timed_out = err.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<IndexLeaseError>(),
+            Some(IndexLeaseError::TimedOut { .. })
+        ) || matches!(
+            cause.downcast_ref::<StoreError>(),
+            Some(StoreError::Lease(IndexLeaseError::TimedOut { .. }))
+        )
+    });
     let text = format!("{err:#}").to_ascii_lowercase();
-    text.contains("locked") || text.contains("busy")
+    lease_timed_out || text.contains("locked") || text.contains("busy")
+}
+
+/// How long the event loop waits before retrying a batch whose sync failed:
+/// the debounce doubled per consecutive failure, capped at [`MAX_BACKOFF`]
+/// (upstream `debounceMs * 2 ** (n - 1)`).
+fn sync_retry_delay(debounce: Duration, consecutive_errors: u32) -> Duration {
+    let doublings = consecutive_errors.saturating_sub(1).min(16);
+    debounce.saturating_mul(1_u32 << doublings).min(MAX_BACKOFF)
 }
 
 fn snapshot(pending: &BTreeMap<String, PendingInfo>) -> Vec<PendingFile> {
@@ -1389,6 +2000,32 @@ fn epoch_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_content_changes_reach_the_loop() {
+        use notify::event::{CreateKind, DataChange, ModifyKind};
+        // notify 8 reports every open; an open, a read or a read-only close
+        // changes nothing. A close after writing, and every other kind, can.
+        for (kind, expected) in [
+            (EventKind::Access(AccessKind::Open(AccessMode::Any)), false),
+            (EventKind::Access(AccessKind::Read), false),
+            (
+                EventKind::Access(AccessKind::Close(AccessMode::Read)),
+                false,
+            ),
+            (EventKind::Access(AccessKind::Any), false),
+            (
+                EventKind::Access(AccessKind::Close(AccessMode::Write)),
+                true,
+            ),
+            (EventKind::Create(CreateKind::Folder), true),
+            (EventKind::Modify(ModifyKind::Data(DataChange::Any)), true),
+            (EventKind::Remove(RemoveKind::Any), true),
+            (EventKind::Any, true),
+        ] {
+            assert_eq!(changes_content(&kind), expected, "{kind:?}");
+        }
+    }
     use std::fs;
     use std::sync::{Arc, Mutex};
 
@@ -1829,6 +2466,9 @@ mod tests {
         watcher.stop();
     }
 
+    /// How long a test waits for a full reconcile to report.
+    const FULL_SYNC_WAIT: Duration = Duration::from_secs(10);
+
     #[test]
     fn root_gitignore_reload_reconciles_and_readmits_sources() {
         let _env = crate::test_env::env_guard();
@@ -1855,8 +2495,10 @@ mod tests {
         watcher.ingest_event_for_tests(".gitignore");
         watcher.ingest_event_for_tests("generated/drop.ts");
         watcher.flush_for_tests();
+        // A full reconcile rescans and rewrites the index; a loaded Windows
+        // runner has taken over two seconds for it.
         let removed = outcome_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(FULL_SYNC_WAIT)
             .expect("gitignore-removal full sync");
         assert_eq!(removed.files_removed, 1);
         assert_eq!(removed.trigger_paths, vec![".gitignore".to_string()]);
@@ -1865,7 +2507,7 @@ mod tests {
         watcher.ingest_event_for_tests(".gitignore");
         watcher.flush_for_tests();
         let readmitted = outcome_rx
-            .recv_timeout(Duration::from_secs(2))
+            .recv_timeout(FULL_SYNC_WAIT)
             .expect("gitignore-readmission full sync");
         assert_eq!(readmitted.files_reindexed, 1);
         assert!(
@@ -2587,6 +3229,205 @@ mod tests {
         );
     }
 
+    /// A failed sync leaves its batch unindexed. A directory removal owes a
+    /// full reconcile and adds no pending file, so dropping the batch on the
+    /// failure lost the reconcile and the removed files kept their nodes
+    /// (upstream #1964): both the paths and the owed full sync are kept and
+    /// retried after a backoff.
+    #[test]
+    fn a_failed_sync_keeps_its_batch_and_owed_full_reconcile_and_retries() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-retry-owed-full");
+        let full_calls = Arc::new(AtomicUsize::new(0));
+        let full_counter = Arc::clone(&full_calls);
+        let full_sync_fn: FullSyncFn = Arc::new(move || {
+            if full_counter.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                return Err(anyhow::anyhow!("disk full while removing nodes"));
+            }
+            Ok(SyncOutcome {
+                files_removed: 2,
+                ..Default::default()
+            })
+        });
+        let incremental_paths = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+        let recorded = Arc::clone(&incremental_paths);
+        let sync_fn: SyncFn = Arc::new(move |paths| {
+            let mut calls = recorded.lock().unwrap();
+            calls.push(paths);
+            if calls.len() == 1 {
+                return Err(anyhow::anyhow!("parse error while re-extracting"));
+            }
+            Ok(SyncOutcome::default())
+        });
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(20),
+                inert_for_tests: true,
+                sync_fn: Some(sync_fn),
+                full_sync_fn: Some(full_sync_fn),
+                on_sync_complete: Some(Arc::new(move |outcome| {
+                    outcome_tx.send(outcome).unwrap();
+                })),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        watcher.ingest_removed_dir_for_tests("src/feature");
+        watcher.flush_for_tests();
+        let outcome = outcome_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the owed full reconcile is retried");
+        assert_eq!(outcome.files_removed, 2);
+        assert_eq!(full_calls.load(AtomicOrdering::SeqCst), 2);
+        assert!(incremental_paths.lock().unwrap().is_empty());
+
+        watcher.ingest_event_for_tests("src/app.ts");
+        watcher.flush_for_tests();
+        outcome_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the failed batch is retried");
+        assert_eq!(
+            *incremental_paths.lock().unwrap(),
+            vec![
+                vec!["src/app.ts".to_string()],
+                vec!["src/app.ts".to_string()]
+            ]
+        );
+        assert!(watcher.pending_files().is_empty());
+        watcher.stop();
+    }
+
+    /// Lock contention past the budget pauses auto-sync as RECOVERING rather
+    /// than stopping it: changes are still collected, a FULL reconcile is
+    /// retried on a slow cadence, and the one that commits restores health
+    /// (upstream #1959).
+    #[test]
+    fn lock_contention_pauses_auto_sync_until_a_full_reconcile_commits() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-recover-lock");
+        let held = Arc::new(AtomicBool::new(true));
+        let full_calls = Arc::new(AtomicUsize::new(0));
+        let full_held = Arc::clone(&held);
+        let full_counter = Arc::clone(&full_calls);
+        let full_sync_fn: FullSyncFn = Arc::new(move || {
+            full_counter.fetch_add(1, AtomicOrdering::SeqCst);
+            if full_held.load(AtomicOrdering::SeqCst) {
+                return Err(anyhow::anyhow!("database is locked"));
+            }
+            Ok(SyncOutcome {
+                files_reindexed: 2,
+                ..Default::default()
+            })
+        });
+        let held_for_sync = Arc::clone(&held);
+        let sync_fn: SyncFn = Arc::new(move |_paths| {
+            if held_for_sync.load(AtomicOrdering::SeqCst) {
+                return Err(anyhow::anyhow!("database is locked"));
+            }
+            Ok(SyncOutcome::default())
+        });
+        let notices = Arc::new(Mutex::new(Vec::<String>::new()));
+        let recorded = Arc::clone(&notices);
+        let stops = Arc::new(AtomicUsize::new(0));
+        let stop_counter = Arc::clone(&stops);
+        let (outcome_tx, outcome_rx) = mpsc::channel();
+        let watcher = ProjectWatcher::start(
+            dir.path(),
+            WatchOptions {
+                debounce: Duration::from_millis(20),
+                inert_for_tests: true,
+                sync_fn: Some(sync_fn),
+                full_sync_fn: Some(full_sync_fn),
+                lock_contention_budget: Duration::from_millis(1),
+                lock_recovery_interval: Duration::from_millis(50),
+                on_sync_error: Some(Arc::new(move |msg| recorded.lock().unwrap().push(msg))),
+                on_degraded: Some(Arc::new(move |_| {
+                    stop_counter.fetch_add(1, AtomicOrdering::SeqCst);
+                })),
+                on_sync_complete: Some(Arc::new(move |outcome| {
+                    outcome_tx.send(outcome).unwrap();
+                })),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(watch_health(dir.path()), Some(WatchHealth::Healthy));
+
+        watcher.ingest_event_for_tests("src/app.ts");
+        watcher.flush_for_tests();
+        let mut recovering = false;
+        for _ in 0..80 {
+            if matches!(watcher.health(), WatchHealth::Recovering { .. }) {
+                recovering = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(recovering, "contention must pause auto-sync as recovering");
+        assert!(matches!(
+            watch_health(dir.path()),
+            Some(WatchHealth::Recovering { .. })
+        ));
+        assert!(watcher.is_degraded());
+        assert_eq!(
+            stops.load(AtomicOrdering::SeqCst),
+            0,
+            "recovering is not a stop"
+        );
+        assert!(
+            notices.lock().unwrap()[0].contains("auto-sync paused"),
+            "{:?}",
+            notices.lock().unwrap()
+        );
+        watcher.ingest_event_for_tests("src/other.ts");
+
+        held.store(false, AtomicOrdering::SeqCst);
+        let outcome = outcome_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the full reconcile commits once the writer is gone");
+        assert_eq!(outcome.files_reindexed, 2);
+        assert_eq!(watcher.health(), WatchHealth::Healthy);
+        assert_eq!(watch_health(dir.path()), Some(WatchHealth::Healthy));
+        assert!(
+            full_calls.load(AtomicOrdering::SeqCst) >= 1,
+            "the recovery ran the full reconcile"
+        );
+        assert!(watcher.pending_files().is_empty());
+        watcher.stop();
+        assert_eq!(
+            watch_health(dir.path()),
+            None,
+            "a stopped watcher is unregistered"
+        );
+    }
+
+    /// A long foreground `index` holds the permanent index lock past a sync's
+    /// bounded acquisition: that is contention to back off from, not a sync
+    /// failure counted toward disabling auto-sync.
+    #[test]
+    fn an_index_lease_timeout_is_lock_contention() {
+        let timed_out = codegraph_store::IndexLeaseError::TimedOut {
+            path: std::path::PathBuf::from("/p/.codegraph/codegraph.lock"),
+        };
+        assert!(is_lock_contention(&anyhow::Error::new(
+            codegraph_store::StoreError::Lease(timed_out)
+        )));
+        assert!(is_lock_contention(
+            &anyhow::Error::new(codegraph_store::IndexLeaseError::TimedOut {
+                path: std::path::PathBuf::from("/p/.codegraph/codegraph.lock"),
+            })
+            .context("opening the sync writer")
+        ));
+        assert!(!is_lock_contention(&anyhow::anyhow!(
+            "schema version mismatch"
+        )));
+    }
+
     #[test]
     fn event_loop_disables_auto_sync_after_persistent_errors() {
         let _env = crate::test_env::env_guard();
@@ -2992,6 +3833,499 @@ mod tests {
         assert!(
             seen,
             "editing a file in a dir created after start should trigger a sync"
+        );
+    }
+
+    // ---- #770: symlinked directories and file links -------------------------
+
+    /// A plain temp directory for link targets: unlike `TestDir`, it holds no
+    /// index namespace that a followed link would lead into.
+    struct LinkTarget(PathBuf);
+
+    impl LinkTarget {
+        fn new(name: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let path = std::env::temp_dir().join(format!(
+                "codegraph-link-target-{name}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            ));
+            let _ = fs::remove_dir_all(&path);
+            fs::create_dir_all(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for LinkTarget {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Create a symlink. Without the privilege (Windows) a local run skips the
+    /// test, but CI must exercise it, so there a refusal fails loudly.
+    fn symlink_at(target: &Path, at: &Path, dir: bool) -> bool {
+        #[cfg(unix)]
+        let made = {
+            let _ = dir;
+            std::os::unix::fs::symlink(target, at)
+        };
+        #[cfg(windows)]
+        let made = if dir {
+            std::os::windows::fs::symlink_dir(target, at)
+        } else {
+            std::os::windows::fs::symlink_file(target, at)
+        };
+        match made {
+            Ok(()) => true,
+            Err(error) if std::env::var_os("CI").is_some() => {
+                panic!("CI must be able to create symlinks: {error}")
+            }
+            Err(_) => false,
+        }
+    }
+
+    fn remove_symlink(at: &Path) {
+        // A directory symlink is a directory entry on Windows, a file on Unix.
+        if fs::remove_file(at).is_err() {
+            fs::remove_dir(at).expect("remove symlink");
+        }
+    }
+
+    fn wait_until(mut condition: impl FnMut() -> bool) -> bool {
+        for _ in 0..100 {
+            std::thread::sleep(Duration::from_millis(50));
+            if condition() {
+                return true;
+            }
+        }
+        false
+    }
+
+    type Recorded = Arc<Mutex<Vec<Vec<String>>>>;
+
+    /// A real watcher whose syncs only record their paths and count full syncs.
+    fn recording_watcher(root: &Path) -> (ProjectWatcher, Recorded, Arc<AtomicUsize>) {
+        let synced: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&synced);
+        let sync_fn: SyncFn = Arc::new(move |paths| {
+            sink.lock().unwrap().push(paths);
+            Ok(SyncOutcome::default())
+        });
+        let full = Arc::new(AtomicUsize::new(0));
+        let full_counter = Arc::clone(&full);
+        let full_sync_fn: FullSyncFn = Arc::new(move || {
+            full_counter.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok(SyncOutcome::default())
+        });
+        let watcher = ProjectWatcher::start(
+            root,
+            WatchOptions {
+                debounce: Duration::from_millis(50),
+                sync_fn: Some(sync_fn),
+                full_sync_fn: Some(full_sync_fn),
+                ..WatchOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap();
+        // Native backends (FSEvents) need a moment before streams report.
+        std::thread::sleep(Duration::from_millis(300));
+        (watcher, synced, full)
+    }
+
+    fn saw_path(synced: &Recorded, wanted: &str) -> bool {
+        synced
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|paths| paths.iter().any(|path| path == wanted))
+    }
+
+    #[test]
+    fn symlink_supplemental_watches_keep_the_first_256_in_logical_order() {
+        let links = (0..300)
+            .rev()
+            .map(|n| (format!("l{n:03}"), PathBuf::from(format!("/t/{n}"))))
+            .collect::<Vec<_>>();
+        let (selected, truncated) = supplemental_watches(&links);
+        assert!(truncated);
+        assert_eq!(selected.len(), MAX_SUPPLEMENTAL_WATCHES);
+        assert_eq!(selected.first().unwrap().0, "l000");
+        assert_eq!(selected.last().unwrap().0, "l255");
+        let (few, truncated) = supplemental_watches(&links[..3]);
+        assert!(!truncated);
+        assert_eq!(
+            few.iter().map(|(dir, _)| dir.as_str()).collect::<Vec<_>>(),
+            vec!["l297", "l298", "l299"]
+        );
+    }
+
+    #[test]
+    fn symlink_event_paths_map_back_through_the_longest_canonical_target() {
+        let root = Path::new("/proj");
+        let supplemental = vec![
+            ("ext".to_string(), PathBuf::from("/real/lib")),
+            ("ext/inner".to_string(), PathBuf::from("/real/lib/deep")),
+            ("other".to_string(), PathBuf::from("/elsewhere")),
+        ];
+        assert_eq!(
+            logical_event_path(Path::new("/real/lib/a.ts"), root, &supplemental),
+            PathBuf::from("/proj/ext/a.ts")
+        );
+        assert_eq!(
+            logical_event_path(Path::new("/real/lib/deep/b.ts"), root, &supplemental),
+            PathBuf::from("/proj/ext/inner/b.ts")
+        );
+        assert_eq!(
+            logical_event_path(Path::new("/proj/src/c.ts"), root, &supplemental),
+            PathBuf::from("/proj/src/c.ts"),
+            "a path no supplemental watch covers is unchanged"
+        );
+        assert_eq!(
+            logical_event_path(Path::new("/real/library/d.ts"), root, &supplemental),
+            PathBuf::from("/real/library/d.ts"),
+            "a prefix must end on a path component"
+        );
+    }
+
+    #[test]
+    fn symlink_relink_plan_rewatches_every_link_reached_directory() {
+        let old = ["kept", "gone"].map(String::from).into_iter().collect();
+        let new = ["kept", "added"].map(String::from).into_iter().collect();
+        let (unwatch, watch) = relink_plan(&old, &new);
+        assert_eq!(unwatch, vec!["gone".to_string(), "kept".to_string()]);
+        assert_eq!(
+            watch,
+            vec!["added".to_string(), "kept".to_string()],
+            "an unchanged logical path is re-watched: its link may now resolve elsewhere"
+        );
+    }
+
+    #[test]
+    fn symlink_vanished_known_directory_is_a_removal_whatever_the_hint() {
+        let known = ["lib".to_string()].into_iter().collect::<BTreeSet<_>>();
+        assert_eq!(
+            effective_removal(RemovalHint::None, "lib", &known, false),
+            RemovalHint::Directory,
+            "inotify reports a deleted symlink as a file removal"
+        );
+        assert_eq!(
+            effective_removal(RemovalHint::None, "lib", &known, true),
+            RemovalHint::None
+        );
+        assert_eq!(
+            effective_removal(RemovalHint::None, "a.ts", &known, false),
+            RemovalHint::None
+        );
+        assert_eq!(
+            effective_removal(RemovalHint::Ambiguous, "lib", &known, true),
+            RemovalHint::Ambiguous
+        );
+    }
+
+    /// The scan alone decides which links the index follows; the watcher only
+    /// narrows that set with its stricter policy and never adds to it.
+    #[test]
+    fn symlink_link_state_follows_the_scan_and_never_widens_it() {
+        let dir = crate::sync::tests::TestDir::new("watch-symlink-parity");
+        let outside = LinkTarget::new("parity");
+        fs::create_dir_all(outside.0.join("sub")).unwrap();
+        fs::write(outside.0.join("sub/o.ts"), "export const o = 1;\n").unwrap();
+        fs::create_dir_all(dir.path().join(".cache")).unwrap();
+        fs::write(dir.path().join(".cache/c.ts"), "export const c = 1;\n").unwrap();
+        fs::create_dir_all(dir.path().join(".codegraph-sources")).unwrap();
+        fs::write(
+            dir.path().join(".codegraph-sources/s.ts"),
+            "export const s = 1;\n",
+        )
+        .unwrap();
+        if !symlink_at(&dir.path().join(".cache"), &dir.path().join("l"), true)
+            || !symlink_at(
+                &dir.path().join(".codegraph-sources"),
+                &dir.path().join("cs"),
+                true,
+            )
+            || !symlink_at(&outside.0, &dir.path().join("ext"), true)
+        {
+            return;
+        }
+        let paths = crate::sync::index_paths(dir.path()).unwrap();
+        let policy = WatchPolicy::new(dir.path());
+        let state = LinkState::load(dir.path(), &paths, &policy);
+        assert_eq!(
+            state.link_paths,
+            ["ext".to_string()].into_iter().collect(),
+            "the real `.cache` and `.codegraph-sources` win, so `l` and `cs` are not followed"
+        );
+        assert_eq!(
+            state.watched_dirs,
+            ["ext".to_string(), "ext/sub".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(state.dir_links.len(), 1);
+    }
+
+    #[test]
+    fn symlink_edit_inside_a_linked_directory_syncs_its_logical_path() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-symlink-edit");
+        let outside = LinkTarget::new("edit");
+        fs::write(outside.0.join("x.ts"), "export const x = 1;\n").unwrap();
+        if !symlink_at(&outside.0, &dir.path().join("ext"), true) {
+            return;
+        }
+        let (watcher, synced, _) = recording_watcher(dir.path());
+        fs::write(outside.0.join("x.ts"), "export const x = 2;\n").unwrap();
+        let seen = wait_until(|| saw_path(&synced, "ext/x.ts"));
+        watcher.stop();
+        assert!(
+            seen,
+            "an edit behind a followed link syncs its logical path"
+        );
+    }
+
+    type Scans = Arc<AtomicUsize>;
+
+    /// A real watcher in observe-only mode: what it reports, and how often it
+    /// asked for a scan.
+    fn observing_watcher(root: &Path) -> (ProjectWatcher, Recorded, Scans) {
+        let seen: Recorded = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&seen);
+        let scans = Arc::new(AtomicUsize::new(0));
+        let scan_counter = Arc::clone(&scans);
+        let watcher = ProjectWatcher::start(
+            root,
+            WatchOptions {
+                debounce: Duration::from_millis(50),
+                ..WatchOptions::default()
+            }
+            .observe_only(
+                move |paths| sink.lock().unwrap().push(paths),
+                move || {
+                    scan_counter.fetch_add(1, AtomicOrdering::SeqCst);
+                },
+            ),
+        )
+        .unwrap()
+        .unwrap();
+        // Native backends (FSEvents) need a moment before streams report.
+        std::thread::sleep(Duration::from_millis(300));
+        (watcher, seen, scans)
+    }
+
+    #[test]
+    fn observe_only_reports_an_edit_by_its_root_relative_path_and_writes_nothing() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-observe-edit");
+        fs::create_dir_all(dir.path().join("src")).unwrap();
+        fs::write(dir.path().join("src/a.ts"), "export const a = 1;\n").unwrap();
+        // Every byte of the index namespace, so a write anywhere in it shows.
+        let snapshot = |root: &Path| -> Vec<(String, Vec<u8>)> {
+            let mut files: Vec<(String, Vec<u8>)> = fs::read_dir(root.join(".codegraph"))
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| e.path().is_file())
+                .map(|e| {
+                    (
+                        e.file_name().to_string_lossy().into_owned(),
+                        fs::read(e.path()).unwrap(),
+                    )
+                })
+                .collect();
+            files.sort();
+            files
+        };
+        let before = snapshot(dir.path());
+        let (watcher, seen, scans) = observing_watcher(dir.path());
+        fs::write(dir.path().join("src/a.ts"), "export const a = 2;\n").unwrap();
+        let reported = wait_until(|| saw_path(&seen, "src/a.ts"));
+        watcher.stop();
+        assert!(reported, "an edit is reported by its root-relative path");
+        assert_eq!(
+            scans.load(AtomicOrdering::SeqCst),
+            0,
+            "a file edit needs no scan"
+        );
+        // The default sync closures would have indexed the edit.
+        assert_eq!(
+            snapshot(dir.path()),
+            before,
+            "an observing watcher never writes the index"
+        );
+    }
+
+    #[test]
+    fn symlink_edit_is_observed_by_its_logical_path_without_a_sync() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-observe-link");
+        let outside = LinkTarget::new("observe");
+        fs::write(outside.0.join("x.ts"), "export const x = 1;\n").unwrap();
+        if !symlink_at(&outside.0, &dir.path().join("ext"), true) {
+            return;
+        }
+        let (watcher, seen, _) = observing_watcher(dir.path());
+        fs::write(outside.0.join("x.ts"), "export const x = 2;\n").unwrap();
+        let reported = wait_until(|| saw_path(&seen, "ext/x.ts"));
+        watcher.stop();
+        assert!(
+            reported,
+            "the logical path is reported, not the link target"
+        );
+    }
+
+    #[test]
+    fn observe_only_asks_for_a_scan_when_an_ancestor_directory_goes() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-observe-remove");
+        fs::create_dir_all(dir.path().join("pkg/inner")).unwrap();
+        fs::write(dir.path().join("pkg/inner/a.ts"), "export const a = 1;\n").unwrap();
+        let (watcher, _, scans) = observing_watcher(dir.path());
+        fs::remove_dir_all(dir.path().join("pkg")).unwrap();
+        let removed = wait_until(|| scans.load(AtomicOrdering::SeqCst) >= 1);
+        let before_rename = scans.load(AtomicOrdering::SeqCst);
+        fs::create_dir_all(dir.path().join("lib/deep")).unwrap();
+        fs::write(dir.path().join("lib/deep/b.ts"), "export const b = 1;\n").unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+        let settled = scans.load(AtomicOrdering::SeqCst);
+        fs::rename(dir.path().join("lib"), dir.path().join("lib2")).unwrap();
+        let renamed = wait_until(|| scans.load(AtomicOrdering::SeqCst) > settled);
+        watcher.stop();
+        assert!(
+            removed,
+            "removing an ancestor of watched files asks for a scan"
+        );
+        assert!(before_rename >= 1);
+        assert!(renamed, "renaming an ancestor directory asks for a scan");
+    }
+
+    #[test]
+    fn symlink_alias_is_reindexed_with_its_target() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-symlink-alias");
+        fs::create_dir_all(dir.path().join("src/real")).unwrap();
+        fs::write(dir.path().join("src/real/a.ts"), "export const a = 1;\n").unwrap();
+        if !symlink_at(
+            &dir.path().join("src/real/a.ts"),
+            &dir.path().join("src/afile.ts"),
+            false,
+        ) {
+            return;
+        }
+        let (watcher, synced, _) = recording_watcher(dir.path());
+        fs::write(dir.path().join("src/real/a.ts"), "export const a = 2;\n").unwrap();
+        let seen =
+            wait_until(|| saw_path(&synced, "src/real/a.ts") && saw_path(&synced, "src/afile.ts"));
+        watcher.stop();
+        assert!(seen, "a file link is re-indexed with the file it aliases");
+    }
+
+    #[test]
+    fn symlink_creation_retarget_and_removal_each_schedule_a_full_sync() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-symlink-topology");
+        let first = LinkTarget::new("topology-first");
+        let second = LinkTarget::new("topology-second");
+        fs::write(dir.path().join("app.ts"), "export const app = 1;\n").unwrap();
+        fs::write(first.0.join("x.ts"), "export const x = 1;\n").unwrap();
+        fs::write(second.0.join("y.ts"), "export const y = 1;\n").unwrap();
+        let (watcher, synced, full) = recording_watcher(dir.path());
+        let link = dir.path().join("lib");
+
+        if !symlink_at(&first.0, &link, true) {
+            watcher.stop();
+            return;
+        }
+        let created = wait_until(|| full.load(AtomicOrdering::SeqCst) >= 1);
+        std::thread::sleep(Duration::from_millis(300));
+        fs::write(first.0.join("x.ts"), "export const x = 2;\n").unwrap();
+        let watched_first = wait_until(|| saw_path(&synced, "lib/x.ts"));
+
+        let before_retarget = full.load(AtomicOrdering::SeqCst);
+        remove_symlink(&link);
+        assert!(symlink_at(&second.0, &link, true));
+        let retargeted = wait_until(|| full.load(AtomicOrdering::SeqCst) > before_retarget);
+        std::thread::sleep(Duration::from_millis(300));
+        fs::write(second.0.join("y.ts"), "export const y = 2;\n").unwrap();
+        let watched_second = wait_until(|| saw_path(&synced, "lib/y.ts"));
+
+        let before_removal = full.load(AtomicOrdering::SeqCst);
+        remove_symlink(&link);
+        let removed = wait_until(|| full.load(AtomicOrdering::SeqCst) > before_removal);
+        watcher.stop();
+
+        assert!(created, "creating a directory link schedules a full sync");
+        assert!(watched_first, "the new link's target is watched");
+        assert!(retargeted, "retargeting a link schedules a full sync");
+        assert!(
+            watched_second,
+            "the retargeted link resolves to its new target"
+        );
+        assert!(removed, "removing a link schedules a full sync");
+    }
+
+    #[test]
+    fn symlink_cap_warning_is_given_once_per_watcher() {
+        let mut warned = false;
+        assert!(supplemental_cap_warning(false, &mut warned).is_none());
+        assert!(supplemental_cap_warning(true, &mut warned).is_some());
+        assert!(supplemental_cap_warning(true, &mut warned).is_none());
+        // A watcher that warned at startup never warns again in its loop.
+        let mut warned_at_startup = true;
+        assert!(supplemental_cap_warning(true, &mut warned_at_startup).is_none());
+    }
+
+    /// A real directory moved in with a link (and sources) inside adds no
+    /// pending file of its own; the full sync it owes must still run.
+    #[test]
+    fn symlink_moved_in_directory_holding_a_link_schedules_a_full_sync() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-symlink-moved-in");
+        let staging = LinkTarget::new("moved-in-staging");
+        let target = LinkTarget::new("moved-in-target");
+        fs::write(target.0.join("t.ts"), "export const t = 1;\n").unwrap();
+        fs::create_dir_all(staging.0.join("pkg")).unwrap();
+        fs::write(staging.0.join("pkg/a.ts"), "export const a = 1;\n").unwrap();
+        if !symlink_at(&target.0, &staging.0.join("pkg/linked"), true) {
+            return;
+        }
+        let (watcher, _, full) = recording_watcher(dir.path());
+        fs::rename(staging.0.join("pkg"), dir.path().join("pkg")).unwrap();
+        let scheduled = wait_until(|| full.load(AtomicOrdering::SeqCst) >= 1);
+        watcher.stop();
+        assert!(
+            scheduled,
+            "a moved-in directory holding a link schedules a full sync"
+        );
+    }
+
+    #[test]
+    fn symlink_file_target_turning_into_a_directory_schedules_a_full_sync() {
+        let _env = crate::test_env::env_guard();
+        let dir = crate::sync::tests::TestDir::new("watch-symlink-retype");
+        fs::create_dir_all(dir.path().join("src/real")).unwrap();
+        fs::write(dir.path().join("src/real/a.ts"), "export const a = 1;\n").unwrap();
+        if !symlink_at(
+            &dir.path().join("src/real/a.ts"),
+            &dir.path().join("src/afile.ts"),
+            false,
+        ) {
+            return;
+        }
+        let (watcher, _, full) = recording_watcher(dir.path());
+        fs::remove_file(dir.path().join("src/real/a.ts")).unwrap();
+        fs::create_dir_all(dir.path().join("src/real/a.ts")).unwrap();
+        fs::write(
+            dir.path().join("src/real/a.ts/inner.ts"),
+            "export const i = 1;\n",
+        )
+        .unwrap();
+        let scheduled = wait_until(|| full.load(AtomicOrdering::SeqCst) >= 1);
+        watcher.stop();
+        assert!(
+            scheduled,
+            "a file link whose target became a directory now reaches a tree the scan follows"
         );
     }
 }
